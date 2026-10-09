@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install *)",
+      "Bash(rtk npm *)",
+      "Bash(npm cache *)",
+      "Bash(rtk npx *)",
+      "Bash(git init *)",
+      "Bash(rtk git *)"
+    ]
+  }
+}

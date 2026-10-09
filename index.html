@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>IS King Panel — King Control Panel</title>
+    <meta name="description" content="Professional localhost server management engine for Minecraft PaperMC, telemetry, file management, plugin marketplace, UPnP port forwarding, JVM tuning, and zero-downtime snapshots." />
+    <meta property="og:title" content="IS King Panel — King Control Panel" />
+    <meta property="og:description" content="Professional localhost server management engine for Minecraft PaperMC, telemetry, file management, plugin marketplace, UPnP port forwarding, JVM tuning, and zero-downtime snapshots." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,300;0,400;0,500;0,600;0,700;0,800;1,400&family=JetBrains+Mono:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet" />
+    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet" />
+    <script>
+      window.addEventListener('unhandledrejection', function (event) {
+        var stack = (event.reason && event.reason.stack) ? String(event.reason.stack) : '';
+        var msg = (event.reason && event.reason.message) ? String(event.reason.message) : String(event.reason || '');
+        if (
+          stack.indexOf('@vite/client') !== -1 ||
+          stack.indexOf('createWebSocketModuleRunnerTransport') !== -1 ||
+          msg.indexOf('WebSocket') !== -1
+        ) {
+          event.preventDefault();
+        }
+      });
+    </script>
+  </head>
+  <body class="bg-[#0c0f17] text-[#dfe2f1] antialiased selection:bg-[#f59e0b] selection:text-black overflow-hidden">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
