@@ -6,3 +6,9 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Electron build outputs
+dist_electron/
+win-unpacked/
+ISKingPanel*.exe
+resources/app.asar

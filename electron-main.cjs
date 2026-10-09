@@ -5,10 +5,21 @@
 const { app, BrowserWindow, shell, ipcMain } = require('electron');
 const path = require('path');
 const { spawn } = require('child_process');
+const { autoUpdater } = require('electron-updater');
+const log = require('electron-log');
 
 let mainWindow = null;
 let backendProcess = null;
 const PORT = process.env.PORT || 3000;
+
+// Configure auto-updater (only in packaged app)
+if (app.isPackaged) {
+  autoUpdater.logger = log;
+  autoUpdater.logger.transports.file.level = 'info';
+  log.info('App starting...');
+} else {
+  log.info('App starting in development mode...');
+}
 
 function startEmbeddedBackend() {
   const serverPath = path.join(__dirname, 'server.ts');
@@ -58,6 +69,9 @@ function createWindowsAppWindow() {
 app.whenReady().then(() => {
   startEmbeddedBackend();
   setTimeout(createWindowsAppWindow, 1200);
+
+  // Check for updates
+  autoUpdater.checkForUpdatesAndNotify();
 });
 
 app.on('window-all-closed', () => {
