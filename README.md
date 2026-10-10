@@ -23,7 +23,7 @@ A Windows desktop application for managing Minecraft servers, built with Electro
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/kingplayz1/KingPanel-.git
+   git clone https://github.com/kingplayz1/KingPanel.git
    cd KingPanel-
    ```
 
