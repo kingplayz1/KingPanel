@@ -1,6 +1,65 @@
-import React, { useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { ServerInstance, NavSection } from '../types';
 import { HOTLINKED_IMAGES } from '../data/initialData';
+
+const unescapeJava = (value: string): string => {
+  const sb = String.fromCharCode(92);
+  return value
+    .replace(new RegExp(sb + sb + 'u([0-9a-fA-F]{4})', 'g'), (_m, hex: string) =>
+      String.fromCharCode(parseInt(hex, 16)),
+    )
+    .replace(new RegExp(sb + sb + 'n', 'g'), String.fromCharCode(10))
+    .split(sb + sb)
+    .join(sb);
+};
+
+const escapeJava = (value: string): string => {
+  const sb = String.fromCharCode(92);
+  return value
+    .split(sb)
+    .join(sb + sb)
+    .split(String.fromCharCode(10))
+    .join(sb + 'n')
+    .split(String.fromCharCode(167))
+    .join(sb + 'u00A7');
+};
+
+const parseProperties = (raw: string): Record<string, string> => {
+  const out: Record<string, string> = {};
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('!')) continue;
+    const idx = trimmed.search(/[:=]/);
+    if (idx === -1) continue;
+    out[trimmed.slice(0, idx).trim()] = trimmed.slice(idx + 1).trim();
+  }
+  return out;
+};
+
+const patchProperties = (raw: string, patch: Record<string, string>): string => {
+  const lines = raw.split(/\r?\n/);
+  const applied = new Set<string>();
+  const next = lines.map((line) => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('!')) return line;
+    const idx = trimmed.search(/[:=]/);
+    if (idx === -1) return line;
+    const key = trimmed.slice(0, idx).trim();
+    if (!(key in patch)) return line;
+    applied.add(key);
+    return `${key}=${patch[key]}`;
+  });
+  for (const [key, value] of Object.entries(patch)) {
+    if (!applied.has(key)) next.push(`${key}=${value}`);
+  }
+  return next.join('\n');
+};
+
+const formatStamp = (iso: string): string => {
+  if (!iso) return 'never';
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? 'never' : d.toLocaleString();
+};
 
 interface ServerSettingsViewProps {
   server: ServerInstance;
@@ -9,7 +68,7 @@ interface ServerSettingsViewProps {
     title: string,
     body?: string,
     type?: 'success' | 'info' | 'warning' | 'error',
-    icon?: string
+    icon?: string,
   ) => void;
 }
 
@@ -22,51 +81,18 @@ interface WhitelistedPlayer {
   role: 'OP LVL 4' | 'OP LVL 3' | 'MEMBER';
 }
 
-const INITIAL_WHITELIST: WhitelistedPlayer[] = [
-  {
-    id: 'wl-1',
-    username: 'Mio_Sakura',
-    uuid: 'f84c6a79-0a4e-45e0-879b-cd49ebd4c4e2',
-    avatar: HOTLINKED_IMAGES.avatarMio,
-    online: true,
-    role: 'OP LVL 4',
-  },
-  {
-    id: 'wl-2',
-    username: 'Aki_Craft99',
-    uuid: '3b91a2e4-72c1-44d8-918a-5e2b99f01a88',
-    avatar: HOTLINKED_IMAGES.avatarAki,
-    online: true,
-    role: 'OP LVL 3',
-  },
-  {
-    id: 'wl-3',
-    username: 'Kuro_Neko_JP',
-    uuid: '99c100f2-18b4-4099-b811-77a910de3310',
-    avatar: HOTLINKED_IMAGES.avatarKuro,
-    online: false,
-    role: 'MEMBER',
-  },
-  {
-    id: 'wl-4',
-    username: 'Voxel_Architect',
-    uuid: 'a12d88e1-55f0-4c12-9001-bc88210fa912',
-    avatar: HOTLINKED_IMAGES.avatarVoxel,
-    online: true,
-    role: 'MEMBER',
-  },
-];
+const INITIAL_WHITELIST: WhitelistedPlayer[] = [];
 
 export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
   server,
   onNavigate,
   onShowToast,
 }) => {
-  const [hasUnsaved, setHasUnsaved] = useState(true);
-  const [motdLine1, setMotdLine1] = useState('§6§l⚡ MIO’S SURVIVAL & SMP §8[§b1.20.4§8] §6§l⚡');
-  const [motdLine2, setMotdLine2] = useState(
-    '§a§lNEW SEASON 4! §7• §dCustom Enchants §7• §eEconomy & Claims'
-  );
+  const [hasUnsaved, setHasUnsaved] = useState(false);
+  const [propsRaw, setPropsRaw] = useState('');
+  const [lastSyncedAt, setLastSyncedAt] = useState('');
+  const [motdLine1, setMotdLine1] = useState('');
+  const [motdLine2, setMotdLine2] = useState('');
   const [activeLineInput, setActiveLineInput] = useState<1 | 2>(1);
 
   // General Settings State
@@ -79,7 +105,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
   // Gameplay & World Rules State
   const [gamemode, setGamemode] = useState('survival');
   const [difficulty, setDifficulty] = useState<'Peaceful' | 'Easy' | 'Normal' | 'Hard'>('Hard');
-  const [worldSeed, setWorldSeed] = useState('-4918273645192837465');
+  const [worldSeed, setWorldSeed] = useState('');
   const [spawnProtection, setSpawnProtection] = useState(16);
   const [pvpCombat, setPvpCombat] = useState(true);
   const [hardcoreMode, setHardcoreMode] = useState(false);
@@ -87,10 +113,173 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
   const [commandBlocks, setCommandBlocks] = useState(true);
 
   // Access & Whitelist State
-  const [enforceWhitelist, setEnforceWhitelist] = useState(true);
+  const [enforceWhitelist, setEnforceWhitelist] = useState(false);
   const [whitelistPlayers, setWhitelistPlayers] = useState<WhitelistedPlayer[]>(INITIAL_WHITELIST);
   const [newPlayerInput, setNewPlayerInput] = useState('');
   const [showAddPlayerInput, setShowAddPlayerInput] = useState(false);
+
+  const serverQuery = `serverId=${encodeURIComponent(server.id)}&serverName=${encodeURIComponent(
+    server.name,
+  )}`;
+
+  const applyProperties = useCallback((raw: string) => {
+    const props = parseProperties(raw);
+    const motd = unescapeJava(props.motd || '');
+    const [line1 = '', line2 = ''] = motd.split('\n');
+    setMotdLine1(line1);
+    setMotdLine2(line2);
+    setMaxPlayers(Number(props['max-players']) || 20);
+    setViewDistance(Number(props['view-distance']) || 10);
+    setSimDistance(Number(props['simulation-distance']) || 10);
+    setOnlineMode(props['online-mode'] === 'false' ? 'false' : 'true');
+    setGamemode(props.gamemode || 'survival');
+    const diff = (props.difficulty || 'normal').toLowerCase();
+    setDifficulty(
+      (diff.charAt(0).toUpperCase() + diff.slice(1)) as 'Peaceful' | 'Easy' | 'Normal' | 'Hard',
+    );
+    setWorldSeed(props['level-seed'] || '');
+    setSpawnProtection(Number(props['spawn-protection']) || 0);
+    setPvpCombat((props.pvp ?? 'true') !== 'false');
+    setHardcoreMode(props.hardcore === 'true');
+    setAllowFlight(props['allow-flight'] === 'true');
+    setCommandBlocks((props['enable-command-block'] ?? 'true') !== 'false');
+    setEnforceWhitelist(props['white-list'] === 'true' || props['enforce-whitelist'] === 'true');
+  }, []);
+
+  const readServerFile = useCallback(
+    async (
+      relPath: string,
+    ): Promise<{ ok: boolean; content?: string; modifiedAt?: string; error?: string }> => {
+      try {
+        const res = await fetch(
+          `/api/server-runtime/file?${serverQuery}&path=${encodeURIComponent(relPath)}`,
+        );
+        return await res.json();
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : 'Backend unreachable' };
+      }
+    },
+    [serverQuery],
+  );
+
+  const writeServerFile = useCallback(
+    async (
+      relPath: string,
+      content: string,
+    ): Promise<{ ok: boolean; bytes?: number; error?: string }> => {
+      try {
+        const res = await fetch('/api/server-runtime/file', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            serverId: server.id,
+            serverName: server.name,
+            path: relPath,
+            content,
+          }),
+        });
+        return await res.json();
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : 'Backend unreachable' };
+      }
+    },
+    [server.id, server.name],
+  );
+
+  const loadWhitelist = useCallback(async () => {
+    const wl = await readServerFile('whitelist.json');
+    const ops = await readServerFile('ops.json');
+    let entries: Array<{ uuid?: string; name?: string }> = [];
+    let operators: Array<{ uuid?: string; level?: number }> = [];
+    if (wl.ok && wl.content) {
+      try {
+        const parsed = JSON.parse(wl.content);
+        if (Array.isArray(parsed)) entries = parsed;
+      } catch {
+        // malformed whitelist.json — leave the list empty rather than inventing entries
+      }
+    }
+    if (ops.ok && ops.content) {
+      try {
+        const parsed = JSON.parse(ops.content);
+        if (Array.isArray(parsed)) operators = parsed;
+      } catch {
+        // ignore
+      }
+    }
+    setWhitelistPlayers(
+      entries
+        .filter((e) => e && typeof e.uuid === 'string')
+        .map((e, idx) => {
+          const uuid = String(e.uuid);
+          const op = operators.find((o) => String(o.uuid) === uuid);
+          const level = Number(op?.level) || 0;
+          return {
+            id: `wl-${uuid || idx}`,
+            username: String(e.name || uuid),
+            uuid,
+            avatar: `https://mc-heads.net/avatar/${uuid.replace(/-/g, '')}/128`,
+            online: false,
+            role: level >= 4 ? 'OP LVL 4' : level >= 3 ? 'OP LVL 3' : 'MEMBER',
+          } as WhitelistedPlayer;
+        }),
+    );
+  }, [readServerFile]);
+
+  const loadFromDisk = useCallback(async () => {
+    const props = await readServerFile('server.properties');
+    if (!props.ok) {
+      onShowToast(
+        'Cannot read server.properties',
+        String(props.error || 'The instance folder has no properties file yet.'),
+        'error',
+        'error',
+      );
+      return;
+    }
+    setPropsRaw(String(props.content ?? ''));
+    applyProperties(String(props.content ?? ''));
+    setLastSyncedAt(String(props.modifiedAt || new Date().toISOString()));
+    setHasUnsaved(false);
+    await loadWhitelist();
+  }, [applyProperties, loadWhitelist, onShowToast, readServerFile]);
+
+  useEffect(() => {
+    void loadFromDisk();
+  }, [loadFromDisk]);
+
+  const persistWhitelist = useCallback(
+    async (list: WhitelistedPlayer[]) =>
+      writeServerFile(
+        'whitelist.json',
+        JSON.stringify(
+          list.map((p) => ({ uuid: p.uuid, name: p.username })),
+          null,
+          2,
+        ),
+      ),
+    [writeServerFile],
+  );
+
+  const persistOperators = useCallback(
+    async (list: WhitelistedPlayer[]) =>
+      writeServerFile(
+        'ops.json',
+        JSON.stringify(
+          list
+            .filter((p) => p.role !== 'MEMBER')
+            .map((p) => ({
+              uuid: p.uuid,
+              name: p.username,
+              level: p.role === 'OP LVL 4' ? 4 : 3,
+              bypassesPlayerLimit: false,
+            })),
+          null,
+          2,
+        ),
+      ),
+    [writeServerFile],
+  );
 
   // Active Section Anchor Highlight
   const [activeSectionTab, setActiveSectionTab] = useState<
@@ -100,9 +289,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
   // Parse basic Minecraft § codes into styled spans for live preview
   const renderMinecraftText = (raw: string) => {
     // If default Line 1 or Line 2 aren't modified, show the rich preview or parse codes
-    if (
-      raw === '§6§l⚡ MIO’S SURVIVAL & SMP §8[§b1.20.4§8] §6§l⚡'
-    ) {
+    if (raw === '§6§l⚡ MIO’S SURVIVAL & SMP §8[§b1.20.4§8] §6§l⚡') {
       return (
         <>
           <span className="text-[#FFAA00] font-bold">⚡ MIO’S SURVIVAL &amp; SMP </span>
@@ -182,7 +369,8 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
             color: currentColor,
             fontWeight: isBold ? 700 : 400,
             fontStyle: isItalic ? 'italic' : 'normal',
-            textDecoration: `${isUnderline ? 'underline ' : ''}${isStrike ? 'line-through' : ''}`.trim(),
+            textDecoration:
+              `${isUnderline ? 'underline ' : ''}${isStrike ? 'line-through' : ''}`.trim(),
           }}
         >
           {part}
@@ -198,88 +386,197 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
     } else {
       setMotdLine2((prev) => prev + code);
     }
-    onShowToast('Format Code Inserted', `Appended ${code} to MOTD Line ${activeLineInput}`, 'info', 'palette');
+    onShowToast(
+      'Format Code Inserted',
+      `Appended ${code} to MOTD Line ${activeLineInput}`,
+      'info',
+      'palette',
+    );
   };
 
   const handleRandomizeSeed = () => {
+    // A candidate seed only takes effect once it is written to server.properties.
     const randomBig =
       (Math.random() > 0.5 ? '-' : '') +
       Math.floor(1000000000000000000 + Math.random() * 8000000000000000000).toString();
     setWorldSeed(randomBig);
     setHasUnsaved(true);
-    onShowToast('World Seed Randomized', `Generated seed: ${randomBig}`, 'info', 'casino');
+    onShowToast(
+      'Candidate seed generated',
+      `Seed ${randomBig} is staged. Save to write it to server.properties; it applies to newly generated terrain.`,
+      'info',
+      'casino',
+    );
+  };
+
+  const saveProperties = async (successTitle: string) => {
+    const patch: Record<string, string> = {
+      'max-players': String(maxPlayers),
+      'view-distance': String(viewDistance),
+      'simulation-distance': String(simDistance),
+      'online-mode': onlineMode,
+      gamemode,
+      difficulty: difficulty.toLowerCase(),
+      'level-seed': worldSeed,
+      'spawn-protection': String(spawnProtection),
+      pvp: String(pvpCombat),
+      hardcore: String(hardcoreMode),
+      'allow-flight': String(allowFlight),
+      'enable-command-block': String(commandBlocks),
+      'white-list': String(enforceWhitelist),
+      motd: escapeJava([motdLine1, motdLine2].filter(Boolean).join('\n')),
+    };
+    let next = propsRaw;
+    for (const [key, value] of Object.entries(patch))
+      next = patchProperties(next, { [key]: value });
+
+    const res = await writeServerFile('server.properties', next);
+    if (!res.ok) {
+      onShowToast(
+        'Save failed',
+        String(res.error || 'Could not write server.properties'),
+        'error',
+        'error',
+      );
+      return;
+    }
+    setPropsRaw(next);
+    setHasUnsaved(false);
+    setLastSyncedAt(new Date().toISOString());
+    onShowToast(
+      successTitle,
+      `${res.bytes ?? next.length} bytes written to ${server.path}/server.properties. A running server applies them on its next restart.`,
+      'success',
+      'save',
+    );
   };
 
   const handleSaveAll = () => {
-    setHasUnsaved(false);
-    onShowToast(
-      'Configuration Saved',
-      'All changes written to server.properties & whitelist.json.',
-      'success',
-      'save'
-    );
+    void saveProperties('server.properties saved');
   };
 
   const handleSaveAndReload = () => {
-    setHasUnsaved(false);
-    onShowToast(
-      'Properties Applied & Reloaded',
-      'Broadcasted /paper reload & updated MOTD buffer in 12ms.',
-      'success',
-      'sync'
-    );
+    void saveProperties('server.properties saved');
   };
 
-  const handleAddWhitelistPlayer = (e: React.FormEvent) => {
+  const handleAddWhitelistPlayer = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newPlayerInput.trim()) return;
-    const newEntry: WhitelistedPlayer = {
-      id: `wl-${Date.now()}`,
-      username: newPlayerInput.trim(),
-      uuid: `${Math.random().toString(16).slice(2, 10)}-48a1-4099-b811-${Math.random().toString(16).slice(2, 14)}`,
-      avatar: HOTLINKED_IMAGES.avatarVoxel,
-      online: false,
-      role: 'MEMBER',
-    };
-    setWhitelistPlayers((prev) => [newEntry, ...prev]);
-    setNewPlayerInput('');
-    setShowAddPlayerInput(false);
+    const name = newPlayerInput.trim();
+    if (!name) return;
+    try {
+      const res = await fetch(`/api/panel/mojang/${encodeURIComponent(name)}`);
+      const data = await res.json();
+      if (!data?.ok) {
+        onShowToast(
+          'Mojang lookup failed',
+          String(data?.error || `No Java Edition account named "${name}"`),
+          'error',
+          'error',
+        );
+        return;
+      }
+      if (whitelistPlayers.some((p) => p.uuid === data.uuid)) {
+        onShowToast(
+          'Already whitelisted',
+          `${data.ign} is already in whitelist.json.`,
+          'info',
+          'info',
+        );
+        return;
+      }
+      const entry: WhitelistedPlayer = {
+        id: `wl-${data.uuid}`,
+        username: String(data.ign),
+        uuid: String(data.uuid),
+        avatar: String(data.avatarUrl || HOTLINKED_IMAGES.avatarVoxel),
+        online: false,
+        role: 'MEMBER',
+      };
+      const next = [entry, ...whitelistPlayers];
+      const written = await persistWhitelist(next);
+      if (!written.ok) {
+        onShowToast(
+          'Whitelist write failed',
+          String(written.error || 'Could not write whitelist.json'),
+          'error',
+          'error',
+        );
+        return;
+      }
+      setWhitelistPlayers(next);
+      setNewPlayerInput('');
+      setShowAddPlayerInput(false);
+      setHasUnsaved(true);
+      onShowToast(
+        'Added to whitelist.json',
+        `${entry.username} resolved to ${entry.uuid} via Mojang.`,
+        'success',
+        'person_add',
+      );
+    } catch (err) {
+      onShowToast(
+        'Mojang lookup failed',
+        err instanceof Error ? err.message : 'Backend unreachable',
+        'error',
+        'error',
+      );
+    }
+  };
+
+  const togglePlayerRole = async (id: string) => {
+    const player = whitelistPlayers.find((p) => p.id === id);
+    if (!player) return;
+    const nextRole: WhitelistedPlayer['role'] =
+      player.role === 'MEMBER' ? 'OP LVL 3' : player.role === 'OP LVL 3' ? 'OP LVL 4' : 'MEMBER';
+    const next = whitelistPlayers.map((p) => (p.id === id ? { ...p, role: nextRole } : p));
+    const written = await persistOperators(next);
+    if (!written.ok) {
+      onShowToast(
+        'ops.json write failed',
+        String(written.error || 'Could not write ops.json'),
+        'error',
+        'error',
+      );
+      return;
+    }
+    setWhitelistPlayers(next);
     setHasUnsaved(true);
     onShowToast(
-      'Player Added to Whitelist',
-      `Resolved Mojang UUID for ${newEntry.username}`,
-      'success',
-      'person_add'
+      'ops.json updated',
+      nextRole === 'MEMBER'
+        ? `${player.username} is no longer an operator.`
+        : `${player.username} now has operator level ${nextRole === 'OP LVL 4' ? 4 : 3}.`,
+      'info',
+      'admin_panel_settings',
     );
   };
 
-  const togglePlayerRole = (id: string) => {
-    setWhitelistPlayers((prev) =>
-      prev.map((p) => {
-        if (p.id !== id) return p;
-        const nextRole =
-          p.role === 'MEMBER' ? 'OP LVL 3' : p.role === 'OP LVL 3' ? 'OP LVL 4' : 'MEMBER';
-        onShowToast(
-          'Operator Level Updated',
-          `${p.username} is now ${nextRole}`,
-          'info',
-          'admin_panel_settings'
-        );
-        return { ...p, role: nextRole };
-      })
+  const removeWhitelistedPlayer = async (id: string, name: string) => {
+    const next = whitelistPlayers.filter((p) => p.id !== id);
+    const written = await persistWhitelist(next);
+    if (!written.ok) {
+      onShowToast(
+        'Whitelist write failed',
+        String(written.error || 'Could not write whitelist.json'),
+        'error',
+        'error',
+      );
+      return;
+    }
+    await persistOperators(next);
+    setWhitelistPlayers(next);
+    setHasUnsaved(true);
+    onShowToast(
+      'Removed from whitelist.json',
+      `Revoked access for ${name}.`,
+      'warning',
+      'person_remove',
     );
-    setHasUnsaved(true);
-  };
-
-  const removeWhitelistedPlayer = (id: string, name: string) => {
-    setWhitelistPlayers((prev) => prev.filter((p) => p.id !== id));
-    setHasUnsaved(true);
-    onShowToast('Removed from Whitelist', `Revoked access for ${name}`, 'warning', 'person_remove');
   };
 
   const scrollToBlock = (
     tab: 'motd' | 'general' | 'world' | 'whitelist' | 'eula' | 'danger',
-    elementId: string
+    elementId: string,
   ) => {
     setActiveSectionTab(tab);
     const el = document.getElementById(elementId);
@@ -291,80 +588,66 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
   return (
     <main className="flex-1 flex flex-col bg-surface-dim overflow-hidden">
       {/* Top Contextual Action Bar */}
-      <header className="h-16 px-6 bg-surface border-b border-outline-variant/15 flex items-center justify-between shrink-0">
-        <div className="flex items-center gap-4">
-          <div className="w-10 h-10 rounded-lg bg-primary/10 border border-primary/25 flex items-center justify-center text-primary shadow-inner">
-            <span className="material-symbols-outlined text-[22px]">settings</span>
-          </div>
-          <div>
-            <div className="flex items-center gap-2.5">
-              <h1 className="text-base font-bold tracking-tight text-on-surface">
-                Server Settings &amp; Visual MOTD Editor
-              </h1>
-              <span className="px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider bg-surface-container-highest text-primary rounded border border-primary/20">
-                server.properties
-              </span>
-              {hasUnsaved ? (
-                <span className="px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider bg-primary-gold/10 text-primary-gold rounded border border-primary-gold/20 flex items-center gap-1">
-                  <span className="w-1.5 h-1.5 rounded-full bg-primary-gold animate-pulse"></span>
-                  2 Unsaved Edits
-                </span>
-              ) : (
-                <span className="px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider bg-secondary/10 text-secondary rounded border border-secondary/20 flex items-center gap-1">
-                  <span className="w-1.5 h-1.5 rounded-full bg-secondary"></span>
-                  Synced to Disk
-                </span>
-              )}
-            </div>
-            <p className="text-xs text-outline font-mono mt-0.5">
-              {server.path}\server.properties • Last synced: 4 mins ago
-            </p>
-          </div>
+      <header className="h-[54px] px-5 bg-surface border-b border-white/[0.06] flex items-center justify-between gap-4 shrink-0">
+        <div className="flex items-center gap-2.5 min-w-0">
+          <span className="material-symbols-outlined text-[17px] text-primary">settings</span>
+          <h1 className="text-[14.5px] font-semibold text-on-surface whitespace-nowrap">
+            Server Settings
+          </h1>
+          {hasUnsaved ? (
+            <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md border border-primary-gold/30 bg-primary-gold/10 text-primary-gold font-mono text-[10.5px]">
+              <span className="size-1.5 rounded-full bg-primary-gold animate-pulse" />
+              Unsaved
+            </span>
+          ) : (
+            <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md border border-secondary/25 bg-secondary/10 text-secondary font-mono text-[10.5px]">
+              <span className="size-1.5 rounded-full bg-secondary" />
+              Synced
+            </span>
+          )}
+          <span className="hidden xl:block w-px h-4 bg-white/10" />
+          <p className="hidden xl:block font-mono text-[11px] text-outline truncate">
+            server.properties · read {formatStamp(lastSyncedAt)}
+          </p>
         </div>
         {/* Primary Global Actions */}
-        <div className="flex items-center gap-2.5">
+        <div className="flex items-center gap-2 shrink-0">
           <button
             onClick={() => onNavigate('files')}
-            className="px-3.5 py-2 rounded-lg bg-surface-container-high hover:bg-surface-bright text-xs font-medium text-on-surface border border-outline-variant/20 transition-all flex items-center gap-2 cursor-pointer"
+            className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg border border-white/10 bg-white/[0.02] hover:bg-white/[0.06] text-[11.5px] font-medium text-on-surface transition-colors cursor-pointer"
           >
             <span className="material-symbols-outlined text-[16px] text-outline">code</span>
-            Open Raw Config
+            Raw config
           </button>
           <button
             onClick={() => {
-              setMotdLine1('§6§l⚡ MIO’S SURVIVAL & SMP §8[§b1.20.4§8] §6§l⚡');
-              setMotdLine2('§a§lNEW SEASON 4! §7• §dCustom Enchants §7• §eEconomy & Claims');
-              setMaxPlayers(20);
-              setViewDistance(12);
-              setSimDistance(10);
-              setDifficulty('Hard');
-              setHasUnsaved(false);
-              onShowToast(
-                'Defaults Restored',
-                'Reverted all fields to last saved server.properties snapshot.',
-                'info',
-                'restart_alt'
+              void loadFromDisk().then(() =>
+                onShowToast(
+                  'Reloaded from disk',
+                  'Every field was re-read from server.properties and whitelist.json.',
+                  'info',
+                  'restart_alt',
+                ),
               );
             }}
-            className="px-3.5 py-2 rounded-lg bg-surface-container-high hover:bg-surface-bright text-xs font-medium text-outline hover:text-on-surface border border-outline-variant/20 transition-all flex items-center gap-1.5 cursor-pointer"
+            className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg border border-white/10 bg-white/[0.02] hover:bg-white/[0.06] text-[11.5px] font-medium text-on-surface transition-colors cursor-pointer"
           >
-            <span className="material-symbols-outlined text-[16px]">restart_alt</span>
-            Reset Defaults
-          </button>
-          <div className="h-5 w-[1px] bg-outline-variant/20 mx-1"></div>
-          <button
-            onClick={handleSaveAll}
-            className="px-4 py-2 rounded-lg bg-primary/15 hover:bg-primary/25 text-xs font-semibold text-primary border border-primary/30 transition-all flex items-center gap-2 cursor-pointer"
-          >
-            <span className="material-symbols-outlined text-[16px]">save</span>
-            Save Changes
+            <span className="material-symbols-outlined text-[16px] text-outline">restart_alt</span>
+            Reload
           </button>
           <button
             onClick={handleSaveAndReload}
-            className="px-4 py-2 rounded-lg bg-gradient-to-r from-primary to-primary-container hover:opacity-95 text-xs font-bold text-on-primary-container shadow-lg shadow-primary/15 transition-all flex items-center gap-2 cursor-pointer"
+            className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg border border-white/10 bg-white/[0.02] hover:bg-white/[0.06] text-[11.5px] font-medium text-on-surface transition-colors cursor-pointer"
           >
-            <span className="material-symbols-outlined text-[16px]">sync</span>
-            Save &amp; Reload Server
+            <span className="material-symbols-outlined text-[16px] text-outline">sync</span>
+            Save &amp; reload
+          </button>
+          <button
+            onClick={handleSaveAll}
+            className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg bg-primary hover:brightness-105 text-[11.5px] font-semibold text-on-primary transition-all cursor-pointer"
+          >
+            <span className="material-symbols-outlined text-[16px]">save</span>
+            Save changes
           </button>
         </div>
       </header>
@@ -372,7 +655,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
       {/* Main Content Workspace: Split Sub-Nav + Scrollable Settings Canvas */}
       <div className="flex-1 flex overflow-hidden">
         {/* Left Settings Sub-Navigation */}
-        <div className="w-56 bg-surface border-r border-outline-variant/15 p-3 flex flex-col justify-between shrink-0">
+        <div className="w-56 bg-surface border-r border-white/[0.06] p-3 flex flex-col justify-between shrink-0">
           <div className="space-y-1">
             <div className="px-2.5 py-1.5 text-[10px] font-mono uppercase tracking-widest text-outline/60 font-semibold">
               Configuration Sections
@@ -451,7 +734,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                 check_circle
               </span>
             </button>
-            <div className="pt-2 mt-2 border-t border-outline-variant/15">
+            <div className="pt-2 mt-2 border-t border-white/[0.06]">
               <button
                 onClick={() => scrollToBlock('danger', 'sec-danger')}
                 className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs transition-all cursor-pointer ${
@@ -469,20 +752,22 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
           </div>
 
           {/* Fast Property Filter Helper */}
-          <div className="p-3 rounded-xl bg-surface-container border border-outline-variant/15 space-y-2">
+          <div className="p-3 rounded-xl bg-surface-container border border-white/[0.06] space-y-2">
             <div className="flex items-center justify-between">
               <span className="text-[10px] font-mono uppercase tracking-wider text-outline">
-                Validation Engine
+                File status
               </span>
-              <span className="w-2 h-2 rounded-full bg-secondary"></span>
+              <span
+                className={`w-2 h-2 rounded-full ${propsRaw ? 'bg-secondary' : 'bg-outline'}`}
+              ></span>
             </div>
             <p className="text-[11px] text-outline leading-relaxed">
-              All 54 keys in <span className="text-on-surface font-mono">server.properties</span>{' '}
-              pass PaperMC 1.20.4 schema validation.
+              {Object.keys(parseProperties(propsRaw)).length} keys parsed from the real{' '}
+              <span className="text-on-surface font-mono">server.properties</span> on disk.
             </p>
             <div className="pt-1 flex items-center justify-between text-[10px] font-mono text-primary">
-              <span>Encoding: UTF-8</span>
-              <span>LF</span>
+              <span>Read: {formatStamp(lastSyncedAt)}</span>
+              <span>{hasUnsaved ? 'UNSAVED' : 'IN SYNC'}</span>
             </div>
           </div>
         </div>
@@ -492,13 +777,11 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
           {/* SECTION 1: VISUAL MOTD & SERVER ICON STUDIO */}
           <section
             id="sec-motd"
-            className="bg-surface rounded-xl border border-outline-variant/15 overflow-hidden shadow-xl"
+            className="bg-surface rounded-xl border border-white/[0.06] overflow-hidden "
           >
-            <div className="px-5 py-3.5 bg-surface-container border-b border-outline-variant/15 flex items-center justify-between">
+            <div className="px-5 py-3.5 bg-surface-container border-b border-white/[0.06] flex items-center justify-between">
               <div className="flex items-center gap-2.5">
-                <span className="material-symbols-outlined text-primary text-[19px]">
-                  campaign
-                </span>
+                <span className="material-symbols-outlined text-primary text-[19px]">campaign</span>
                 <h2 className="text-xs font-bold uppercase tracking-wider text-on-surface">
                   Server Identity, Icon &amp; Live MOTD Studio
                 </h2>
@@ -508,14 +791,18 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                   Supports Legacy (§) &amp; MiniMessage Hex
                 </span>
                 <button
-                  onClick={() =>
+                  onClick={() => {
+                    setMotdLine1('§6§lSURVIVAL & SMP §8[§b1.21§8] §6§l⚡');
+                    setMotdLine2('§aSeason 5 is live §7• §dCustom Enchants §7• §eClaims & Economy');
+                    setActiveLineInput(1);
+                    setHasUnsaved(true);
                     onShowToast(
-                      'Preset Gallery Loaded',
-                      'Applied "Obsidian Gold Season 4" MOTD template.',
+                      'Preset staged',
+                      'Two MOTD lines were staged in the editor. Save to write them to server.properties.',
                       'info',
-                      'auto_Fix_high'
-                    )
-                  }
+                      'auto_fix_high',
+                    );
+                  }}
                   className="px-2.5 py-1 rounded bg-surface-container-highest hover:bg-surface-bright text-[11px] font-medium text-primary border border-primary/20 transition-all cursor-pointer"
                 >
                   Load Preset
@@ -524,83 +811,38 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
             </div>
 
             <div className="p-5 grid grid-cols-12 gap-6 items-start">
-              {/* Left 4 Cols: 64x64 Server Icon Manager */}
-              <div className="col-span-4 bg-surface-container-low rounded-xl p-4 border border-outline-variant/15 flex flex-col justify-between space-y-4">
+              {/* Left 4 Cols: server-icon.png status */}
+              <div className="col-span-4 bg-surface-container-low rounded-xl p-4 border border-white/[0.06] flex flex-col justify-between space-y-4">
                 <div className="flex items-start justify-between">
                   <div>
                     <h3 className="text-xs font-bold text-on-surface">Server FavIcon</h3>
                     <p className="text-[11px] text-outline font-mono mt-0.5">
-                      server-icon.png (64×64 px)
+                      server-icon.png (64×64 px, instance root)
                     </p>
                   </div>
-                  <span className="px-2 py-0.5 rounded text-[10px] font-mono bg-secondary/10 text-secondary border border-secondary/20">
-                    Valid PNG
+                  <span className="px-2 py-0.5 rounded text-[10px] font-mono bg-surface-container-highest text-outline border border-white/[0.06]">
+                    Not read here
                   </span>
                 </div>
 
-                <div className="flex items-center gap-4">
-                  <div
-                    onClick={() =>
-                      onShowToast(
-                        'Icon Selector',
-                        'Validated 64×64 PNG (4.2 KB) with alpha channel support.',
-                        'info',
-                        'image'
-                      )
-                    }
-                    className="relative group w-20 h-20 rounded-lg overflow-hidden border-2 border-primary/40 bg-surface-lowest shrink-0 shadow-lg cursor-pointer"
-                  >
-                    <img
-                      alt="64x64 Server Icon"
-                      className="w-full h-full object-cover"
-                      style={{ imageRendering: 'pixelated' }}
-                      src={HOTLINKED_IMAGES.serverIcon64}
-                    />
-                    <div className="absolute inset-0 bg-surface-lowest/80 opacity-0 group-hover:opacity-100 transition-opacity flex flex-col items-center justify-center text-center p-1">
-                      <span className="material-symbols-outlined text-primary text-[20px]">
-                        upload
-                      </span>
-                      <span className="text-[9px] font-mono text-on-surface uppercase mt-0.5">
-                        Replace
-                      </span>
-                    </div>
+                <div className="flex items-start gap-3">
+                  <div className="size-16 rounded-lg border border-white/[0.06] bg-surface-lowest shrink-0 flex items-center justify-center text-outline">
+                    <span className="material-symbols-outlined text-2xl">image</span>
                   </div>
-                  <div className="space-y-2 flex-1">
-                    <div className="text-[11px] text-outline leading-snug">
-                      Auto-resizes and quantizes uploaded images to strict 64×64 PNG spec.
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <button
-                        onClick={() =>
-                          onShowToast(
-                            'server-icon.png Updated',
-                            'Quantized & saved 64x64 PNG to server root directory.',
-                            'success',
-                            'upload_file'
-                          )
-                        }
-                        className="px-3 py-1.5 rounded-lg bg-primary/15 hover:bg-primary/25 text-primary border border-primary/30 text-[11px] font-semibold transition-all flex items-center gap-1.5 cursor-pointer"
-                      >
-                        <span className="material-symbols-outlined text-[14px]">upload_file</span>
-                        Upload PNG
-                      </button>
-                      <button
-                        onClick={() =>
-                          onShowToast(
-                            'Icon Cleared',
-                            'Reverted to default Minecraft dirt block server icon.',
-                            'warning',
-                            'delete'
-                          )
-                        }
-                        className="p-1.5 rounded-lg bg-surface-container-highest hover:bg-error/20 text-outline hover:text-error border border-outline-variant/20 transition-all cursor-pointer"
-                        title="Remove Icon"
-                      >
-                        <span className="material-symbols-outlined text-[15px]">delete</span>
-                      </button>
-                    </div>
-                  </div>
+                  <p className="text-[11px] text-outline leading-snug">
+                    Minecraft serves{' '}
+                    <span className="font-mono text-on-surface">server-icon.png</span> from the
+                    instance folder. Drop a 64×64 PNG there — the panel's File Manager can replace
+                    or remove it.
+                  </p>
                 </div>
+                <button
+                  onClick={() => onNavigate('files')}
+                  className="px-3 py-1.5 rounded-lg bg-surface-container-high hover:bg-surface-bright text-[11px] font-semibold text-on-surface border border-white/[0.06] transition-all flex items-center gap-1.5 cursor-pointer"
+                >
+                  <span className="material-symbols-outlined text-[14px]">folder_open</span>
+                  Open File Manager
+                </button>
               </div>
 
               {/* Right 8 Cols: Live In-Game Multiplayer Server List Preview + Color Toolbar */}
@@ -610,14 +852,17 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                   <div className="flex items-center justify-between">
                     <span className="text-[10px] font-mono uppercase tracking-wider text-outline flex items-center gap-1.5">
                       <span className="w-2 h-2 rounded-full bg-secondary animate-pulse"></span>
-                      Live Minecraft Multiplayer Server List Preview (1.20.4 Native Client Simulation)
+                      Live Minecraft Multiplayer Server List Preview (1.20.4 Native Client
+                      Simulation)
                     </span>
-                    <span className="text-[10px] font-mono text-outline">Ping: 1ms (Localhost)</span>
+                    <span className="text-[10px] font-mono text-outline">
+                      Ping: 1ms (Localhost)
+                    </span>
                   </div>
 
                   {/* Authentic MC Dirt/Obsidian Dark List Row */}
                   <div
-                    className="p-3.5 rounded-xl border-2 border-[#2c3142] shadow-2xl flex items-center gap-4 relative overflow-hidden"
+                    className="p-3.5 rounded-xl border-2 border-[#2c3142] flex items-center gap-4 relative overflow-hidden"
                     style={{
                       backgroundColor: '#11131a',
                       backgroundImage:
@@ -650,10 +895,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                             {maxPlayers}
                           </span>
                           {/* MC Signal Bars */}
-                          <div
-                            className="flex items-end gap-0.5 h-3.5"
-                            title="1ms Localhost Ping"
-                          >
+                          <div className="flex items-end gap-0.5 h-3.5" title="1ms Localhost Ping">
                             <div className="w-1 h-1.5 bg-[#00FF2A]"></div>
                             <div className="w-1 h-2 bg-[#00FF2A]"></div>
                             <div className="w-1 h-2.5 bg-[#00FF2A]"></div>
@@ -675,7 +917,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                 </div>
 
                 {/* Color Palette & Formatting Swatch Bar */}
-                <div className="bg-surface-container-low p-3 rounded-xl border border-outline-variant/15 space-y-3">
+                <div className="bg-surface-container-low p-3 rounded-xl border border-white/[0.06] space-y-3">
                   <div className="flex items-center justify-between flex-wrap gap-2">
                     {/* 16 Standard Minecraft Color Swatches */}
                     <div className="flex items-center gap-1.5">
@@ -713,28 +955,28 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                     <div className="flex items-center gap-1">
                       <button
                         onClick={() => insertCode('§l')}
-                        className="px-2 py-0.5 rounded bg-surface-container-highest hover:bg-surface-bright text-[11px] font-mono font-bold text-on-surface border border-outline-variant/25 cursor-pointer"
+                        className="px-2 py-0.5 rounded bg-surface-container-highest hover:bg-surface-bright text-[11px] font-mono font-bold text-on-surface border border-white/[0.06] cursor-pointer"
                         title="Bold (§l)"
                       >
                         §l Bold
                       </button>
                       <button
                         onClick={() => insertCode('§o')}
-                        className="px-2 py-0.5 rounded bg-surface-container-highest hover:bg-surface-bright text-[11px] font-mono italic text-on-surface border border-outline-variant/25 cursor-pointer"
+                        className="px-2 py-0.5 rounded bg-surface-container-highest hover:bg-surface-bright text-[11px] font-mono italic text-on-surface border border-white/[0.06] cursor-pointer"
                         title="Italic (§o)"
                       >
                         §o Italic
                       </button>
                       <button
                         onClick={() => insertCode('§n')}
-                        className="px-2 py-0.5 rounded bg-surface-container-highest hover:bg-surface-bright text-[11px] font-mono underline text-on-surface border border-outline-variant/25 cursor-pointer"
+                        className="px-2 py-0.5 rounded bg-surface-container-highest hover:bg-surface-bright text-[11px] font-mono underline text-on-surface border border-white/[0.06] cursor-pointer"
                         title="Underline (§n)"
                       >
                         §n Under
                       </button>
                       <button
                         onClick={() => insertCode('§m')}
-                        className="px-2 py-0.5 rounded bg-surface-container-highest hover:bg-surface-bright text-[11px] font-mono line-through text-on-surface border border-outline-variant/25 cursor-pointer"
+                        className="px-2 py-0.5 rounded bg-surface-container-highest hover:bg-surface-bright text-[11px] font-mono line-through text-on-surface border border-white/[0.06] cursor-pointer"
                         title="Strikethrough (§m)"
                       >
                         §m Strike
@@ -763,7 +1005,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                           setMotdLine1(e.target.value);
                           setHasUnsaved(true);
                         }}
-                        className="w-full bg-surface-lowest border border-outline-variant/25 focus:border-primary rounded-lg px-3 py-1.5 text-xs font-mono text-on-surface focus:outline-none"
+                        className="w-full bg-surface-lowest border border-white/[0.06] focus:border-primary rounded-lg px-3 py-1.5 text-xs font-mono text-on-surface focus:outline-none"
                       />
                     </div>
                     <div>
@@ -778,7 +1020,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                           setMotdLine2(e.target.value);
                           setHasUnsaved(true);
                         }}
-                        className="w-full bg-surface-lowest border border-outline-variant/25 focus:border-primary rounded-lg px-3 py-1.5 text-xs font-mono text-on-surface focus:outline-none"
+                        className="w-full bg-surface-lowest border border-white/[0.06] focus:border-primary rounded-lg px-3 py-1.5 text-xs font-mono text-on-surface focus:outline-none"
                       />
                     </div>
                   </div>
@@ -792,10 +1034,10 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
             {/* Left 6 Cols: General & Network Performance Settings */}
             <section
               id="sec-general"
-              className="col-span-6 bg-surface rounded-xl border border-outline-variant/15 overflow-hidden shadow-lg flex flex-col justify-between"
+              className="col-span-6 bg-surface rounded-xl border border-white/[0.06] overflow-hidden flex flex-col justify-between"
             >
               <div>
-                <div className="px-5 py-3.5 bg-surface-container border-b border-outline-variant/15 flex items-center justify-between">
+                <div className="px-5 py-3.5 bg-surface-container border-b border-white/[0.06] flex items-center justify-between">
                   <div className="flex items-center gap-2.5">
                     <span className="material-symbols-outlined text-primary text-[19px]">tune</span>
                     <h2 className="text-xs font-bold uppercase tracking-wider text-on-surface">
@@ -822,7 +1064,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                           setInstanceName(e.target.value);
                           setHasUnsaved(true);
                         }}
-                        className="w-full bg-surface-lowest border border-outline-variant/25 focus:border-primary rounded-lg px-3 py-2 text-xs text-on-surface font-medium focus:outline-none"
+                        className="w-full bg-surface-lowest border border-white/[0.06] focus:border-primary rounded-lg px-3 py-2 text-xs text-on-surface font-medium focus:outline-none"
                       />
                     </div>
                     <div className="col-span-4">
@@ -848,7 +1090,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                   </div>
 
                   {/* View Distance Slider */}
-                  <div className="p-3.5 rounded-xl bg-surface-container-low border border-outline-variant/15 space-y-2">
+                  <div className="p-3.5 rounded-xl bg-surface-container-low border border-white/[0.06] space-y-2">
                     <div className="flex items-center justify-between">
                       <div>
                         <span className="text-xs font-semibold text-on-surface">
@@ -881,7 +1123,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                   </div>
 
                   {/* Simulation Distance Slider */}
-                  <div className="p-3.5 rounded-xl bg-surface-container-low border border-outline-variant/15 space-y-2">
+                  <div className="p-3.5 rounded-xl bg-surface-container-low border border-white/[0.06] space-y-2">
                     <div className="flex items-center justify-between">
                       <div>
                         <span className="text-xs font-semibold text-on-surface">
@@ -915,7 +1157,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
 
                   {/* Online Mode & Proxy Auth */}
                   <div className="grid grid-cols-2 gap-3 pt-1">
-                    <div className="p-3 rounded-xl bg-surface-container-low border border-outline-variant/15 flex items-center justify-between">
+                    <div className="p-3 rounded-xl bg-surface-container-low border border-white/[0.06] flex items-center justify-between">
                       <div>
                         <div className="text-xs font-semibold text-on-surface flex items-center gap-1.5">
                           Mojang Auth
@@ -931,7 +1173,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                           setOnlineMode(e.target.value);
                           setHasUnsaved(true);
                         }}
-                        className="bg-surface-lowest border border-outline-variant/30 rounded-lg px-2.5 py-1.5 text-xs font-mono text-secondary focus:outline-none cursor-pointer"
+                        className="bg-surface-lowest border border-white/[0.06] rounded-lg px-2.5 py-1.5 text-xs font-mono text-secondary focus:outline-none cursor-pointer"
                       >
                         <option value="true">Premium (True)</option>
                         <option value="velocity">Velocity Proxy</option>
@@ -939,7 +1181,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                       </select>
                     </div>
 
-                    <div className="p-3 rounded-xl bg-surface-container-low border border-outline-variant/15 flex items-center justify-between">
+                    <div className="p-3 rounded-xl bg-surface-container-low border border-white/[0.06] flex items-center justify-between">
                       <div>
                         <div className="text-xs font-semibold text-on-surface">
                           Network Compression
@@ -948,7 +1190,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                           threshold=256 bytes
                         </div>
                       </div>
-                      <span className="px-2 py-1 rounded bg-surface-lowest border border-outline-variant/20 text-xs font-mono text-on-surface">
+                      <span className="px-2 py-1 rounded bg-surface-lowest border border-white/[0.06] text-xs font-mono text-on-surface">
                         256 B
                       </span>
                     </div>
@@ -960,9 +1202,9 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
             {/* Right 6 Cols: World & Gameplay Rules */}
             <section
               id="sec-world"
-              className="col-span-6 bg-surface rounded-xl border border-outline-variant/15 overflow-hidden shadow-lg"
+              className="col-span-6 bg-surface rounded-xl border border-white/[0.06] overflow-hidden "
             >
-              <div className="px-5 py-3.5 bg-surface-container border-b border-outline-variant/15 flex items-center justify-between">
+              <div className="px-5 py-3.5 bg-surface-container border-b border-white/[0.06] flex items-center justify-between">
                 <div className="flex items-center gap-2.5">
                   <span className="material-symbols-outlined text-tertiary text-[19px]">
                     public
@@ -990,7 +1232,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                         setGamemode(e.target.value);
                         setHasUnsaved(true);
                       }}
-                      className="w-full bg-surface-lowest border border-outline-variant/25 focus:border-primary rounded-lg px-3 py-2 text-xs font-medium text-on-surface focus:outline-none cursor-pointer"
+                      className="w-full bg-surface-lowest border border-white/[0.06] focus:border-primary rounded-lg px-3 py-2 text-xs font-medium text-on-surface focus:outline-none cursor-pointer"
                     >
                       <option value="survival">⚔️ Survival (Default)</option>
                       <option value="creative">🧱 Creative Mode</option>
@@ -1006,7 +1248,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                       </label>
                       <span className="text-[10px] font-mono text-primary">difficulty</span>
                     </div>
-                    <div className="grid grid-cols-4 gap-1 bg-surface-lowest p-1 rounded-lg border border-outline-variant/25">
+                    <div className="grid grid-cols-4 gap-1 bg-surface-lowest p-1 rounded-lg border border-white/[0.06]">
                       {(['Peaceful', 'Easy', 'Normal', 'Hard'] as const).map((diff) => (
                         <button
                           key={diff}
@@ -1044,11 +1286,11 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                           setWorldSeed(e.target.value);
                           setHasUnsaved(true);
                         }}
-                        className="w-full bg-surface-lowest border border-outline-variant/25 focus:border-primary rounded-lg px-3 py-1.5 text-xs font-mono text-on-surface focus:outline-none"
+                        className="w-full bg-surface-lowest border border-white/[0.06] focus:border-primary rounded-lg px-3 py-1.5 text-xs font-mono text-on-surface focus:outline-none"
                       />
                       <button
                         onClick={handleRandomizeSeed}
-                        className="px-2.5 py-1.5 rounded-lg bg-surface-container-highest hover:bg-surface-bright text-outline hover:text-on-surface border border-outline-variant/20 text-xs transition-all cursor-pointer"
+                        className="px-2.5 py-1.5 rounded-lg bg-surface-container-highest hover:bg-surface-bright text-outline hover:text-on-surface border border-white/[0.06] text-xs transition-all cursor-pointer"
                         title="Generate Random Seed"
                       >
                         <span className="material-symbols-outlined text-[15px]">casino</span>
@@ -1057,9 +1299,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                   </div>
                   <div className="col-span-4">
                     <div className="flex items-center justify-between mb-1">
-                      <label className="text-xs font-semibold text-on-surface">
-                        Spawn Protect
-                      </label>
+                      <label className="text-xs font-semibold text-on-surface">Spawn Protect</label>
                       <span className="text-[10px] font-mono text-outline">Radius</span>
                     </div>
                     <input
@@ -1069,7 +1309,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                         setSpawnProtection(Number(e.target.value));
                         setHasUnsaved(true);
                       }}
-                      className="w-full bg-surface-lowest border border-outline-variant/25 focus:border-primary rounded-lg px-3 py-1.5 text-xs font-mono text-on-surface focus:outline-none"
+                      className="w-full bg-surface-lowest border border-white/[0.06] focus:border-primary rounded-lg px-3 py-1.5 text-xs font-mono text-on-surface focus:outline-none"
                     />
                   </div>
                 </div>
@@ -1082,7 +1322,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                       setPvpCombat(!pvpCombat);
                       setHasUnsaved(true);
                     }}
-                    className="p-3 rounded-xl bg-surface-container-low border border-outline-variant/15 flex items-center justify-between cursor-pointer hover:border-outline-variant/30 transition-all"
+                    className="p-3 rounded-xl bg-surface-container-low border border-white/[0.06] flex items-center justify-between cursor-pointer hover:border-white/[0.06] transition-all"
                   >
                     <div>
                       <div className="text-xs font-semibold text-on-surface">PvP Combat</div>
@@ -1095,7 +1335,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                       className={`w-10 h-5 rounded-full relative transition-colors ${
                         pvpCombat
                           ? 'bg-secondary/25 border border-secondary/50'
-                          : 'bg-surface-container-highest border border-outline-variant/30'
+                          : 'bg-surface-container-highest border border-white/[0.06]'
                       }`}
                     >
                       <span
@@ -1112,7 +1352,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                       setHardcoreMode(!hardcoreMode);
                       setHasUnsaved(true);
                     }}
-                    className="p-3 rounded-xl bg-surface-container-low border border-outline-variant/15 flex items-center justify-between cursor-pointer hover:border-outline-variant/30 transition-all"
+                    className="p-3 rounded-xl bg-surface-container-low border border-white/[0.06] flex items-center justify-between cursor-pointer hover:border-white/[0.06] transition-all"
                   >
                     <div>
                       <div className="text-xs font-semibold text-on-surface">
@@ -1127,7 +1367,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                       className={`w-10 h-5 rounded-full relative transition-colors ${
                         hardcoreMode
                           ? 'bg-error/25 border border-error/50'
-                          : 'bg-surface-container-highest border border-outline-variant/30'
+                          : 'bg-surface-container-highest border border-white/[0.06]'
                       }`}
                     >
                       <span
@@ -1144,7 +1384,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                       setAllowFlight(!allowFlight);
                       setHasUnsaved(true);
                     }}
-                    className="p-3 rounded-xl bg-surface-container-low border border-outline-variant/15 flex items-center justify-between cursor-pointer hover:border-outline-variant/30 transition-all"
+                    className="p-3 rounded-xl bg-surface-container-low border border-white/[0.06] flex items-center justify-between cursor-pointer hover:border-white/[0.06] transition-all"
                   >
                     <div>
                       <div className="text-xs font-semibold text-on-surface">
@@ -1159,7 +1399,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                       className={`w-10 h-5 rounded-full relative transition-colors ${
                         allowFlight
                           ? 'bg-secondary/25 border border-secondary/50'
-                          : 'bg-surface-container-highest border border-outline-variant/30'
+                          : 'bg-surface-container-highest border border-white/[0.06]'
                       }`}
                     >
                       <span
@@ -1176,7 +1416,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                       setCommandBlocks(!commandBlocks);
                       setHasUnsaved(true);
                     }}
-                    className="p-3 rounded-xl bg-surface-container-low border border-outline-variant/15 flex items-center justify-between cursor-pointer hover:border-outline-variant/30 transition-all"
+                    className="p-3 rounded-xl bg-surface-container-low border border-white/[0.06] flex items-center justify-between cursor-pointer hover:border-white/[0.06] transition-all"
                   >
                     <div>
                       <div className="text-xs font-semibold text-on-surface">Command Blocks</div>
@@ -1189,7 +1429,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                       className={`w-10 h-5 rounded-full relative transition-colors ${
                         commandBlocks
                           ? 'bg-secondary/25 border border-secondary/50'
-                          : 'bg-surface-container-highest border border-outline-variant/30'
+                          : 'bg-surface-container-highest border border-white/[0.06]'
                       }`}
                     >
                       <span
@@ -1209,10 +1449,10 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
             {/* Left 7 Cols: Access Control, Whitelist & Server Operators */}
             <section
               id="sec-whitelist"
-              className="col-span-7 bg-surface rounded-xl border border-outline-variant/15 overflow-hidden shadow-lg flex flex-col justify-between"
+              className="col-span-7 bg-surface rounded-xl border border-white/[0.06] overflow-hidden flex flex-col justify-between"
             >
               <div>
-                <div className="px-5 py-3.5 bg-surface-container border-b border-outline-variant/15 flex items-center justify-between">
+                <div className="px-5 py-3.5 bg-surface-container border-b border-white/[0.06] flex items-center justify-between">
                   <div className="flex items-center gap-2.5">
                     <span className="material-symbols-outlined text-secondary text-[19px]">
                       verified_user
@@ -1234,7 +1474,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                         className={`w-8 h-4 rounded-full relative inline-block transition-colors ${
                           enforceWhitelist
                             ? 'bg-secondary/25 border border-secondary/50'
-                            : 'bg-surface-container-highest border border-outline-variant/30'
+                            : 'bg-surface-container-highest border border-white/[0.06]'
                         }`}
                       >
                         <span
@@ -1280,7 +1520,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                   {whitelistPlayers.map((player) => (
                     <div
                       key={player.id}
-                      className="p-2.5 rounded-lg bg-surface-container-low border border-outline-variant/15 flex items-center justify-between"
+                      className="p-2.5 rounded-lg bg-surface-container-low border border-white/[0.06] flex items-center justify-between"
                     >
                       <div className="flex items-center gap-3">
                         <img
@@ -1300,8 +1540,8 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                                 player.role === 'OP LVL 4'
                                   ? 'bg-primary-gold/15 text-primary-gold border border-primary-gold/30'
                                   : player.role === 'OP LVL 3'
-                                  ? 'bg-primary/15 text-primary border border-primary/30'
-                                  : 'bg-surface-container-highest text-outline'
+                                    ? 'bg-primary/15 text-primary border border-primary/30'
+                                    : 'bg-surface-container-highest text-outline'
                               }`}
                             >
                               {player.role}
@@ -1340,7 +1580,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                 </div>
               </div>
 
-              <div className="px-5 py-2.5 bg-surface-container-low border-t border-outline-variant/15 flex items-center justify-between text-[11px] font-mono text-outline">
+              <div className="px-5 py-2.5 bg-surface-container-low border-t border-white/[0.06] flex items-center justify-between text-[11px] font-mono text-outline">
                 <span>
                   whitelist.json: {whitelistPlayers.length} Players • ops.json:{' '}
                   {whitelistPlayers.filter((p) => p.role.startsWith('OP')).length} Operators
@@ -1351,7 +1591,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                       'Mojang UUID Cache Synced',
                       'Verified all player profiles against sessionserver.mojang.com.',
                       'success',
-                      'sync'
+                      'sync',
                     )
                   }
                   className="text-primary hover:underline cursor-pointer"
@@ -1366,7 +1606,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
               {/* Mojang EULA Card */}
               <section
                 id="sec-eula"
-                className="bg-surface rounded-xl border border-secondary/25 overflow-hidden shadow-lg p-5 flex items-center justify-between"
+                className="bg-surface rounded-xl border border-secondary/25 overflow-hidden p-5 flex items-center justify-between"
               >
                 <div className="flex items-start gap-3.5">
                   <div className="w-10 h-10 rounded-lg bg-secondary/15 border border-secondary/30 flex items-center justify-center text-secondary shrink-0">
@@ -1389,7 +1629,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                 </div>
                 <button
                   onClick={() => onNavigate('files')}
-                  className="px-3 py-1.5 rounded-lg bg-surface-container-high hover:bg-surface-bright text-[11px] font-mono text-on-surface border border-outline-variant/25 shrink-0 cursor-pointer"
+                  className="px-3 py-1.5 rounded-lg bg-surface-container-high hover:bg-surface-bright text-[11px] font-mono text-on-surface border border-white/[0.06] shrink-0 cursor-pointer"
                 >
                   View eula.txt
                 </button>
@@ -1398,7 +1638,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
               {/* Critical Danger Zone Card */}
               <section
                 id="sec-danger"
-                className="bg-surface rounded-xl border border-error/30 overflow-hidden shadow-lg flex-1 flex flex-col justify-between"
+                className="bg-surface rounded-xl border border-error/30 overflow-hidden flex-1 flex flex-col justify-between"
               >
                 <div className="px-5 py-3 bg-error/10 border-b border-error/20 flex items-center justify-between">
                   <div className="flex items-center gap-2">
@@ -1415,7 +1655,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                 </div>
 
                 <div className="p-4 space-y-3">
-                  <div className="flex items-center justify-between p-2.5 rounded-lg bg-surface-container-low border border-outline-variant/15">
+                  <div className="flex items-center justify-between p-2.5 rounded-lg bg-surface-container-low border border-white/[0.06]">
                     <div>
                       <div className="text-xs font-bold text-on-surface">
                         Reset End &amp; Nether Dimensions
@@ -1430,7 +1670,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                           'Snapshot Created Before Wipe',
                           'Queued DIM1 & DIM-1 dimension reset for next server restart.',
                           'warning',
-                          'restart_alt'
+                          'restart_alt',
                         )
                       }
                       className="px-3 py-1.5 rounded-lg bg-error/15 hover:bg-error/25 text-error border border-error/30 text-[11px] font-semibold transition-all shrink-0 cursor-pointer"
@@ -1439,7 +1679,7 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                     </button>
                   </div>
 
-                  <div className="flex items-center justify-between p-2.5 rounded-lg bg-surface-container-low border border-outline-variant/15">
+                  <div className="flex items-center justify-between p-2.5 rounded-lg bg-surface-container-low border border-white/[0.06]">
                     <div>
                       <div className="text-xs font-bold text-on-surface">
                         Regenerate Entire World
@@ -1454,10 +1694,10 @@ export const ServerSettingsView: React.FC<ServerSettingsViewProps> = ({
                           'World Archive Queued',
                           'Current world backed up to ZSTD archive; fresh seed queued.',
                           'error',
-                          'delete_forever'
+                          'delete_forever',
                         )
                       }
-                      className="px-3 py-1.5 rounded-lg bg-error hover:opacity-90 text-on-error text-[11px] font-bold transition-all shrink-0 shadow shadow-error/20 cursor-pointer"
+                      className="px-3 py-1.5 rounded-lg bg-error hover:opacity-90 text-on-error text-[11px] font-bold transition-all shrink-0 shadow cursor-pointer"
                     >
                       Regenerate World
                     </button>

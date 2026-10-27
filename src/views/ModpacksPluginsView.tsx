@@ -15,7 +15,7 @@ interface ModpacksPluginsViewProps {
     title: string,
     body?: string,
     type?: 'success' | 'info' | 'warning' | 'error',
-    icon?: string
+    icon?: string,
   ) => void;
 }
 
@@ -65,7 +65,12 @@ const SERVER_JAR_ENGINES = [
   { id: 'folia', label: 'Folia', badge: 'Region Multithreading', color: 'text-tertiary' },
   { id: 'fabric', label: 'Fabric Loader', badge: 'Lightweight Modded', color: 'text-primary' },
   { id: 'velocity', label: 'Velocity Proxy', badge: 'Cluster Edge Proxy', color: 'text-secondary' },
-  { id: 'vanilla', label: 'Vanilla Mojang', badge: 'Official Piston API', color: 'text-on-surface' },
+  {
+    id: 'vanilla',
+    label: 'Vanilla Mojang',
+    badge: 'Official Piston API',
+    color: 'text-on-surface',
+  },
   { id: 'waterfall', label: 'Waterfall Proxy', badge: 'BungeeCord Fork', color: 'text-tertiary' },
   { id: 'spigot', label: 'SpigotMC', badge: 'CraftBukkit Standard', color: 'text-primary' },
   { id: 'neoforge', label: 'NeoForge', badge: 'Modern Mod Loader', color: 'text-secondary' },
@@ -147,7 +152,7 @@ export const ModpacksPluginsView: React.FC<ModpacksPluginsViewProps> = ({
         setLiveLoading(false);
       }
     },
-    []
+    [],
   );
 
   useEffect(() => {
@@ -175,40 +180,71 @@ export const ModpacksPluginsView: React.FC<ModpacksPluginsViewProps> = ({
     }
   };
 
-  // Install a Live Mod or Plugin into the active server
-  const handleInstallLivePackage = (item: LiveModrinthItem, versionLabel?: string, filename?: string) => {
-    const ver = versionLabel || item.latestMcVersion || 'Latest';
-    setInstalledLiveIds((prev) => ({ ...prev, [item.id]: ver }));
-
-    if (onAddCustomPlugin) {
-      const newPlugin: PluginItem = {
+  // Install a live Modrinth mod/plugin: the backend downloads the real file into
+  // the instance's mods/ or plugins/ folder and reports what it wrote.
+  const handleInstallLivePackage = async (
+    item: LiveModrinthItem,
+    versionLabel?: string,
+    _filename?: string,
+    versionId?: string,
+  ) => {
+    try {
+      const res = await fetch('/api/marketplace/install', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          serverId: server.id,
+          serverName: server.name,
+          slug: item.slug,
+          projectType: item.projectType === 'plugin' ? 'plugin' : 'mod',
+          versionId,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data?.ok) {
+        onShowToast(
+          'Install failed',
+          String(data?.error || 'The backend could not download that file'),
+          'error',
+          'error',
+        );
+        return;
+      }
+      const installedVersion = String(data.versionNumber || versionLabel || 'installed');
+      setInstalledLiveIds((prev) => ({ ...prev, [item.id]: installedVersion }));
+      onAddCustomPlugin?.({
         id: `live-${item.slug}`,
         code: item.name.slice(0, 2).toUpperCase(),
         codeColor: 'bg-primary/20 text-primary',
         name: item.name,
         author: item.author,
         category: item.projectType.toUpperCase(),
-        filterCategory: 'Optimization & Profiling',
+        filterCategory: item.categories[0] || item.projectType,
         source: 'Modrinth',
         description: item.description,
-        rating: '4.9',
+        rating: '—',
         downloads: `${(item.downloads / 1000).toFixed(1)}k`,
-        version: `${ver} Installed`,
+        version: `${installedVersion} Installed`,
         status: 'installed',
         extraTag: item.categories[0] || item.projectType,
-        footerLeft: filename || `${item.slug}-${ver}.jar`,
-      };
-      onAddCustomPlugin(newPlugin);
+        footerLeft: String(data.filename || `${item.slug}.jar`),
+      });
+      onShowToast(
+        `Installed ${item.name} (${installedVersion})`,
+        `${data.filename} was written to ${data.relativePath} (${(
+          (Number(data.bytes) || 0) / 1048576
+        ).toFixed(1)} MB). Restart the server to load it.`,
+        'success',
+        'download_done',
+      );
+    } catch (err) {
+      onShowToast(
+        'Install failed',
+        err instanceof Error ? err.message : 'Backend unreachable',
+        'error',
+        'error',
+      );
     }
-
-    onShowToast(
-      `Installed ${item.name} (${ver})`,
-      `Fetched ${filename || `${item.slug}.jar`} into ${server.path}\\${
-        item.projectType === 'mod' ? 'mods' : 'plugins'
-      }`,
-      'success',
-      'download_done'
-    );
   };
 
   // Fetch Real-Time Server.jar Versions when Engine changes
@@ -219,9 +255,7 @@ export const ModpacksPluginsView: React.FC<ModpacksPluginsViewProps> = ({
       const data = await resp.json();
       if (data.ok && Array.isArray(data.versions) && data.versions.length > 0) {
         setEngineVersions(data.versions);
-        const preferred = data.versions.includes('1.20.4')
-          ? '1.20.4'
-          : data.versions[0];
+        const preferred = data.versions.includes('1.20.4') ? '1.20.4' : data.versions[0];
         setSelectedMcVersion(preferred);
       }
     } catch {
@@ -237,7 +271,7 @@ export const ModpacksPluginsView: React.FC<ModpacksPluginsViewProps> = ({
     setBuildsLoading(true);
     try {
       const resp = await fetch(
-        `/api/jars/engines/${encodeURIComponent(engineId)}/${encodeURIComponent(mcVersion)}`
+        `/api/jars/engines/${encodeURIComponent(engineId)}/${encodeURIComponent(mcVersion)}`,
       );
       const data = await resp.json();
       if (data.ok && Array.isArray(data.builds)) {
@@ -262,7 +296,7 @@ export const ModpacksPluginsView: React.FC<ModpacksPluginsViewProps> = ({
 
   const stagedUpdatesCount = plugins.filter((p) => p.status === 'update_ready').length;
   const installedCount = plugins.filter(
-    (p) => p.status === 'installed' || p.status === 'update_ready'
+    (p) => p.status === 'installed' || p.status === 'update_ready',
   ).length;
 
   const filteredPlugins = plugins.filter((p) => {
@@ -280,10 +314,10 @@ export const ModpacksPluginsView: React.FC<ModpacksPluginsViewProps> = ({
       activeTab === 'browse'
         ? true
         : activeTab === 'installed'
-        ? p.status === 'installed' || p.status === 'update_ready'
-        : activeTab === 'updates'
-        ? p.status === 'update_ready'
-        : true;
+          ? p.status === 'installed' || p.status === 'update_ready'
+          : activeTab === 'updates'
+            ? p.status === 'update_ready'
+            : true;
 
     return matchesSearch && matchesSource && matchesCategory && matchesTab;
   });
@@ -307,85 +341,70 @@ export const ModpacksPluginsView: React.FC<ModpacksPluginsViewProps> = ({
   return (
     <div className="flex-1 overflow-y-auto p-6 space-y-5">
       {/* ================= 1. CONTEXT / HEADER BAR ================= */}
-      <div className="flex flex-col xl:flex-row items-start xl:items-center justify-between gap-4 p-4 rounded-xl bg-surface-container-low border border-white/10 shadow-md">
-        <div className="space-y-1.5">
-          <div className="flex items-center gap-2">
-            <span className="font-label-caps text-label-caps uppercase text-primary tracking-widest">
-              Server Operations
-            </span>
-            <span className="text-on-surface-variant/40 text-xs">/</span>
-            <span className="font-headline-sm text-headline-sm text-on-surface">
-              Real-Time Mods, Plugins &amp; Server.jar Hub
-            </span>
-            <span className="font-code-sm text-code-sm px-2 py-0.5 rounded-full bg-secondary/15 text-secondary border border-secondary/30 flex items-center gap-1">
-              <span className="size-1.5 rounded-full bg-secondary animate-ping" />
-              LIVE API CONNECTED
+      <div className="flex flex-col xl:flex-row items-start xl:items-center justify-between gap-3 px-4 py-3 rounded-xl bg-surface border border-white/[0.06]">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2.5">
+            <span className="material-symbols-outlined text-[17px] text-primary">extension</span>
+            <h1 className="text-[14.5px] font-semibold text-on-surface whitespace-nowrap">
+              Mods &amp; Plugins
+            </h1>
+            <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md border border-secondary/25 bg-secondary/10 text-secondary font-mono text-[10.5px]">
+              <span className="size-1.5 rounded-full bg-secondary" />
+              Live API
             </span>
           </div>
 
-          <div className="flex flex-wrap items-center gap-2.5">
-            <div className="flex items-center gap-2 px-2.5 py-1 rounded-lg bg-surface-container-high text-on-surface text-body-sm font-body-sm">
-              <span className="size-2 rounded-full bg-secondary shadow-[0_0_8px_rgba(78,222,163,0.6)]" />
-              <span className="font-semibold text-white">{server.name}</span>
-              <span className="font-code-sm text-code-sm text-on-surface-variant">
-                {server.engine}
-              </span>
-              <span className="text-on-surface-variant/40">•</span>
-              <span className="font-code-sm text-code-sm text-tertiary">{server.javaVersion}</span>
-            </div>
-
-            <div className="hidden sm:flex items-center gap-3 px-3 py-1 rounded-lg bg-surface-container text-on-surface-variant font-code-sm text-code-sm">
-              <span>
-                <strong className="text-white">
-                  {41 + installedCount + Object.keys(installedLiveIds).length}
-                </strong>{' '}
-                Installed
-              </span>
-              <span className="text-on-surface-variant/30">|</span>
-              <span className="text-primary font-semibold">
-                <strong className="text-primary">{stagedUpdatesCount}</strong> Updates Staged
-              </span>
-              <span className="text-on-surface-variant/30">|</span>
-              <span>
-                <strong className="text-white">
-                  {liveTotalHits > 0 ? liveTotalHits.toLocaleString() : '54,820'}
-                </strong>{' '}
-                Live Repos Indexed
-              </span>
-              <span className="text-on-surface-variant/30">|</span>
-              <span className="flex items-center gap-1 text-secondary">
-                <span className="material-symbols-outlined text-xs">verified</span> SHA-256/512
-                Verified
-              </span>
-            </div>
+          <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 mt-1.5 font-mono text-[11px] text-outline">
+            <span className="text-on-surface">{server.name}</span>
+            <span className="text-white/15">|</span>
+            <span>{server.engine}</span>
+            <span className="text-white/15">|</span>
+            <span>{server.javaVersion}</span>
+            <span className="text-white/15">|</span>
+            <span>
+              <span className="text-on-surface">
+                {41 + installedCount + Object.keys(installedLiveIds).length}
+              </span>{' '}
+              installed
+            </span>
+            <span className="text-white/15">|</span>
+            <span>
+              <span className="text-primary">{stagedUpdatesCount}</span> updates staged
+            </span>
+            <span className="text-white/15">|</span>
+            <span>
+              <span className="text-on-surface">
+                {liveTotalHits > 0 ? liveTotalHits.toLocaleString() : '54,820'}
+              </span>{' '}
+              repos indexed
+            </span>
+            <span className="text-white/15">|</span>
+            <span className="flex items-center gap-1">
+              <span className="material-symbols-outlined text-[13px]">verified</span>
+              SHA-256
+            </span>
           </div>
         </div>
 
         {/* Right: High-Priority Action Cluster */}
-        <div className="flex flex-wrap items-center gap-2 self-stretch xl:self-auto justify-end">
+        <div className="flex flex-wrap items-center gap-2 self-stretch xl:self-auto justify-end shrink-0">
           <button
             type="button"
             onClick={() => setActiveTab('server_jars')}
-            className={`flex items-center gap-2 px-3.5 py-2 rounded-lg font-title-md text-title-md transition-all cursor-pointer border ${
-              activeTab === 'server_jars'
-                ? 'bg-tertiary text-surface-dim font-bold border-tertiary shadow-lg'
-                : 'bg-surface-container-high hover:bg-surface-bright text-tertiary border-tertiary/30'
-            }`}
+            className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg border border-white/10 bg-white/[0.02] hover:bg-white/[0.06] text-[11.5px] font-medium text-on-surface transition-colors cursor-pointer"
           >
-            <span className="material-symbols-outlined text-base">dns</span>
-            <span>Fetch Server.jar (All Versions)</span>
+            <span className="material-symbols-outlined text-[16px] text-outline">dns</span>
+            <span>Fetch server.jar</span>
           </button>
 
           <button
             type="button"
             onClick={onUpdateAllPlugins}
-            className="relative group flex items-center gap-2 px-3.5 py-2 rounded-lg bg-primary-container text-on-primary font-title-md text-title-md shadow-lg shadow-primary/20 hover:bg-primary transition-all cursor-pointer"
+            className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg bg-primary hover:brightness-105 text-on-primary text-[11.5px] font-semibold transition-all cursor-pointer"
           >
-            <span className="material-symbols-outlined text-base group-hover:rotate-180 transition-transform duration-500">
-              sync
-            </span>
-            <span>1-Click Update All</span>
-            <span className="size-5 rounded-full bg-on-primary-container text-primary-fixed font-code-sm text-code-sm flex items-center justify-center font-bold">
+            <span className="material-symbols-outlined text-[16px]">sync</span>
+            <span>Update all</span>
+            <span className="ml-0.5 px-1.5 rounded bg-black/20 font-mono text-[10px]">
               {stagedUpdatesCount}
             </span>
           </button>
@@ -399,43 +418,43 @@ export const ModpacksPluginsView: React.FC<ModpacksPluginsViewProps> = ({
                 'Live Repositories Refreshed',
                 'Synced real-time Modrinth v2, PaperMC, Purpur, Fabric & Mojang manifests.',
                 'success',
-                'refresh'
+                'refresh',
               );
             }}
-            className="p-2 rounded-lg bg-surface-container-high hover:bg-surface-bright text-on-surface-variant hover:text-white transition-colors shadow-sm cursor-pointer"
-            title="Refresh Real-Time Index"
+            className="inline-flex items-center justify-center size-8 rounded-lg border border-white/10 bg-white/[0.02] hover:bg-white/[0.06] text-outline hover:text-white transition-colors cursor-pointer"
+            title="Refresh real-time index"
           >
-            <span className="material-symbols-outlined text-base">refresh</span>
+            <span className="material-symbols-outlined text-[16px]">refresh</span>
           </button>
         </div>
       </div>
 
       {/* ================= 2. SEARCH & LIVE REGISTRY FILTER HUB ================= */}
-      <div className="p-4 rounded-xl bg-surface-container border border-white/10 space-y-3.5 shadow-md">
-        <div className="flex flex-col md:flex-row items-stretch md:items-center gap-3">
+      <div className="px-4 py-3 rounded-xl bg-surface border border-white/[0.06]">
+        <div className="flex flex-col md:flex-row items-stretch md:items-center gap-2">
           <div className="relative flex-1">
-            <span className="material-symbols-outlined absolute left-3.5 top-1/2 -translate-y-1/2 text-primary text-lg">
+            <span className="material-symbols-outlined absolute left-3 top-1/2 -translate-y-1/2 text-outline text-[17px]">
               search
             </span>
             <input
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full pl-10 pr-28 py-2.5 rounded-lg bg-surface-container-lowest text-on-surface placeholder:text-on-surface-variant/60 font-body-md text-body-md border border-white/10 focus:outline-none focus:border-primary transition-colors shadow-inner"
-              placeholder="Real-time search 50,000+ Mods, Plugins, Modpacks (e.g. Lithium, WorldEdit, Create, Geyser)..."
+              className="w-full h-9 pl-9 pr-20 rounded-lg bg-surface-container-lowest text-on-surface placeholder:text-outline/70 font-mono text-[11.5px] border border-white/10 focus:outline-none focus:border-primary/50 transition-colors"
+              placeholder="Search mods, plugins and modpacks…"
             />
-            <div className="absolute right-3 top-1/2 -translate-y-1/2 flex items-center gap-1.5">
+            <div className="absolute right-2.5 top-1/2 -translate-y-1/2 flex items-center gap-1.5">
               {liveLoading && (
-                <span className="size-4 border-2 border-primary border-t-transparent rounded-full animate-spin" />
+                <span className="size-3.5 border-2 border-primary border-t-transparent rounded-full animate-spin" />
               )}
-              <span className="px-1.5 py-0.5 rounded bg-secondary/15 text-secondary font-code-sm text-[10px]">
+              <span className="px-1.5 py-0.5 rounded bg-secondary/10 text-secondary font-mono text-[10px]">
                 LIVE
               </span>
             </div>
           </div>
 
           {/* Real-Time Project Type Selector */}
-          <div className="flex flex-wrap items-center gap-1.5 bg-surface-container-lowest p-1 rounded-lg border border-white/10">
+          <div className="flex flex-wrap items-center gap-0.5 p-0.5 rounded-lg border border-white/10 h-9">
             {[
               { id: 'plugin', label: 'Plugins', icon: 'extension' },
               { id: 'mod', label: 'Mods (Fabric/Forge)', icon: 'memory' },
@@ -448,26 +467,26 @@ export const ModpacksPluginsView: React.FC<ModpacksPluginsViewProps> = ({
                   setLiveProjectType(t.id as 'plugin' | 'mod' | 'modpack');
                   if (activeTab !== 'live_registry') setActiveTab('live_registry');
                 }}
-                className={`px-3 py-1.5 rounded-md font-code-sm text-code-sm flex items-center gap-1.5 transition-colors cursor-pointer ${
+                className={`h-8 px-2.5 rounded-md font-mono text-[11px] flex items-center gap-1.5 transition-colors cursor-pointer ${
                   liveProjectType === t.id && activeTab === 'live_registry'
-                    ? 'bg-primary text-on-primary font-bold shadow-sm'
-                    : 'text-on-surface-variant hover:text-white'
+                    ? 'bg-white/10 text-white font-semibold'
+                    : 'text-outline hover:text-white'
                 }`}
               >
-                <span className="material-symbols-outlined text-sm">{t.icon}</span>
+                <span className="material-symbols-outlined text-[15px]">{t.icon}</span>
                 <span>{t.label}</span>
               </button>
             ))}
           </div>
 
           {/* Loader Filter */}
-          <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-surface-container-low border border-white/10 text-body-sm font-body-sm text-on-surface">
-            <span className="material-symbols-outlined text-sm text-primary">filter_alt</span>
-            <span className="text-on-surface-variant text-xs">Loader:</span>
+          <div className="flex items-center gap-1.5 h-9 px-2.5 rounded-lg bg-surface-container-lowest border border-white/10">
+            <span className="material-symbols-outlined text-[15px] text-outline">filter_alt</span>
+            <span className="text-outline font-mono text-[11px]">Loader</span>
             <select
               value={liveLoader}
               onChange={(e) => setLiveLoader(e.target.value)}
-              className="bg-transparent text-white font-mono text-xs font-bold focus:outline-none cursor-pointer"
+              className="bg-transparent text-on-surface font-mono text-[11.5px] focus:outline-none cursor-pointer"
             >
               <option value="" className="bg-surface-container">
                 All Loaders
@@ -502,81 +521,65 @@ export const ModpacksPluginsView: React.FC<ModpacksPluginsViewProps> = ({
       </div>
 
       {/* ================= 3. PRIMARY WORKSPACE MODE TABS ================= */}
-      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-2">
-        <div className="flex flex-wrap items-center gap-2">
-          <button
-            type="button"
-            onClick={() => setActiveTab('live_registry')}
-            className={`flex items-center gap-2 px-3.5 py-2 rounded-lg font-title-md text-title-md transition-colors cursor-pointer ${
-              activeTab === 'live_registry'
-                ? 'bg-primary text-on-primary font-bold shadow-md'
-                : 'bg-surface-container-low text-on-surface-variant hover:text-white'
-            }`}
-          >
-            <span className="material-symbols-outlined text-base">cloud_download</span>
-            <span>Real-Time Mods &amp; Plugins (Live API)</span>
-            <span
-              className={`px-1.5 py-0.5 rounded-full font-code-sm text-[10px] ${
-                activeTab === 'live_registry'
-                  ? 'bg-black/25 text-white'
-                  : 'bg-secondary/15 text-secondary'
+      <div className="flex flex-wrap items-center gap-1 border-b border-white/[0.06]">
+        {(
+          [
+            {
+              id: 'live_registry' as const,
+              icon: 'cloud_download',
+              label: 'Registry',
+              count: liveTotalHits > 0 ? liveTotalHits.toLocaleString() : 'Live',
+            },
+            {
+              id: 'server_jars' as const,
+              icon: 'dns',
+              label: 'Server.jar',
+              count: '10 engines',
+            },
+            {
+              id: 'installed' as const,
+              icon: 'inventory_2',
+              label: 'Installed',
+              count: String(plugins.length),
+            },
+            {
+              id: 'updates' as const,
+              icon: 'pending_actions',
+              label: 'Staged updates',
+              count: String(stagedUpdatesCount),
+            },
+          ] as const
+        ).map((tab) => {
+          const isActive = activeTab === tab.id;
+          return (
+            <button
+              key={tab.id}
+              type="button"
+              onClick={() => setActiveTab(tab.id)}
+              className={`inline-flex items-center gap-1.5 h-9 px-3 -mb-px border-b-2 font-mono text-[11.5px] transition-colors cursor-pointer ${
+                isActive
+                  ? 'border-primary text-white font-semibold'
+                  : 'border-transparent text-outline hover:text-white'
               }`}
             >
-              {liveTotalHits > 0 ? liveTotalHits.toLocaleString() : 'Live'}
-            </span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => setActiveTab('server_jars')}
-            className={`flex items-center gap-2 px-3.5 py-2 rounded-lg font-title-md text-title-md transition-colors cursor-pointer ${
-              activeTab === 'server_jars'
-                ? 'bg-tertiary text-surface-dim font-bold shadow-md'
-                : 'bg-surface-container-low text-on-surface-variant hover:text-white'
-            }`}
-          >
-            <span className="material-symbols-outlined text-base">dns</span>
-            <span>Real-Time Server.jar Fetcher (All Versions)</span>
-            <span className="px-1.5 py-0.5 rounded-full bg-surface-container-high text-tertiary font-code-sm text-[10px]">
-              10 Engines
-            </span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => setActiveTab('installed')}
-            className={`flex items-center gap-2 px-3.5 py-2 rounded-lg font-body-md text-body-md transition-colors cursor-pointer ${
-              activeTab === 'installed'
-                ? 'bg-surface-container-high text-white font-bold shadow-sm'
-                : 'text-on-surface-variant hover:text-white hover:bg-surface-container-low'
-            }`}
-          >
-            <span className="material-symbols-outlined text-base">inventory_2</span>
-            <span>Installed Packages</span>
-            <span className="px-1.5 py-0.5 rounded-full bg-surface-container-high text-on-surface font-code-sm text-code-sm">
-              {plugins.length}
-            </span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => setActiveTab('updates')}
-            className={`flex items-center gap-2 px-3.5 py-2 rounded-lg font-body-md text-body-md transition-colors cursor-pointer ${
-              activeTab === 'updates'
-                ? 'bg-surface-container-high text-primary font-bold shadow-sm'
-                : 'text-primary hover:bg-surface-container-low'
-            }`}
-          >
-            <span className="material-symbols-outlined text-base">pending_actions</span>
-            <span>Staged Updates ({stagedUpdatesCount})</span>
-          </button>
-        </div>
+              <span className="material-symbols-outlined text-[16px]">{tab.icon}</span>
+              <span>{tab.label}</span>
+              <span
+                className={`px-1.5 py-0.5 rounded font-mono text-[10px] ${
+                  isActive ? 'bg-primary/15 text-primary' : 'bg-white/[0.05] text-outline'
+                }`}
+              >
+                {tab.count}
+              </span>
+            </button>
+          );
+        })}
       </div>
 
       {/* ================= 4A. REAL-TIME SERVER.JAR FETCHER FOR ALL ENGINES & VERSIONS ================= */}
       {activeTab === 'server_jars' && (
         <div className="space-y-5">
-          <div className="p-5 rounded-xl bg-surface-container-low border border-white/10 shadow-lg space-y-4">
+          <div className="p-5 rounded-xl bg-surface-container-low border border-white/[0.08] space-y-4">
             <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
               <div>
                 <h2 className="font-headline-sm text-headline-sm text-white font-bold flex items-center gap-2">
@@ -611,8 +614,8 @@ export const ModpacksPluginsView: React.FC<ModpacksPluginsViewProps> = ({
                       onClick={() => setSelectedEngine(eng.id)}
                       className={`p-3 rounded-xl text-left transition-all cursor-pointer border ${
                         isSelected
-                          ? 'bg-surface-container-high border-primary shadow-md'
-                          : 'bg-surface-container border-white/5 hover:border-white/20'
+                          ? 'bg-surface-container-high border-primary '
+                          : 'bg-surface-container border-white/[0.06] hover:border-white/20'
                       }`}
                     >
                       <div className="flex items-center justify-between">
@@ -644,7 +647,7 @@ export const ModpacksPluginsView: React.FC<ModpacksPluginsViewProps> = ({
                   value={versionFilterText}
                   onChange={(e) => setVersionFilterText(e.target.value)}
                   placeholder="Filter version (e.g. 1.21, 1.20.4, 1.19, 1.8)..."
-                  className="px-3 py-1 rounded-lg bg-surface-container text-xs font-mono text-white border border-white/10 focus:outline-none focus:border-primary"
+                  className="px-3 py-1 rounded-lg bg-surface-container text-xs font-mono text-white border border-white/[0.08] focus:outline-none focus:border-primary"
                 />
               </div>
 
@@ -654,12 +657,12 @@ export const ModpacksPluginsView: React.FC<ModpacksPluginsViewProps> = ({
                   Querying live version manifest for {selectedEngine.toUpperCase()}...
                 </div>
               ) : (
-                <div className="flex flex-wrap gap-1.5 max-h-36 overflow-y-auto p-2.5 rounded-lg bg-surface-container-lowest border border-white/5">
+                <div className="flex flex-wrap gap-1.5 max-h-36 overflow-y-auto p-2.5 rounded-lg bg-surface-container-lowest border border-white/[0.06]">
                   {engineVersions
                     .filter(
                       (v) =>
                         !versionFilterText ||
-                        v.toLowerCase().includes(versionFilterText.toLowerCase())
+                        v.toLowerCase().includes(versionFilterText.toLowerCase()),
                     )
                     .map((ver) => (
                       <button
@@ -668,7 +671,7 @@ export const ModpacksPluginsView: React.FC<ModpacksPluginsViewProps> = ({
                         onClick={() => setSelectedMcVersion(ver)}
                         className={`px-2.5 py-1 rounded-md font-mono text-xs transition-all cursor-pointer ${
                           selectedMcVersion === ver
-                            ? 'bg-primary text-on-primary font-bold shadow-sm'
+                            ? 'bg-primary text-on-primary font-bold '
                             : 'bg-surface-container text-on-surface-variant hover:text-white hover:bg-surface-container-high'
                         }`}
                       >
@@ -698,7 +701,7 @@ export const ModpacksPluginsView: React.FC<ModpacksPluginsViewProps> = ({
                   {selectedMcVersion}...
                 </div>
               ) : (
-                <div className="overflow-x-auto rounded-lg border border-white/10">
+                <div className="overflow-x-auto rounded-lg border border-white/[0.08]">
                   <table className="w-full text-left font-body-sm text-body-sm">
                     <thead>
                       <tr className="bg-surface-container text-outline font-label-caps text-label-caps uppercase">
@@ -739,7 +742,7 @@ export const ModpacksPluginsView: React.FC<ModpacksPluginsViewProps> = ({
                                     `Downloading ${b.filename}`,
                                     `Streaming official ${selectedEngine.toUpperCase()} ${selectedMcVersion} server.jar binary.`,
                                     'info',
-                                    'download'
+                                    'download',
                                   )
                                 }
                                 className="px-2.5 py-1 rounded bg-surface-container-high hover:bg-surface-bright text-white font-mono text-xs flex items-center gap-1 cursor-pointer"
@@ -752,18 +755,11 @@ export const ModpacksPluginsView: React.FC<ModpacksPluginsViewProps> = ({
                               <button
                                 type="button"
                                 onClick={() => {
-                                  if (onUpdateServerEngine) {
-                                    onUpdateServerEngine(
-                                      `${selectedEngine.toUpperCase()} ${selectedMcVersion}`,
-                                      `Build #${b.build}`,
-                                      b.filename
-                                    );
-                                  }
-                                  onShowToast(
-                                    `Active Engine Set: ${b.filename}`,
-                                    `Mounted ${b.filename} onto ${server.name} root directory.`,
-                                    'success',
-                                    'check_circle'
+                                  // App downloads the jar and reports the real outcome.
+                                  void onUpdateServerEngine?.(
+                                    `${selectedEngine.toUpperCase()} ${selectedMcVersion}`,
+                                    `Build #${b.build}`,
+                                    b.filename,
                                   );
                                 }}
                                 className="px-2.5 py-1 rounded bg-primary text-on-primary font-bold text-xs flex items-center gap-1 cursor-pointer"
@@ -807,7 +803,7 @@ export const ModpacksPluginsView: React.FC<ModpacksPluginsViewProps> = ({
                 return (
                   <div
                     key={item.id}
-                    className="p-4 rounded-xl bg-surface-container-low hover:bg-surface-container border border-white/10 transition-all shadow-md flex flex-col justify-between space-y-3"
+                    className="p-4 rounded-xl bg-surface-container-low hover:bg-surface-container border border-white/[0.08] transition-all flex flex-col justify-between space-y-3"
                   >
                     <div className="space-y-2.5">
                       <div className="flex items-start justify-between gap-2">
@@ -816,7 +812,7 @@ export const ModpacksPluginsView: React.FC<ModpacksPluginsViewProps> = ({
                             <img
                               src={item.iconUrl}
                               alt={item.name}
-                              className="size-11 rounded-lg object-cover bg-surface-container-highest shrink-0 border border-white/10"
+                              className="size-11 rounded-lg object-cover bg-surface-container-highest shrink-0 border border-white/[0.08]"
                             />
                           ) : (
                             <div className="size-11 rounded-lg bg-primary/20 text-primary flex items-center justify-center font-bold text-lg shrink-0">
@@ -844,47 +840,42 @@ export const ModpacksPluginsView: React.FC<ModpacksPluginsViewProps> = ({
                         {item.description}
                       </p>
 
-                      <div className="flex flex-wrap items-center gap-1.5 font-code-sm text-code-sm">
-                        <span className="px-2 py-0.5 rounded bg-surface-container text-secondary flex items-center gap-1">
-                          <span className="material-symbols-outlined text-xs">download</span>
+                      <div className="flex flex-wrap items-center gap-1.5 font-mono text-[11px] text-outline">
+                        <span className="flex items-center gap-1">
+                          <span className="material-symbols-outlined text-[13px]">download</span>
                           {formatDownloads(item.downloads)}
                         </span>
                         {item.categories.slice(0, 4).map((cat) => (
-                          <span
-                            key={cat}
-                            className="px-2 py-0.5 rounded bg-surface-container-high text-on-surface-variant text-[11px]"
-                          >
+                          <span key={cat} className="px-1.5 py-0.5 rounded bg-white/[0.04] text-outline">
                             {cat}
                           </span>
                         ))}
                       </div>
                     </div>
 
-                    <div className="flex items-center justify-between pt-2 border-t border-white/5">
+                    <div className="flex items-center justify-between gap-3 pt-2.5 border-t border-white/[0.06]">
                       <button
                         type="button"
                         onClick={() => handleInspectModVersions(item)}
-                        className="font-code-sm text-code-sm text-tertiary hover:underline flex items-center gap-1 cursor-pointer"
+                        className="inline-flex items-center gap-1 text-[11.5px] text-outline hover:text-white transition-colors cursor-pointer"
                       >
-                        <span className="material-symbols-outlined text-sm">history</span>
-                        <span>Inspect Versions &amp; .JARs</span>
+                        <span className="material-symbols-outlined text-[15px]">history</span>
+                        <span>Versions</span>
                       </button>
 
                       {isInstalledVer ? (
-                        <span className="px-3 py-1.5 rounded-lg bg-secondary/20 text-secondary font-code-sm text-code-sm font-bold flex items-center gap-1">
-                          <span className="material-symbols-outlined text-sm">check_circle</span>
-                          Installed ({isInstalledVer})
+                        <span className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-secondary/10 text-secondary font-mono text-[11px]">
+                          <span className="material-symbols-outlined text-[14px]">check_circle</span>
+                          {isInstalledVer}
                         </span>
                       ) : (
                         <button
                           type="button"
-                          onClick={() => handleInstallLivePackage(item)}
-                          className="px-3.5 py-1.5 rounded-lg bg-primary hover:bg-primary-fixed-dim text-on-primary font-body-sm text-body-sm font-bold flex items-center gap-1 shadow-sm cursor-pointer"
+                          onClick={() => void handleInstallLivePackage(item)}
+                          className="inline-flex items-center gap-1.5 h-7 px-2.5 rounded-lg border border-primary/35 bg-primary/10 hover:bg-primary/20 text-primary text-[11.5px] font-medium transition-colors cursor-pointer"
                         >
-                          <span className="material-symbols-outlined text-sm font-bold">
-                            download
-                          </span>
-                          <span>Hot-Install</span>
+                          <span className="material-symbols-outlined text-[15px]">download</span>
+                          <span>Install</span>
                         </button>
                       )}
                     </div>
@@ -896,18 +887,19 @@ export const ModpacksPluginsView: React.FC<ModpacksPluginsViewProps> = ({
 
           {/* RIGHT COLUMN: RUNTIME & DEPENDENCY INSPECTOR */}
           <div className="xl:col-span-4 space-y-4">
-            <div className="p-4 rounded-xl bg-surface-container-low border border-white/10 shadow-md space-y-4">
-              <div className="flex items-center justify-between pb-2">
+            <div className="p-4 rounded-xl bg-surface border border-white/[0.06] space-y-3">
+              <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
-                  <span className="material-symbols-outlined text-primary text-lg">schema</span>
-                  <h3 className="font-title-md text-title-md font-bold text-white">
-                    Live Repository Telemetry
-                  </h3>
+                  <span className="material-symbols-outlined text-[16px] text-outline">schema</span>
+                  <h3 className="text-[13px] font-semibold text-white">Repository telemetry</h3>
                 </div>
-                <span className="size-2 rounded-full bg-secondary shadow-[0_0_8px_rgba(78,222,163,0.8)]" />
+                <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md border border-secondary/25 bg-secondary/10 text-secondary font-mono text-[10.5px]">
+                  <span className="size-1.5 rounded-full bg-secondary" />
+                  Connected
+                </span>
               </div>
 
-              <div className="p-3 rounded-lg bg-surface-container space-y-2">
+              <div className="p-3 rounded-lg bg-surface-container space-y-2 border border-white/[0.06]">
                 <div className="flex items-center justify-between">
                   <span className="font-label-caps text-label-caps uppercase text-on-surface-variant">
                     Upstream API Feed
@@ -951,13 +943,13 @@ export const ModpacksPluginsView: React.FC<ModpacksPluginsViewProps> = ({
           {filteredPlugins.map((pkg) => (
             <div
               key={pkg.id}
-              className="p-4 rounded-xl bg-surface-container-low hover:bg-surface-container border border-white/10 transition-all shadow-md flex flex-col justify-between space-y-3"
+              className="p-4 rounded-xl bg-surface-container-low hover:bg-surface-container border border-white/[0.08] transition-all flex flex-col justify-between space-y-3"
             >
               <div className="space-y-2.5">
                 <div className="flex items-start justify-between gap-2">
                   <div className="flex items-center gap-3">
                     <div
-                      className={`size-11 rounded-lg flex items-center justify-center font-bold text-lg shadow-inner ${pkg.codeColor}`}
+                      className={`size-11 rounded-lg flex items-center justify-center font-bold text-lg ${pkg.codeColor}`}
                     >
                       {pkg.code}
                     </div>
@@ -1030,8 +1022,8 @@ export const ModpacksPluginsView: React.FC<ModpacksPluginsViewProps> = ({
       {/* ================= VERSION INSPECTOR & DIRECT .JAR DOWNLOAD MODAL ================= */}
       {inspectingItem && (
         <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-surface-container-low border border-white/15 rounded-xl max-w-3xl w-full max-h-[82vh] flex flex-col shadow-2xl overflow-hidden">
-            <div className="p-4 border-b border-white/10 flex items-center justify-between">
+          <div className="bg-surface-container-low border border-white/15 rounded-xl max-w-3xl w-full max-h-[82vh] flex flex-col overflow-hidden">
+            <div className="p-4 border-b border-white/[0.08] flex items-center justify-between">
               <div className="flex items-center gap-3">
                 {inspectingItem.iconUrl && (
                   <img
@@ -1072,7 +1064,7 @@ export const ModpacksPluginsView: React.FC<ModpacksPluginsViewProps> = ({
                 inspectVersions.map((v) => (
                   <div
                     key={v.id}
-                    className="p-3 rounded-lg bg-surface-container border border-white/5 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+                    className="p-3 rounded-lg bg-surface-container border border-white/[0.06] flex flex-col sm:flex-row sm:items-center justify-between gap-3"
                   >
                     <div className="space-y-1">
                       <div className="flex items-center gap-2 flex-wrap">
@@ -1110,7 +1102,12 @@ export const ModpacksPluginsView: React.FC<ModpacksPluginsViewProps> = ({
                       <button
                         type="button"
                         onClick={() => {
-                          handleInstallLivePackage(inspectingItem, v.versionNumber, v.filename);
+                          void handleInstallLivePackage(
+                            inspectingItem,
+                            v.versionNumber,
+                            v.filename,
+                            v.id,
+                          );
                           setInspectingItem(null);
                         }}
                         className="px-3 py-1.5 rounded bg-primary text-on-primary font-bold text-xs cursor-pointer"

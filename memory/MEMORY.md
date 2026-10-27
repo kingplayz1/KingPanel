@@ -1,0 +1,2 @@
+- [Session security fix](memory/feedback_session_fix.md) — Fixed session security with cryptographically random IDs and SQLite storage
+- [Project session security](memory/project_session_security.md) — Secure session management implementation for IS King Panel

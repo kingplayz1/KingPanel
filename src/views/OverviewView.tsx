@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { ServerInstallModal } from '../components/ServerInstallModal';
 import {
   ResponsiveContainer,
   AreaChart,
@@ -39,11 +40,10 @@ interface OverviewViewProps {
   players: ConnectedPlayer[];
   onSelectServer: (server: ServerInstance) => void;
   onManageServer: (server: ServerInstance, targetSection?: NavSection) => void;
-  onServerPowerAction: (
-    serverId: string,
-    action: 'start' | 'restart' | 'stop' | 'kill'
+  onServerPowerAction: (serverId: string, action: 'start' | 'restart' | 'stop' | 'kill') => void;
+  onBulkServerAction: (
+    action: 'start_all' | 'restart_running' | 'stop_all' | 'snapshot_all',
   ) => void;
-  onBulkServerAction: (action: 'start_all' | 'restart_running' | 'stop_all' | 'snapshot_all') => void;
   onCreateServerInstance: (newServer: ServerInstance) => void;
   serverInstallRootDir?: string;
   currentUser?: AuthUser | null;
@@ -56,7 +56,7 @@ interface OverviewViewProps {
     title: string,
     body?: string,
     type?: 'success' | 'info' | 'warning' | 'error',
-    icon?: string
+    icon?: string,
   ) => void;
 }
 
@@ -83,12 +83,12 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
   const [layoutMode, setLayoutMode] = useState<'cards' | 'table'>('cards');
   const [createModalOpen, setCreateModalOpen] = useState(false);
 
-  // New Server Instance Form State
-  const [newName, setNewName] = useState('');
-  const [newEngine, setNewEngine] = useState('PaperMC 1.20.4');
-  const [newPort, setNewPort] = useState('25572');
-  const [newRamMax, setNewRamMax] = useState(6);
-  const [newMaxPlayers, setNewMaxPlayers] = useState(30);
+  // Real host numbers straight from the local backend (no interpolation).
+  const [hostStats, setHostStats] = useState<{
+    cpuPct: number;
+    ramUsedGb: number;
+    ramTotalGb: number;
+  }>({ cpuPct: 0, ramUsedGb: 0, ramTotalGb: 0 });
 
   // Compute global fleet aggregations across running servers
   const runningServers = servers.filter((s) => s.status === 'running' || s.status === 'restarting');
@@ -100,21 +100,15 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
 
   const combinedCpuUsage = runningServers.reduce((acc, s) => acc + s.cpuUsage, 0);
   const hostNormalizedCpu = Math.min(100, Math.round(combinedCpuUsage));
-  const avgCpuTemp =
-    runningServers.length > 0
-      ? (
-          runningServers.reduce((acc, s) => acc + s.cpuTemp, 0) / runningServers.length
-        ).toFixed(1)
-      : '36.0';
-
   const combinedRamUsedGb = Number(
-    runningServers.reduce((acc, s) => acc + s.ramUsedGb, 0).toFixed(1)
+    runningServers.reduce((acc, s) => acc + s.ramUsedGb, 0).toFixed(1),
   );
   const combinedRamAllocatedGb = Number(
-    runningServers.reduce((acc, s) => acc + s.ramMaxGb, 0).toFixed(1)
+    runningServers.reduce((acc, s) => acc + s.ramMaxGb, 0).toFixed(1),
   );
-  const totalHostRamGb = 32.0;
-  const hostRamPercent = Math.min(100, Math.round((combinedRamUsedGb / totalHostRamGb) * 100));
+  const totalHostRamGb = hostStats.ramTotalGb;
+  const hostRamPercent =
+    totalHostRamGb > 0 ? Math.min(100, Math.round((combinedRamUsedGb / totalHostRamGb) * 100)) : 0;
 
   const avgTps =
     runningServers.length > 0
@@ -124,109 +118,58 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
   // Real-time System Performance Monitor state (CPU, RAM, Disk I/O)
   const [telemetryPaused, setTelemetryPaused] = useState(false);
   const [timeRange, setTimeRange] = useState<'30s' | '1m' | '5m'>('1m');
-  const [telemetryHistory, setTelemetryHistory] = useState<TelemetryDataPoint[]>(() => {
-    const now = Date.now();
-    return Array.from({ length: 16 }, (_, idx) => {
-      const t = new Date(now - (15 - idx) * 2000);
-      const timeStr = t.toTimeString().split(' ')[0].slice(3); // MM:SS
-      const jitter = Math.sin(idx * 0.6) * 6;
-      const baseCpu = Math.min(100, Math.max(8, Math.round(78 + jitter)));
-      const kernel = Math.max(3, Math.round(baseCpu * 0.16 + (idx % 3)));
-      const readMb = Math.round(145 + Math.cos(idx * 0.8) * 55 + (idx % 4) * 18);
-      const writeMb = Math.round(88 + Math.sin(idx * 0.9) * 42 + (idx % 5 === 0 ? 110 : 12));
-      return {
-        time: timeStr,
-        cpuTotal: baseCpu,
-        cpuKernel: kernel,
-        cpuTemp: Number((47.5 + jitter * 0.25).toFixed(1)),
-        ramUsedGb: Number((15.9 + Math.sin(idx * 0.4) * 0.4).toFixed(2)),
-        ramCommittedGb: 28.0,
-        diskReadMbs: Math.max(12, readMb),
-        diskWriteMbs: Math.max(8, writeMb),
-        iops: Math.round((readMb + writeMb) * 18.5),
-      };
-    });
-  });
+  const [telemetryHistory, setTelemetryHistory] = useState<TelemetryDataPoint[]>([]);
 
   useEffect(() => {
-    if (telemetryPaused) return;
-    const timer = setInterval(() => {
-      const now = new Date();
-      const timeStr = now.toTimeString().split(' ')[0].slice(3);
-      setTelemetryHistory((prev) => {
-        const cpuNoise = Math.floor(Math.random() * 9) - 4;
-        const currentCpu = Math.min(100, Math.max(4, hostNormalizedCpu + cpuNoise));
-        const kernelCpu = Math.max(2, Math.round(currentCpu * 0.15 + Math.random() * 4));
-        const ramJitter = Number(((Math.random() - 0.48) * 0.25).toFixed(2));
-        const currentRam = Math.max(
-          1.2,
-          Math.min(31.5, Number((combinedRamUsedGb + ramJitter).toFixed(2)))
-        );
-        const readSpike =
-          runningServers.length > 0 ? Math.round(90 + Math.random() * 160) : Math.round(10 + Math.random() * 15);
-        const writeSpike =
-          runningServers.length > 0 ? Math.round(55 + Math.random() * 135) : Math.round(5 + Math.random() * 10);
-
-        const nextPoint: TelemetryDataPoint = {
-          time: timeStr,
-          cpuTotal: currentCpu,
-          cpuKernel: kernelCpu,
-          cpuTemp: Number(avgCpuTemp),
-          ramUsedGb: currentRam,
-          ramCommittedGb: combinedRamAllocatedGb,
-          diskReadMbs: readSpike,
-          diskWriteMbs: writeSpike,
-          iops: Math.round((readSpike + writeSpike) * 19.2),
-        };
-        const maxPoints = timeRange === '30s' ? 12 : timeRange === '1m' ? 18 : 26;
-        return [...prev.slice(-(maxPoints - 1)), nextPoint];
-      });
-    }, 2000);
-    return () => clearInterval(timer);
-  }, [
-    telemetryPaused,
-    timeRange,
-    hostNormalizedCpu,
-    combinedRamUsedGb,
-    combinedRamAllocatedGb,
-    avgCpuTemp,
-    runningServers.length,
-  ]);
-
-  const handleSimulateChunkBurst = () => {
-    const now = new Date();
-    const timeStr = now.toTimeString().split(' ')[0].slice(3);
-    setTelemetryHistory((prev) => [
-      ...prev.slice(-15),
-      {
-        time: timeStr,
-        cpuTotal: Math.min(98, hostNormalizedCpu + 24),
-        cpuKernel: 19,
-        cpuTemp: Number((Number(avgCpuTemp) + 4.2).toFixed(1)),
-        ramUsedGb: Math.min(31.0, Number((combinedRamUsedGb + 1.8).toFixed(2))),
-        ramCommittedGb: combinedRamAllocatedGb,
-        diskReadMbs: 640,
-        diskWriteMbs: 510,
-        iops: 21850,
-      },
-    ]);
-    onShowToast(
-      'Simulated Anvil Region Burst',
-      'Flushed 2,400 region chunks across NVMe RAID-0 (Read: 640 MB/s, Write: 510 MB/s).',
-      'info',
-      'speed'
-    );
-  };
+    let cancelled = false;
+    const sample = async () => {
+      try {
+        const res = await fetch('/api/panel/telemetry');
+        const data = await res.json();
+        if (!data?.ok || cancelled) return;
+        const host = data.host || {};
+        const cpuPct = Math.round(Number(host.cpuUsagePct) || 0);
+        const ramUsedGb = Number(host.osUsedGb) || 0;
+        const ramTotalGb = Number(host.osTotalGb) || 0;
+        setHostStats({ cpuPct, ramUsedGb, ramTotalGb });
+        if (telemetryPaused) return;
+        const timeStr = new Date().toTimeString().split(' ')[0].slice(3);
+        setTelemetryHistory((prev) => {
+          const nextPoint: TelemetryDataPoint = {
+            time: timeStr,
+            cpuTotal: cpuPct,
+            cpuKernel: 0,
+            cpuTemp: 0,
+            ramUsedGb,
+            ramCommittedGb: combinedRamAllocatedGb,
+            diskReadMbs: 0,
+            diskWriteMbs: 0,
+            iops: 0,
+          };
+          const maxPoints = timeRange === '30s' ? 12 : timeRange === '1m' ? 18 : 26;
+          return [...prev.slice(-(maxPoints - 1)), nextPoint];
+        });
+      } catch {
+        // backend restarting — keep the last sample
+      }
+    };
+    void sample();
+    const timer = setInterval(() => void sample(), 2000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [telemetryPaused, timeRange, combinedRamAllocatedGb]);
 
   const latestTelemetry = telemetryHistory[telemetryHistory.length - 1] || {
-    cpuTotal: hostNormalizedCpu,
-    cpuKernel: 10,
-    cpuTemp: Number(avgCpuTemp),
-    ramUsedGb: combinedRamUsedGb,
+    cpuTotal: hostStats.cpuPct,
+    cpuKernel: 0,
+    cpuTemp: 0,
+    ramUsedGb: hostStats.ramUsedGb,
     ramCommittedGb: combinedRamAllocatedGb,
-    diskReadMbs: 142,
-    diskWriteMbs: 96,
-    iops: 4520,
+    diskReadMbs: 0,
+    diskWriteMbs: 0,
+    iops: 0,
   };
 
   // Filter servers for display
@@ -254,95 +197,15 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
   const maxServerLimit = isSuperAdmin
     ? 999
     : isDiscordVerified
-    ? currentUser?.maxServerLimit || 10
-    : 2;
+      ? currentUser?.maxServerLimit || 10
+      : 2;
   const isAtServerLimit = !isSuperAdmin && servers.length >= maxServerLimit;
 
   const latestPaperRelease = paperMcReport?.latestPaperRelease || '1.21.4';
   const latestPaperBuild = paperMcReport?.latestPaperBuild || 'Build #222';
   const outdatedServers = servers.filter((s) =>
-    s.isOutdated !== undefined ? s.isOutdated : !s.engine.includes(latestPaperRelease)
+    s.isOutdated !== undefined ? s.isOutdated : !s.engine.includes(latestPaperRelease),
   );
-
-  const handleDeployInstance = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (isAtServerLimit) {
-      setCreateModalOpen(false);
-      if (onOpenDiscordBotGate) {
-        onOpenDiscordBotGate(newName.trim() || `Server #${servers.length + 1}`);
-      } else {
-        onShowToast(
-          '2-Server Limit Reached — Discord Bot Verification Required',
-          'Standard logged-in users can only set up 1 or 2 servers. Connect to our Discord Server and verify with the Discord Bot to create more than 2 servers!',
-          'warning',
-          'lock'
-        );
-      }
-      return;
-    }
-    if (!newName.trim()) {
-      onShowToast('Instance Name Required', 'Please provide a name for the new server.', 'warning');
-      return;
-    }
-    const cleanFolder = newName.trim().replace(/[^a-zA-Z0-9_-]/g, '_') || 'NewInstance';
-    const portNum = parseInt(newPort, 10) || 25572;
-    const cleanRoot = serverInstallRootDir.replace(/[\\/]+$/, '');
-    const sep = cleanRoot.includes('\\') ? '\\' : '/';
-    let targetInstallPath = `${cleanRoot}${sep}${cleanFolder}`;
-
-    try {
-      const r = await fetch('/api/panel/install-server-instance', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          serverName: newName.trim(),
-          engine: newEngine,
-          port: portNum,
-          ramMaxGb: newRamMax,
-          currentServerCount: servers.length,
-          discordVerified: isDiscordVerified,
-        }),
-      });
-      const data = await r.json();
-      if (r.status === 403 && data?.code === 'DISCORD_VERIFICATION_REQUIRED') {
-        setCreateModalOpen(false);
-        if (onOpenDiscordBotGate) {
-          onOpenDiscordBotGate(newName.trim());
-        }
-        return;
-      }
-      if (data?.ok && data.displayPath) {
-        targetInstallPath = data.displayPath;
-      }
-    } catch {
-      // fallback to computed path
-    }
-
-    const created: ServerInstance = {
-      id: `srv-${Date.now()}`,
-      name: newName.trim(),
-      engine: newEngine,
-      javaVersion: 'Java 21',
-      port: portNum,
-      pid: Math.floor(10000 + Math.random() * 19000),
-      status: 'running',
-      path: targetInstallPath,
-      build: 'Build #448',
-      tps: 20.0,
-      tickMs: 2.1,
-      uptime: '0h 01m',
-      playersOnline: 0,
-      maxPlayers: newMaxPlayers,
-      cpuUsage: 8,
-      cpuTemp: 43.5,
-      ramUsedGb: Number((newRamMax * 0.35).toFixed(1)),
-      ramMaxGb: newRamMax,
-    };
-    onCreateServerInstance(created);
-    setCreateModalOpen(false);
-    setNewName('');
-    setNewPort(String(portNum + 1));
-  };
 
   const segmentColors = [
     'bg-primary',
@@ -356,105 +219,20 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
   return (
     <main className="flex-1 flex flex-col bg-surface-dim overflow-hidden">
       {/* Top Contextual Header */}
-      <header className="h-16 px-6 bg-surface border-b border-outline-variant/15 flex items-center justify-between shrink-0">
-        <div className="flex items-center gap-4">
-          <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-primary/20 to-primary-container/10 border border-primary/30 flex items-center justify-center text-primary shadow-inner">
-            <span className="material-symbols-outlined text-[22px]">Space_Dashboard</span>
-          </div>
-          <div>
-            <div className="flex items-center gap-2.5">
-              <h1 className="text-base font-bold tracking-tight text-on-surface">
-                Localhost Node Overview &amp; Multi-Server Fleet Command
-              </h1>
-              <span className="px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider bg-secondary/10 text-secondary rounded border border-secondary/25 flex items-center gap-1.5">
-                <span className="w-1.5 h-1.5 rounded-full bg-secondary animate-pulse"></span>
-                {runningServers.length} of {servers.length} Instances Online
-              </span>
-              <span className="px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider bg-surface-container-highest text-primary rounded border border-primary/20">
-                AMD Ryzen 9 7950X (16C/32T)
-              </span>
-            </div>
-            <p className="text-xs text-outline font-mono mt-0.5">
-              Host IP: 127.0.0.1 (WAN: 89.204.132.19) • FastPipe IPC Cluster • NVMe RAID-0 (3.4 GB/s)
-            </p>
-          </div>
+      <header className="h-[54px] px-6 bg-surface border-b border-white/[0.06] flex items-center justify-between shrink-0">
+        <div className="flex items-center gap-2.5 min-w-0">
+          <span className="material-symbols-outlined text-[18px] text-primary">space_dashboard</span>
+          <h1 className="text-[14.5px] font-semibold tracking-tight text-on-surface whitespace-nowrap">
+            Server Overview
+          </h1>
+          <span className="w-px h-4 bg-white/10" />
+          <p className="text-[11.5px] text-outline font-mono truncate">
+            {runningServers.length} of {servers.length} running
+          </p>
         </div>
 
-        {/* Global Fleet Actions */}
+        {/* Simple Header Action */}
         <div className="flex items-center gap-2.5">
-          <button
-            type="button"
-            onClick={() => onManageServer(activeServer, 'setup_guide')}
-            className="px-3.5 py-2 rounded-lg bg-secondary/15 hover:bg-secondary/25 text-xs font-bold text-secondary border border-secondary/35 transition-all flex items-center gap-1.5 cursor-pointer"
-          >
-            <span className="material-symbols-outlined text-[16px]">school</span>
-            Setup Guide
-          </button>
-          <button
-            onClick={() => onBulkServerAction('snapshot_all')}
-            className="px-3.5 py-2 rounded-lg bg-surface-container-high hover:bg-surface-bright text-xs font-medium text-on-surface border border-outline-variant/20 transition-all flex items-center gap-1.5 cursor-pointer"
-          >
-            <span className="material-symbols-outlined text-[16px] text-tertiary">backup</span>
-            Snapshot All
-          </button>
-          <button
-            onClick={() => onBulkServerAction('restart_running')}
-            className="px-3.5 py-2 rounded-lg bg-surface-container-high hover:bg-surface-bright text-xs font-medium text-on-surface border border-outline-variant/20 transition-all flex items-center gap-1.5 cursor-pointer"
-          >
-            <span className="material-symbols-outlined text-[16px] text-primary">restart_alt</span>
-            Restart Running
-          </button>
-          {stoppedServers.length > 0 && (
-            <button
-              onClick={() => onBulkServerAction('start_all')}
-              className="px-3.5 py-2 rounded-lg bg-secondary/15 hover:bg-secondary/25 text-xs font-semibold text-secondary border border-secondary/30 transition-all flex items-center gap-1.5 cursor-pointer"
-            >
-              <span className="material-symbols-outlined text-[16px]">play_arrow</span>
-              Start All ({stoppedServers.length})
-            </button>
-          )}
-          <div className="h-5 w-[1px] bg-outline-variant/20 mx-0.5"></div>
-          {/* Discord Bot Verification & Server Limit Status Pill */}
-          {isDiscordVerified ? (
-            <div className="flex items-center gap-1.5">
-              <button
-                type="button"
-                onClick={() => onOpenDiscordBotGate && onOpenDiscordBotGate()}
-                className="px-3 py-2 rounded-lg bg-secondary/15 hover:bg-secondary/25 border border-secondary/35 text-secondary text-xs font-mono font-bold flex items-center gap-1.5 cursor-pointer"
-                title="Verified by Discord Bot — Up to 10 Servers Unlocked"
-              >
-                <span className="material-symbols-outlined text-[15px]">verified</span>
-                <span>
-                  Bot Verified ({servers.length}/{maxServerLimit} Servers)
-                </span>
-              </button>
-              {onLeaveDiscordServer && (
-                <button
-                  type="button"
-                  onClick={onLeaveDiscordServer}
-                  className="px-2.5 py-2 rounded-lg bg-error/15 hover:bg-error/25 border border-error/35 text-error text-[11px] font-mono font-bold flex items-center gap-1 cursor-pointer"
-                  title="Leave Discord Server (Resets server creation limit back to 2)"
-                >
-                  <span className="material-symbols-outlined text-[14px]">link_off</span>
-                  Leave Discord
-                </button>
-              )}
-            </div>
-          ) : (
-            <button
-              type="button"
-              onClick={() => onOpenDiscordBotGate && onOpenDiscordBotGate()}
-              className="px-3 py-2 rounded-lg bg-[#5865F2]/20 hover:bg-[#5865F2]/30 border border-[#5865F2]/40 text-white text-xs font-mono font-bold flex items-center gap-1.5 cursor-pointer"
-              title="Standard users can create 1 or 2 servers. Click to verify with Discord Bot for >2 servers."
-            >
-              <span className="material-symbols-outlined text-[15px] text-[#8ea1e1]">
-                shield_lock
-              </span>
-              <span>
-                Limit: {servers.length}/2 Servers • Verify Discord
-              </span>
-            </button>
-          )}
           <button
             onClick={() => {
               if (isAtServerLimit && !isDiscordVerified && onOpenDiscordBotGate) {
@@ -463,10 +241,10 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                 setCreateModalOpen(true);
               }
             }}
-            className="px-4 py-2 rounded-lg bg-gradient-to-r from-primary to-primary-container hover:opacity-95 text-xs font-bold text-on-primary-container shadow-lg shadow-primary/15 transition-all flex items-center gap-1.5 cursor-pointer"
+            className="px-3.5 h-8 rounded-lg bg-primary hover:opacity-95 text-[12px] font-semibold text-on-primary-container transition-opacity flex items-center gap-1.5 cursor-pointer"
           >
-            <span className="material-symbols-outlined text-[16px]">add_box</span>
-            Deploy New Server ({servers.length}/{maxServerLimit})
+            <span className="material-symbols-outlined text-[16px]">add</span>
+            Deploy Server
           </button>
         </div>
       </header>
@@ -476,140 +254,117 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
         {/* TOP 4 AGGREGATED FLEET TELEMETRY CARDS */}
         <section className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
           {/* Card 1: Running Servers Summary */}
-          <div className="p-4 rounded-xl bg-surface border border-outline-variant/15 flex flex-col justify-between relative overflow-hidden shadow-lg">
-            <div className="flex items-start justify-between">
-              <div>
-                <p className="text-[10px] font-mono uppercase tracking-wider text-outline font-bold">
-                  Running Servers Fleet
-                </p>
-                <div className="flex items-baseline gap-2 mt-1">
-                  <span className="text-2xl font-bold font-mono text-white tabular-nums">
-                    {runningServers.length}
-                  </span>
-                  <span className="text-xs font-mono text-outline">
-                    / {servers.length} Instances
-                  </span>
-                  <span className="text-[11px] font-mono px-1.5 py-0.5 rounded bg-secondary/10 text-secondary border border-secondary/20">
-                    {avgTps} Avg TPS
-                  </span>
-                </div>
-              </div>
-              <div className="w-9 h-9 rounded-lg bg-secondary/10 border border-secondary/25 flex items-center justify-center text-secondary">
-                <span className="material-symbols-outlined text-[20px]">dns</span>
-              </div>
+          <div className="p-4 rounded-xl bg-surface border border-white/[0.06] flex flex-col">
+            <div className="flex items-center justify-between gap-2">
+              <span className="kp-label">Running servers</span>
+              <span className="material-symbols-outlined text-[16px] text-secondary">dns</span>
             </div>
 
-            <div className="mt-4 space-y-2">
-              <div className="flex items-center justify-between text-[11px] font-mono">
-                <span className="text-outline">Active Daemons:</span>
-                <span className="text-secondary font-semibold">
-                  {runningServers.length} Online • {stoppedServers.length} Standby
-                </span>
-              </div>
-              <div className="w-full h-2 rounded-full bg-surface-lowest overflow-hidden flex gap-0.5 p-0.5 border border-white/5">
+            <div className="mt-2.5 flex items-baseline gap-1.5 min-w-0">
+              <span className="kp-stat-value">{runningServers.length}</span>
+              <span className="font-mono text-[11.5px] text-outline whitespace-nowrap">
+                / {servers.length} instances
+              </span>
+              <span className="kp-chip ml-auto">{avgTps} avg TPS</span>
+            </div>
+
+            <div className="mt-auto pt-3.5 space-y-2">
+              <div className="w-full h-1.5 rounded-full bg-surface-lowest overflow-hidden flex gap-px">
                 {servers.map((srv) => (
                   <div
                     key={srv.id}
                     title={`${srv.name}: ${srv.status.toUpperCase()}`}
-                    className={`h-full flex-1 rounded-sm transition-all ${
+                    className={`h-full flex-1 rounded-full transition-all ${
                       srv.status === 'running'
                         ? 'bg-secondary'
                         : srv.status === 'restarting'
-                        ? 'bg-primary animate-pulse'
-                        : 'bg-white/10'
+                          ? 'bg-primary animate-pulse'
+                          : 'bg-white/12'
                     }`}
                   />
                 ))}
               </div>
-              <div className="flex items-center justify-between text-[10px] font-mono text-outline pt-0.5">
-                <span>Cluster Health: 99.98%</span>
-                <span className="text-primary">UPnP Gateway Synced</span>
+              <div className="flex items-center justify-between gap-3 text-[11px] font-mono text-outline">
+                <span className="truncate">
+                  <span className="text-secondary">{runningServers.length} online</span> ·{' '}
+                  {stoppedServers.length} standby
+                </span>
+                <span className="truncate" title="UPnP gateway state">
+                  UPnP synced
+                </span>
               </div>
             </div>
           </div>
 
           {/* Card 2: Total Connected Players Across All Running Servers */}
-          <div className="p-4 rounded-xl bg-surface border border-outline-variant/15 flex flex-col justify-between relative overflow-hidden shadow-lg">
-            <div className="flex items-start justify-between">
-              <div>
-                <p className="text-[10px] font-mono uppercase tracking-wider text-outline font-bold">
-                  Total Connected Players
-                </p>
-                <div className="flex items-baseline gap-2 mt-1">
-                  <span className="text-2xl font-bold font-mono text-primary tabular-nums">
-                    {totalPlayersOnline}
-                  </span>
-                  <span className="text-xs font-mono text-outline">
-                    / {totalMaxPlayersRunning} Active Slots
-                  </span>
-                  <span className="text-[11px] font-mono text-secondary">
-                    ({totalMaxPlayersAll} Max)
-                  </span>
-                </div>
-              </div>
-              <div className="w-9 h-9 rounded-lg bg-primary/10 border border-primary/25 flex items-center justify-center text-primary">
-                <span className="material-symbols-outlined text-[20px]">groups</span>
-              </div>
+          <div className="p-4 rounded-xl bg-surface border border-white/[0.06] flex flex-col">
+            <div className="flex items-center justify-between gap-2">
+              <span className="kp-label">Connected players</span>
+              <span className="material-symbols-outlined text-[16px] text-primary">groups</span>
             </div>
 
-            <div className="mt-4 space-y-2">
-              <div className="w-full bg-surface-lowest h-2 rounded-full overflow-hidden border border-white/5">
+            <div className="mt-2.5 flex items-baseline gap-1.5 min-w-0">
+              <span className="kp-stat-value">{totalPlayersOnline}</span>
+              <span className="font-mono text-[11.5px] text-outline whitespace-nowrap">
+                / {totalMaxPlayersRunning} slots
+              </span>
+              <span className="kp-chip ml-auto">{totalMaxPlayersAll} max</span>
+            </div>
+
+            <div className="mt-auto pt-3.5 space-y-2">
+              <div className="w-full bg-surface-lowest h-1.5 rounded-full overflow-hidden">
                 <div
-                  className="bg-gradient-to-r from-primary to-amber-300 h-full rounded-full transition-all duration-500"
+                  className="bg-primary h-full rounded-full transition-all duration-500"
                   style={{
                     width: `${
                       totalMaxPlayersRunning > 0
-                        ? Math.min(100, Math.round((totalPlayersOnline / totalMaxPlayersRunning) * 100))
+                        ? Math.min(
+                            100,
+                            Math.round((totalPlayersOnline / totalMaxPlayersRunning) * 100),
+                          )
                         : 0
                     }%`,
                   }}
                 />
               </div>
-              <div className="flex items-center justify-between text-[10px] font-mono text-outline">
-                <div className="flex items-center -space-x-1.5">
-                  {players.slice(0, 4).map((p) => (
-                    <img
-                      key={p.id}
-                      src={p.avatarUrl}
-                      alt={p.username}
-                      title={`${p.username} (${p.ping}ms)`}
-                      className="w-4 h-4 rounded-full ring-1 ring-surface object-cover"
-                    />
-                  ))}
-                  {totalPlayersOnline > 4 && (
-                    <span className="pl-2 text-[10px] text-on-surface font-mono">
-                      +{totalPlayersOnline - 4} peers across nodes
-                    </span>
-                  )}
+              <div className="flex items-center justify-between gap-3 text-[11px] font-mono text-outline">
+                <div className="flex items-center gap-1.5 min-w-0">
+                  <div className="flex items-center -space-x-1.5 shrink-0">
+                    {players.slice(0, 4).map((p) => (
+                      <img
+                        key={p.id}
+                        src={p.avatarUrl}
+                        alt={p.username}
+                        title={`${p.username} (${p.ping}ms)`}
+                        className="w-4 h-4 rounded-full ring-1 ring-surface object-cover"
+                      />
+                    ))}
+                  </div>
+                  <span className="truncate">
+                    {totalPlayersOnline > 4
+                      ? `+${totalPlayersOnline - 4} more`
+                      : 'No players connected'}
+                  </span>
                 </div>
-                <span className="text-secondary">Avg Ping: 16ms</span>
+                <span className="shrink-0">16ms avg ping</span>
               </div>
             </div>
           </div>
 
           {/* Card 3: Combined CPU Usage Across Running Servers */}
-          <div className="p-4 rounded-xl bg-surface border border-outline-variant/15 flex flex-col justify-between relative overflow-hidden shadow-lg">
-            <div className="flex items-start justify-between">
-              <div>
-                <p className="text-[10px] font-mono uppercase tracking-wider text-outline font-bold">
-                  Combined CPU Load (All JVMs)
-                </p>
-                <div className="flex items-baseline gap-2 mt-1">
-                  <span className="text-2xl font-bold font-mono text-white tabular-nums">
-                    {hostNormalizedCpu}%
-                  </span>
-                  <span className="text-xs font-mono text-tertiary">{avgCpuTemp}°C Pkg</span>
-                  <span className="text-[10px] font-mono text-outline">• 5.35 GHz Boost</span>
-                </div>
-              </div>
-              <div className="w-9 h-9 rounded-lg bg-tertiary/10 border border-tertiary/25 flex items-center justify-center text-tertiary">
-                <span className="material-symbols-outlined text-[20px]">memory</span>
-              </div>
+          <div className="p-4 rounded-xl bg-surface border border-white/[0.06] flex flex-col">
+            <div className="flex items-center justify-between gap-2">
+              <span className="kp-label">CPU load · all JVMs</span>
+              <span className="material-symbols-outlined text-[16px] text-tertiary">memory</span>
             </div>
 
-            <div className="mt-3">
-              {/* Segmented CPU Bar per Running Server */}
-              <div className="w-full bg-surface-lowest h-2 rounded-full overflow-hidden flex border border-white/5">
+            <div className="mt-2.5 flex items-baseline gap-1.5 min-w-0">
+              <span className="kp-stat-value">{hostNormalizedCpu}%</span>
+              <span className="kp-chip ml-auto">{runningServers.length} JVMs</span>
+            </div>
+
+            <div className="mt-auto pt-3.5 space-y-2">
+              <div className="w-full bg-surface-lowest h-1.5 rounded-full overflow-hidden flex gap-px">
                 {runningServers.map((srv, idx) => (
                   <div
                     key={srv.id}
@@ -617,46 +372,38 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                     style={{ width: `${Math.min(100, srv.cpuUsage)}%` }}
                     className={`h-full transition-all duration-500 ${
                       segmentColors[idx % segmentColors.length]
-                    } border-r border-surface-lowest`}
+                    }`}
                   />
                 ))}
               </div>
-              <div className="flex items-center justify-between text-[10px] font-mono text-outline mt-2">
-                <span>{runningServers.length} JVM Processes Active</span>
-                <span className="text-tertiary">
-                  {Math.max(0, 100 - hostNormalizedCpu)}% Headroom Free
+              <div className="flex items-center justify-between gap-3 text-[11px] font-mono text-outline">
+                <span className="truncate">Real host sample</span>
+                <span className="shrink-0">
+                  {Math.max(0, 100 - hostNormalizedCpu)}% headroom
                 </span>
               </div>
             </div>
           </div>
 
           {/* Card 4: Combined RAM Usage Across Running Servers */}
-          <div className="p-4 rounded-xl bg-surface border border-outline-variant/15 flex flex-col justify-between relative overflow-hidden shadow-lg">
-            <div className="flex items-start justify-between">
-              <div>
-                <p className="text-[10px] font-mono uppercase tracking-wider text-outline font-bold">
-                  Combined JVM Heap / Host RAM
-                </p>
-                <div className="flex items-baseline gap-2 mt-1">
-                  <span className="text-2xl font-bold font-mono text-white tabular-nums">
-                    {combinedRamUsedGb}
-                  </span>
-                  <span className="text-xs font-mono text-outline">
-                    / {combinedRamAllocatedGb} GB Heap
-                  </span>
-                  <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-primary/10 text-primary">
-                    {hostRamPercent}% of 32GB
-                  </span>
-                </div>
-              </div>
-              <div className="w-9 h-9 rounded-lg bg-primary-gold/10 border border-primary-gold/25 flex items-center justify-center text-primary-gold">
-                <span className="material-symbols-outlined text-[20px]">developer_board</span>
-              </div>
+          <div className="p-4 rounded-xl bg-surface border border-white/[0.06] flex flex-col">
+            <div className="flex items-center justify-between gap-2">
+              <span className="kp-label">JVM heap / host RAM</span>
+              <span className="material-symbols-outlined text-[16px] text-primary-gold">
+                developer_board
+              </span>
             </div>
 
-            <div className="mt-3">
-              {/* Segmented RAM Bar per Running Server */}
-              <div className="w-full bg-surface-lowest h-2 rounded-full overflow-hidden flex border border-white/5">
+            <div className="mt-2.5 flex items-baseline gap-1.5 min-w-0">
+              <span className="kp-stat-value">{combinedRamUsedGb}</span>
+              <span className="font-mono text-[11.5px] text-outline whitespace-nowrap">
+                / {combinedRamAllocatedGb} GB heap
+              </span>
+              <span className="kp-chip ml-auto">{hostRamPercent}% of host</span>
+            </div>
+
+            <div className="mt-auto pt-3.5 space-y-2">
+              <div className="w-full bg-surface-lowest h-1.5 rounded-full overflow-hidden flex gap-px">
                 {runningServers.map((srv, idx) => (
                   <div
                     key={srv.id}
@@ -664,24 +411,24 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                     style={{ width: `${(srv.ramUsedGb / totalHostRamGb) * 100}%` }}
                     className={`h-full transition-all duration-500 ${
                       segmentColors[idx % segmentColors.length]
-                    } border-r border-surface-lowest`}
+                    }`}
                   />
                 ))}
               </div>
-              <div className="flex items-center justify-between text-[10px] font-mono text-outline mt-2">
-                <span>DDR5-6000 ECC • G1GC Active</span>
+              <div className="flex items-center justify-between gap-3 text-[11px] font-mono text-outline">
+                <span className="truncate">G1GC active</span>
                 <button
                   onClick={() =>
                     onShowToast(
                       'Global G1GC Sweep Triggered',
                       `Reclaimed 1.4 GB unreferenced heap across ${runningServers.length} running JVMs.`,
                       'success',
-                      'cleaning_services'
+                      'cleaning_services',
                     )
                   }
-                  className="text-primary hover:underline cursor-pointer"
+                  className="shrink-0 text-primary hover:underline cursor-pointer"
                 >
-                  Sweep All GC →
+                  Sweep GC →
                 </button>
               </div>
             </div>
@@ -689,42 +436,36 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
         </section>
 
         {/* REAL-TIME HOST SYSTEM PERFORMANCE MONITOR (RECHARTS ENGINE) */}
-        <section className="rounded-xl bg-surface border border-outline-variant/15 overflow-hidden shadow-xl">
+        <section className="rounded-xl bg-surface border border-white/[0.06] overflow-hidden ">
           {/* Header Bar */}
-          <div className="px-5 py-3.5 bg-surface-container border-b border-outline-variant/15 flex flex-wrap items-center justify-between gap-4">
-            <div className="flex items-center gap-3">
-              <div className="w-8 h-8 rounded-lg bg-primary/10 border border-primary/25 flex items-center justify-center text-primary">
-                <span className="material-symbols-outlined text-[18px]">monitoring</span>
-              </div>
-              <div>
-                <div className="flex items-center gap-2.5">
-                  <h2 className="text-xs font-bold uppercase tracking-wider text-white">
-                    Real-Time System Performance Monitor (Global Host Telemetry)
-                  </h2>
-                  <span
-                    className={`px-2 py-0.5 rounded text-[10px] font-mono uppercase flex items-center gap-1 border ${
-                      telemetryPaused
-                        ? 'bg-primary-gold/10 text-primary-gold border-primary-gold/25'
-                        : 'bg-secondary/10 text-secondary border-secondary/25'
-                    }`}
-                  >
-                    <span
-                      className={`w-1.5 h-1.5 rounded-full ${
-                        telemetryPaused ? 'bg-primary-gold' : 'bg-secondary animate-ping'
-                      }`}
-                    />
-                    {telemetryPaused ? 'Stream Paused' : 'Live 2s IPC Stream'}
-                  </span>
-                </div>
-                <p className="text-[11px] font-mono text-outline mt-0.5">
-                  Aggregated CPU Threads, Physical DDR5 Commit &amp; NVMe RAID-0 Disk I/O Across All Processes
-                </p>
-              </div>
+          <div className="px-4 h-[52px] bg-surface-container border-b border-white/[0.06] flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <span className="material-symbols-outlined text-[17px] text-primary">monitoring</span>
+              <h2 className="text-[13.5px] font-semibold text-white whitespace-nowrap">
+                System performance
+              </h2>
+              <span
+                className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md border font-mono text-[10.5px] ${
+                  telemetryPaused
+                    ? 'bg-primary-gold/10 text-primary-gold border-primary-gold/25'
+                    : 'bg-secondary/10 text-secondary border-secondary/25'
+                }`}
+              >
+                <span
+                  className={`w-1.5 h-1.5 rounded-full ${
+                    telemetryPaused ? 'bg-primary-gold' : 'bg-secondary'
+                  }`}
+                />
+                {telemetryPaused ? 'Paused' : 'Live · 2s'}
+              </span>
+              <p className="hidden lg:block text-[11.5px] font-mono text-outline truncate">
+                Host CPU, memory commit and disk I/O across all instances
+              </p>
             </div>
 
             {/* Stream Controls */}
             <div className="flex items-center gap-2">
-              <div className="flex items-center bg-surface-lowest p-0.5 rounded-lg border border-outline-variant/20">
+              <div className="flex items-center bg-surface-lowest p-0.5 rounded-lg border border-white/[0.06]">
                 {(['30s', '1m', '5m'] as const).map((range) => (
                   <button
                     key={range}
@@ -743,18 +484,8 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
 
               <button
                 type="button"
-                onClick={handleSimulateChunkBurst}
-                className="px-3 py-1.5 rounded-lg bg-surface-container-highest hover:bg-surface-bright text-[11px] font-mono text-primary border border-primary/20 flex items-center gap-1.5 transition-colors cursor-pointer"
-                title="Trigger simulated region disk & CPU spike"
-              >
-                <span className="material-symbols-outlined text-[14px]">bolt</span>
-                Simulate I/O Burst
-              </button>
-
-              <button
-                type="button"
                 onClick={() => setTelemetryPaused(!telemetryPaused)}
-                className="px-3 py-1.5 rounded-lg bg-surface-container-high hover:bg-surface-bright text-[11px] font-mono text-on-surface border border-outline-variant/20 flex items-center gap-1 transition-colors cursor-pointer"
+                className="px-3 py-1.5 rounded-lg bg-surface-container-high hover:bg-surface-bright text-[11px] font-mono text-on-surface border border-white/[0.06] flex items-center gap-1 transition-colors cursor-pointer"
               >
                 <span className="material-symbols-outlined text-[14px]">
                   {telemetryPaused ? 'play_arrow' : 'pause'}
@@ -767,34 +498,32 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
           {/* 3-Column Recharts Telemetry Grid: Global CPU, Global RAM, Disk I/O */}
           <div className="p-5 grid grid-cols-1 lg:grid-cols-3 gap-5">
             {/* CHART 1: GLOBAL CPU UTILIZATION & KERNEL OVERHEAD */}
-            <div className="p-4 rounded-xl bg-surface-container-low border border-outline-variant/15 flex flex-col justify-between space-y-3">
-              <div className="flex items-start justify-between">
-                <div>
+            <div className="p-4 rounded-xl bg-surface-container-low border border-white/[0.06] flex flex-col">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
                   <div className="flex items-center gap-2">
-                    <span className="w-2 h-2 rounded-full bg-primary"></span>
-                    <h3 className="text-xs font-bold uppercase tracking-wider text-white">
-                      Global CPU Utilization
+                    <span className="w-1.5 h-1.5 rounded-full bg-primary" />
+                    <h3 className="text-[11px] font-semibold uppercase tracking-[0.06em] text-white">
+                      Global CPU
                     </h3>
                   </div>
-                  <p className="text-[10px] font-mono text-outline mt-0.5">
-                    JVM User Threads vs. Kernel Overhead
+                  <p className="text-[11px] font-mono text-outline mt-1 truncate">
+                    JVM threads vs. kernel overhead
                   </p>
                 </div>
-                <div className="text-right font-mono">
-                  <div className="text-base font-bold text-primary tabular-nums">
+                <div className="text-right font-mono shrink-0">
+                  <div className="text-[17px] font-semibold text-primary tabular-nums leading-6">
                     {latestTelemetry.cpuTotal}%
                   </div>
-                  <div className="text-[10px] text-tertiary">
-                    Kernel: {latestTelemetry.cpuKernel}% • {latestTelemetry.cpuTemp}°C
-                  </div>
+                  <div className="text-[10.5px] text-outline leading-4">2s interval</div>
                 </div>
               </div>
 
-              <div className="h-44 w-full">
+              <div className="mt-3 h-44 w-full">
                 <ResponsiveContainer width="100%" height="100%">
                   <AreaChart
                     data={telemetryHistory}
-                    margin={{ top: 6, right: 6, left: -24, bottom: 0 }}
+                    margin={{ top: 6, right: 14, left: -24, bottom: 0 }}
                   >
                     <defs>
                       <linearGradient id="cpuTotalGrad" x1="0" y1="0" x2="0" y2="1">
@@ -812,6 +541,8 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                       tick={{ fill: '#8e909e', fontSize: 10, fontFamily: 'JetBrains Mono' }}
                       axisLine={{ stroke: 'rgba(255,255,255,0.1)' }}
                       tickLine={false}
+                      minTickGap={44}
+                      tickMargin={6}
                     />
                     <YAxis
                       domain={[0, 100]}
@@ -860,44 +591,44 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                 </ResponsiveContainer>
               </div>
 
-              <div className="pt-2 border-t border-outline-variant/10 flex items-center justify-between text-[10px] font-mono text-outline">
-                <span className="flex items-center gap-1.5">
-                  <span className="w-2 h-0.5 bg-primary inline-block"></span> JVM Load
-                  <span className="w-2 h-0.5 bg-tertiary inline-block ml-2"></span> System Kernel
+              <div className="mt-3 pt-2.5 border-t border-outline-variant/10 flex items-center justify-between gap-3 text-[11px] font-mono text-outline">
+                <span className="flex items-center gap-1.5 whitespace-nowrap">
+                  <span className="w-2 h-0.5 bg-primary inline-block"></span> JVM
+                  <span className="w-2 h-0.5 bg-tertiary inline-block ml-2"></span> Kernel
                 </span>
-                <span>16C / 32T SMT Active</span>
+                <span className="whitespace-nowrap">16C / 32T SMT</span>
               </div>
             </div>
 
             {/* CHART 2: GLOBAL RAM & JVM HEAP ALLOCATION */}
-            <div className="p-4 rounded-xl bg-surface-container-low border border-outline-variant/15 flex flex-col justify-between space-y-3">
-              <div className="flex items-start justify-between">
-                <div>
+            <div className="p-4 rounded-xl bg-surface-container-low border border-white/[0.06] flex flex-col">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
                   <div className="flex items-center gap-2">
-                    <span className="w-2 h-2 rounded-full bg-secondary"></span>
-                    <h3 className="text-xs font-bold uppercase tracking-wider text-white">
-                      Global RAM &amp; Heap Commit
+                    <span className="w-1.5 h-1.5 rounded-full bg-secondary" />
+                    <h3 className="text-[11px] font-semibold uppercase tracking-[0.06em] text-white">
+                      Global memory
                     </h3>
                   </div>
-                  <p className="text-[10px] font-mono text-outline mt-0.5">
-                    Active Heap vs. Committed Memory (32 GB Host)
+                  <p className="text-[11px] font-mono text-outline mt-1 truncate">
+                    Active heap vs. committed
                   </p>
                 </div>
-                <div className="text-right font-mono">
-                  <div className="text-base font-bold text-secondary tabular-nums">
+                <div className="text-right font-mono shrink-0">
+                  <div className="text-[17px] font-semibold text-secondary tabular-nums leading-6">
                     {latestTelemetry.ramUsedGb} GB
                   </div>
-                  <div className="text-[10px] text-outline">
-                    Commit: {latestTelemetry.ramCommittedGb} GB / 32 GB
+                  <div className="text-[10.5px] text-outline leading-4 whitespace-nowrap">
+                    commit {latestTelemetry.ramCommittedGb} GB
                   </div>
                 </div>
               </div>
 
-              <div className="h-44 w-full">
+              <div className="mt-3 h-44 w-full">
                 <ResponsiveContainer width="100%" height="100%">
                   <AreaChart
                     data={telemetryHistory}
-                    margin={{ top: 6, right: 6, left: -24, bottom: 0 }}
+                    margin={{ top: 6, right: 14, left: -24, bottom: 0 }}
                   >
                     <defs>
                       <linearGradient id="ramUsedGrad" x1="0" y1="0" x2="0" y2="1">
@@ -911,6 +642,8 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                       tick={{ fill: '#8e909e', fontSize: 10, fontFamily: 'JetBrains Mono' }}
                       axisLine={{ stroke: 'rgba(255,255,255,0.1)' }}
                       tickLine={false}
+                      minTickGap={44}
+                      tickMargin={6}
                     />
                     <YAxis
                       domain={[0, 32]}
@@ -949,45 +682,44 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                 </ResponsiveContainer>
               </div>
 
-              <div className="pt-2 border-t border-outline-variant/10 flex items-center justify-between text-[10px] font-mono text-outline">
-                <span className="flex items-center gap-1.5">
-                  <span className="w-2 h-0.5 bg-secondary inline-block"></span> Active Heap Used
-                  <span className="w-2 h-0.5 bg-primary inline-block ml-2"></span> -Xmx Reserved
+              <div className="mt-3 pt-2.5 border-t border-outline-variant/10 flex items-center justify-between gap-3 text-[11px] font-mono text-outline">
+                <span className="flex items-center gap-1.5 whitespace-nowrap">
+                  <span className="w-2 h-0.5 bg-secondary inline-block"></span> Heap
+                  <span className="w-2 h-0.5 bg-primary inline-block ml-2"></span> -Xmx
                 </span>
-                <span className="text-secondary">G1GC YoungGen Optimal</span>
+                <span className="text-secondary whitespace-nowrap">G1GC YoungGen</span>
               </div>
             </div>
 
-            {/* CHART 3: NVMe RAID-0 DISK I/O THROUGHPUT (READ / WRITE MB/s) */}
-            <div className="p-4 rounded-xl bg-surface-container-low border border-outline-variant/15 flex flex-col justify-between space-y-3">
-              <div className="flex items-start justify-between">
-                <div>
+            {/* CHART 3: DISK I/O THROUGHPUT (READ / WRITE MB/s) */}
+            <div className="p-4 rounded-xl bg-surface-container-low border border-white/[0.06] flex flex-col">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
                   <div className="flex items-center gap-2">
-                    <span className="w-2 h-2 rounded-full bg-tertiary"></span>
-                    <h3 className="text-xs font-bold uppercase tracking-wider text-white">
-                      NVMe Disk I/O Throughput
+                    <span className="w-1.5 h-1.5 rounded-full bg-tertiary" />
+                    <h3 className="text-[11px] font-semibold uppercase tracking-[0.06em] text-white">
+                      Disk I/O
                     </h3>
                   </div>
-                  <p className="text-[10px] font-mono text-outline mt-0.5">
-                    Region Anvil Read vs. Chunk/WAL Write (MB/s)
+                  <p className="text-[11px] font-mono text-outline mt-1 truncate">
+                    Region reads vs. chunk writes
                   </p>
                 </div>
-                <div className="text-right font-mono">
-                  <div className="text-base font-bold text-tertiary tabular-nums">
+                <div className="text-right font-mono shrink-0">
+                  <div className="text-[17px] font-semibold text-tertiary tabular-nums leading-6">
                     {latestTelemetry.diskReadMbs + latestTelemetry.diskWriteMbs} MB/s
                   </div>
-                  <div className="text-[10px] text-outline">
-                    R: {latestTelemetry.diskReadMbs} • W: {latestTelemetry.diskWriteMbs} MB/s (
-                    {latestTelemetry.iops.toLocaleString()} IOPS)
+                  <div className="text-[10.5px] text-outline leading-4 whitespace-nowrap">
+                    R {latestTelemetry.diskReadMbs} · W {latestTelemetry.diskWriteMbs}
                   </div>
                 </div>
               </div>
 
-              <div className="h-44 w-full">
+              <div className="mt-3 h-44 w-full">
                 <ResponsiveContainer width="100%" height="100%">
                   <ComposedChart
                     data={telemetryHistory}
-                    margin={{ top: 6, right: 6, left: -20, bottom: 0 }}
+                    margin={{ top: 6, right: 14, left: -20, bottom: 0 }}
                   >
                     <defs>
                       <linearGradient id="diskReadGrad" x1="0" y1="0" x2="0" y2="1">
@@ -1001,6 +733,8 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                       tick={{ fill: '#8e909e', fontSize: 10, fontFamily: 'JetBrains Mono' }}
                       axisLine={{ stroke: 'rgba(255,255,255,0.1)' }}
                       tickLine={false}
+                      minTickGap={44}
+                      tickMargin={6}
                     />
                     <YAxis
                       tick={{ fill: '#8e909e', fontSize: 10, fontFamily: 'JetBrains Mono' }}
@@ -1048,26 +782,25 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                 </ResponsiveContainer>
               </div>
 
-              <div className="pt-2 border-t border-outline-variant/10 flex items-center justify-between text-[10px] font-mono text-outline">
-                <span className="flex items-center gap-1.5">
-                  <span className="w-2 h-0.5 bg-tertiary inline-block"></span> Read MB/s
+              <div className="mt-3 pt-2.5 border-t border-outline-variant/10 flex items-center justify-between gap-3 text-[11px] font-mono text-outline">
+                <span className="flex items-center gap-1.5 whitespace-nowrap">
+                  <span className="w-2 h-0.5 bg-tertiary inline-block"></span> Read
                   <span className="w-2 h-2 rounded-xs bg-primary inline-block ml-2"></span> Write
-                  MB/s
                 </span>
-                <span>Queue Depth: 2 • 0.16ms Latency</span>
+                <span>{latestTelemetry.iops.toLocaleString()} IOPS</span>
               </div>
             </div>
           </div>
 
           {/* COMBINED RESOURCE DISTRIBUTION & MULTI-NODE TELEMETRY BAR */}
-          <div className="px-5 py-3.5 bg-surface-container-low border-t border-outline-variant/15">
+          <div className="px-5 py-3.5 bg-surface-container-low border-t border-white/[0.06]">
             <div className="flex flex-wrap items-center justify-between gap-4 mb-2.5">
               <div className="flex items-center gap-2">
-                <span className="material-symbols-outlined text-primary text-[16px]">
+                <span className="material-symbols-outlined text-outline text-[15px]">
                   stacked_bar_chart
                 </span>
-                <span className="text-[11px] font-bold uppercase tracking-wider text-on-surface">
-                  Per-Instance Resource Attribution Breakdown
+                <span className="text-[11.5px] font-medium text-outline">
+                  Per-instance resource attribution
                 </span>
               </div>
               <div className="flex flex-wrap items-center gap-4 text-[11px] font-mono">
@@ -1106,7 +839,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                     {hostNormalizedCpu}% Busy / {100 - hostNormalizedCpu}% Idle
                   </span>
                 </div>
-                <div className="w-full h-2.5 rounded-md bg-surface-lowest overflow-hidden flex p-0.5 gap-0.5 border border-white/5">
+                <div className="w-full h-2.5 rounded-md bg-surface-lowest overflow-hidden flex p-0.5 gap-0.5 border border-white/[0.06]">
                   {runningServers.map((srv, idx) => (
                     <div
                       key={srv.id}
@@ -1131,7 +864,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                     GB Free
                   </span>
                 </div>
-                <div className="w-full h-2.5 rounded-md bg-surface-lowest overflow-hidden flex p-0.5 gap-0.5 border border-white/5">
+                <div className="w-full h-2.5 rounded-md bg-surface-lowest overflow-hidden flex p-0.5 gap-0.5 border border-white/[0.06]">
                   {runningServers.map((srv, idx) => (
                     <div
                       key={srv.id}
@@ -1149,7 +882,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
         </section>
 
         {/* PAPERMC API BACKGROUND VERSION CHECKER SERVICE BANNER */}
-        <section className="rounded-xl bg-surface border border-amber-400/30 p-4 flex flex-wrap items-center justify-between gap-4 shadow-lg">
+        <section className="rounded-xl bg-surface border border-amber-400/30 p-4 flex flex-wrap items-center justify-between gap-4 ">
           <div className="flex items-start sm:items-center gap-3.5">
             <div className="w-10 h-10 rounded-xl bg-amber-400/15 border border-amber-400/35 flex items-center justify-center text-amber-300 shrink-0">
               <span className="material-symbols-outlined text-[22px]">system_update_alt</span>
@@ -1177,7 +910,8 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                 <strong className="text-primary">
                   PaperMC {latestPaperRelease} ({latestPaperBuild})
                 </strong>{' '}
-                • Checked via <code className="text-white/80">https://api.papermc.io/v2/projects/paper</code> •
+                • Checked via{' '}
+                <code className="text-white/80">https://api.papermc.io/v2/projects/paper</code> •
                 Last Check:{' '}
                 <span className="text-on-surface">
                   {paperMcReport?.lastCheckedAt
@@ -1214,7 +948,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
 
         {/* ALL SERVERS LISTED — FILTER BAR & DIRECTORY */}
         <section className="space-y-4">
-          <div className="flex flex-wrap items-center justify-between gap-4 bg-surface p-3.5 rounded-xl border border-outline-variant/15 shadow-md">
+          <div className="flex flex-wrap items-center justify-between gap-4 bg-surface p-3.5 rounded-xl border border-white/[0.06] ">
             <div className="flex items-center gap-3">
               <div className="flex items-center gap-2">
                 <span className="material-symbols-outlined text-primary text-[20px]">
@@ -1226,7 +960,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
               </div>
 
               {/* Filter Tabs */}
-              <div className="flex items-center gap-1 bg-surface-lowest p-1 rounded-lg border border-outline-variant/20 ml-2">
+              <div className="flex items-center gap-1 bg-surface-lowest p-1 rounded-lg border border-white/[0.06] ml-2">
                 <button
                   onClick={() => setStatusFilter('all')}
                   className={`px-3 py-1 rounded-md text-xs font-medium transition-colors cursor-pointer ${
@@ -1272,11 +1006,11 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                   placeholder="Filter by server, engine, port, PID..."
-                  className="w-full bg-surface-lowest border border-outline-variant/25 focus:border-primary rounded-lg pl-9 pr-3 py-1.5 text-xs font-mono text-on-surface focus:outline-none"
+                  className="w-full bg-surface-lowest border border-white/[0.06] focus:border-primary rounded-lg pl-9 pr-3 py-1.5 text-xs font-mono text-on-surface focus:outline-none"
                 />
               </div>
 
-              <div className="flex items-center bg-surface-lowest p-1 rounded-lg border border-outline-variant/20">
+              <div className="flex items-center bg-surface-lowest p-1 rounded-lg border border-white/[0.06]">
                 <button
                   onClick={() => setLayoutMode('cards')}
                   className={`px-2.5 py-1 rounded text-xs font-mono flex items-center gap-1 cursor-pointer ${
@@ -1306,7 +1040,35 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
           </div>
 
           {/* LAYOUT MODE 1: DETAILED SERVER INSTANCE CARDS */}
-          {layoutMode === 'cards' ? (
+          {servers.length === 0 ? (
+            <div className="rounded-xl bg-surface border border-dashed border-primary/40 p-8 text-center space-y-4 ">
+              <div className="w-14 h-14 rounded-xl bg-primary/15 border border-primary/35 flex items-center justify-center text-primary mx-auto">
+                <span className="material-symbols-outlined text-[30px]">add_to_queue</span>
+              </div>
+              <div className="space-y-1.5 max-w-lg mx-auto">
+                <h3 className="text-base font-bold text-white">
+                  No Minecraft Servers Created Yet (0 / {maxServerLimit} Servers)
+                </h3>
+                <p className="text-xs text-outline leading-relaxed">
+                  No servers are pre-installed by default. Click the button below to create your own
+                  Minecraft server in{' '}
+                  <code className="text-primary font-mono">{serverInstallRootDir}</code>. Every
+                  server remains <strong className="text-amber-300">STOPPED</strong> by default
+                  until you manually click <strong className="text-secondary">Start</strong>.
+                </p>
+              </div>
+              <div className="flex items-center justify-center gap-3 pt-1">
+                <button
+                  type="button"
+                  onClick={() => setCreateModalOpen(true)}
+                  className="px-5 py-2.5 rounded-xl bg-primary hover:opacity-95 text-on-primary-container text-xs font-bold flex items-center gap-2 cursor-pointer"
+                >
+                  <span className="material-symbols-outlined text-[18px]">add_circle</span>+ Create
+                  Your Own Server Now
+                </button>
+              </div>
+            </div>
+          ) : layoutMode === 'cards' ? (
             <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
               {filteredServers.map((srv, idx) => {
                 const isSelected = srv.id === activeServer.id;
@@ -1314,27 +1076,27 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                 const isRestarting = srv.status === 'restarting';
                 const ramPercent = Math.min(
                   100,
-                  Math.round((srv.ramUsedGb / Math.max(1, srv.ramMaxGb)) * 100)
+                  Math.round((srv.ramUsedGb / Math.max(1, srv.ramMaxGb)) * 100),
                 );
                 const playerPercent = Math.min(
                   100,
-                  Math.round((srv.playersOnline / Math.max(1, srv.maxPlayers)) * 100)
+                  Math.round((srv.playersOnline / Math.max(1, srv.maxPlayers)) * 100),
                 );
 
                 return (
                   <div
                     key={srv.id}
-                    className={`rounded-xl bg-surface border transition-all p-5 flex flex-col justify-between shadow-lg ${
+                    className={`rounded-xl bg-surface border transition-all p-5 flex flex-col justify-between ${
                       isSelected
                         ? 'border-primary/50 ring-1 ring-primary/20'
-                        : 'border-outline-variant/15 hover:border-outline-variant/35'
+                        : 'border-white/[0.06] hover:border-outline-variant/35'
                     }`}
                   >
                     {/* Card Header: Identity, Status & Quick Select */}
                     <div>
                       <div className="flex items-start justify-between gap-4">
                         <div className="flex items-start gap-3.5">
-                          <div className="w-12 h-12 rounded-xl bg-surface-lowest border border-outline-variant/25 flex items-center justify-center relative shrink-0 overflow-hidden shadow-md">
+                          <div className="w-12 h-12 rounded-xl bg-surface-lowest border border-white/[0.06] flex items-center justify-center relative shrink-0 overflow-hidden ">
                             <img
                               src={HOTLINKED_IMAGES.serverIcon64}
                               alt={srv.name}
@@ -1348,8 +1110,8 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                                 isRunning
                                   ? 'bg-secondary'
                                   : isRestarting
-                                  ? 'bg-primary animate-ping'
-                                  : 'bg-error'
+                                    ? 'bg-primary animate-ping'
+                                    : 'bg-error'
                               }`}
                             />
                           </div>
@@ -1372,15 +1134,17 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                                   isRunning
                                     ? 'bg-secondary/15 text-secondary border border-secondary/30'
                                     : isRestarting
-                                    ? 'bg-primary/15 text-primary border border-primary/30'
-                                    : 'bg-error/15 text-error border border-error/30'
+                                      ? 'bg-primary/15 text-primary border border-primary/30'
+                                      : 'bg-error/15 text-error border border-error/30'
                                 }`}
                               >
                                 {srv.status}
                               </span>
-                              {(srv.isOutdated !== undefined
-                                ? srv.isOutdated
-                                : !srv.engine.includes(latestPaperRelease)) ? (
+                              {(
+                                srv.isOutdated !== undefined
+                                  ? srv.isOutdated
+                                  : !srv.engine.includes(latestPaperRelease)
+                              ) ? (
                                 <span
                                   className="px-2 py-0.5 rounded text-[10px] font-mono uppercase font-bold bg-error/20 text-error border border-error/40 flex items-center gap-1"
                                   title={`Outdated Engine! Installed: ${srv.engine} | Latest PaperMC Release: ${
@@ -1409,7 +1173,8 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                               <span>{srv.pid > 0 ? `PID ${srv.pid}` : 'No PID'}</span>
                             </div>
                             <div className="text-[11px] font-mono text-outline/70 mt-0.5">
-                              {srv.path} • Uptime: <strong className="text-on-surface">{srv.uptime}</strong>
+                              {srv.path} • Uptime:{' '}
+                              <strong className="text-on-surface">{srv.uptime}</strong>
                             </div>
                           </div>
                         </div>
@@ -1430,7 +1195,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                       </div>
 
                       {/* 3-Column Per-Server Telemetry Strip (Players, CPU, RAM) */}
-                      <div className="grid grid-cols-3 gap-3 mt-4 pt-4 border-t border-outline-variant/15">
+                      <div className="grid grid-cols-3 gap-3 mt-4 pt-4 border-t border-white/[0.06]">
                         {/* Metric 1: Players */}
                         <div className="p-3 rounded-lg bg-surface-container-low border border-outline-variant/10">
                           <div className="flex items-center justify-between text-[10px] font-mono text-outline uppercase">
@@ -1462,9 +1227,6 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                               style={{ width: `${Math.min(100, srv.cpuUsage)}%` }}
                             />
                           </div>
-                          <div className="text-[10px] font-mono text-outline mt-1.5">
-                            Temp: {srv.cpuTemp}°C
-                          </div>
                         </div>
 
                         {/* Metric 3: RAM Usage */}
@@ -1491,7 +1253,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                     </div>
 
                     {/* Card Footer: Quick Workspace Navigation & Power Controls */}
-                    <div className="mt-4 pt-3 border-t border-outline-variant/15 flex items-center justify-between gap-2 flex-wrap">
+                    <div className="mt-4 pt-3 border-t border-white/[0.06] flex items-center justify-between gap-2 flex-wrap">
                       {/* Left: Jump to specific server tools */}
                       <div className="flex items-center gap-1.5">
                         <button
@@ -1503,7 +1265,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                         </button>
                         <button
                           onClick={() => onManageServer(srv, 'files')}
-                          className="px-2.5 py-1.5 rounded-lg bg-surface-container-high hover:bg-surface-bright text-on-surface text-xs font-medium border border-outline-variant/20 flex items-center gap-1 transition-colors cursor-pointer"
+                          className="px-2.5 py-1.5 rounded-lg bg-surface-container-high hover:bg-surface-bright text-on-surface text-xs font-medium border border-white/[0.06] flex items-center gap-1 transition-colors cursor-pointer"
                           title="Open File Manager"
                         >
                           <span className="material-symbols-outlined text-[14px] text-outline">
@@ -1513,7 +1275,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                         </button>
                         <button
                           onClick={() => onManageServer(srv, 'jvm')}
-                          className="px-2.5 py-1.5 rounded-lg bg-surface-container-high hover:bg-surface-bright text-on-surface text-xs font-medium border border-outline-variant/20 flex items-center gap-1 transition-colors cursor-pointer"
+                          className="px-2.5 py-1.5 rounded-lg bg-surface-container-high hover:bg-surface-bright text-on-surface text-xs font-medium border border-white/[0.06] flex items-center gap-1 transition-colors cursor-pointer"
                           title="Configure JVM Flags"
                         >
                           <span className="material-symbols-outlined text-[14px] text-outline">
@@ -1523,7 +1285,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                         </button>
                         <button
                           onClick={() => onManageServer(srv, 'settings')}
-                          className="px-2.5 py-1.5 rounded-lg bg-surface-container-high hover:bg-surface-bright text-on-surface text-xs font-medium border border-outline-variant/20 flex items-center gap-1 transition-colors cursor-pointer"
+                          className="px-2.5 py-1.5 rounded-lg bg-surface-container-high hover:bg-surface-bright text-on-surface text-xs font-medium border border-white/[0.06] flex items-center gap-1 transition-colors cursor-pointer"
                           title="Server Settings & MOTD"
                         >
                           <span className="material-symbols-outlined text-[14px] text-outline">
@@ -1562,7 +1324,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                           <>
                             <button
                               onClick={() => onServerPowerAction(srv.id, 'restart')}
-                              className="px-2.5 py-1.5 rounded-lg bg-surface-container-high hover:bg-primary/20 text-outline hover:text-primary border border-outline-variant/20 text-xs font-mono flex items-center gap-1 transition-colors cursor-pointer"
+                              className="px-2.5 py-1.5 rounded-lg bg-surface-container-high hover:bg-primary/20 text-outline hover:text-primary border border-white/[0.06] text-xs font-mono flex items-center gap-1 transition-colors cursor-pointer"
                               title="Graceful Restart"
                             >
                               <span className="material-symbols-outlined text-[14px]">
@@ -1588,11 +1350,11 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             </div>
           ) : (
             /* LAYOUT MODE 2: HIGH-DENSITY ALL SERVERS TABLE */
-            <div className="bg-surface rounded-xl border border-outline-variant/15 overflow-hidden shadow-xl">
+            <div className="bg-surface rounded-xl border border-white/[0.06] overflow-hidden ">
               <div className="overflow-x-auto">
                 <table className="w-full text-left border-collapse">
                   <thead>
-                    <tr className="border-b border-outline-variant/15 text-[10px] font-mono uppercase text-outline bg-surface-container">
+                    <tr className="border-b border-white/[0.06] text-[10px] font-mono uppercase text-outline bg-surface-container">
                       <th className="py-3 px-4">Server Instance</th>
                       <th className="py-3 px-4">Status</th>
                       <th className="py-3 px-4">Engine &amp; Build</th>
@@ -1633,8 +1395,8 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                                 isRunning
                                   ? 'bg-secondary/15 text-secondary border border-secondary/30'
                                   : srv.status === 'restarting'
-                                  ? 'bg-primary/15 text-primary border border-primary/30'
-                                  : 'bg-error/15 text-error border border-error/30'
+                                    ? 'bg-primary/15 text-primary border border-primary/30'
+                                    : 'bg-error/15 text-error border border-error/30'
                               }`}
                             >
                               {srv.status}
@@ -1643,9 +1405,11 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                           <td className="py-3 px-4 font-mono">
                             <div className="text-on-surface flex items-center gap-1.5 flex-wrap">
                               <span>{srv.engine}</span>
-                              {(srv.isOutdated !== undefined
-                                ? srv.isOutdated
-                                : !srv.engine.includes(latestPaperRelease)) ? (
+                              {(
+                                srv.isOutdated !== undefined
+                                  ? srv.isOutdated
+                                  : !srv.engine.includes(latestPaperRelease)
+                              ) ? (
                                 <span className="px-1.5 py-0.5 rounded bg-error/20 text-error border border-error/40 text-[9px] font-bold">
                                   OUTDATED → {srv.latestVersion || latestPaperRelease}
                                 </span>
@@ -1671,7 +1435,6 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                           </td>
                           <td className="py-3 px-4 font-mono">
                             <div className="text-tertiary font-bold">{srv.cpuUsage}%</div>
-                            <div className="text-[10px] text-outline">{srv.cpuTemp}°C</div>
                           </td>
                           <td className="py-3 px-4 font-mono">
                             <div className="text-secondary font-bold">
@@ -1683,22 +1446,21 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
                                 style={{
                                   width: `${Math.min(
                                     100,
-                                    (srv.ramUsedGb / Math.max(1, srv.ramMaxGb)) * 100
+                                    (srv.ramUsedGb / Math.max(1, srv.ramMaxGb)) * 100,
                                   )}%`,
                                 }}
                               />
                             </div>
                           </td>
                           <td className="py-3 px-4 font-mono">
-                            <div className={isRunning ? 'text-secondary font-bold' : 'text-outline'}>
+                            <div
+                              className={isRunning ? 'text-secondary font-bold' : 'text-outline'}
+                            >
                               {srv.tps.toFixed(1)} TPS
                             </div>
                             <div className="text-[10px] text-outline">{srv.tickMs}ms</div>
                           </td>
-                          <td
-                            className="py-3 px-4 text-right"
-                            onClick={(e) => e.stopPropagation()}
-                          >
+                          <td className="py-3 px-4 text-right" onClick={(e) => e.stopPropagation()}>
                             <div className="inline-flex items-center gap-1.5">
                               {(srv.isOutdated !== undefined
                                 ? srv.isOutdated
@@ -1753,120 +1515,22 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
         </section>
       </div>
 
-      {/* DEPLOY NEW SERVER INSTANCE MODAL */}
-      {createModalOpen && (
-        <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="w-full max-w-md rounded-2xl bg-surface border border-outline-variant/25 shadow-2xl overflow-hidden">
-            <div className="px-5 py-4 bg-surface-container border-b border-outline-variant/15 flex items-center justify-between">
-              <div className="flex items-center gap-2.5">
-                <span className="material-symbols-outlined text-primary text-[20px]">add_box</span>
-                <h3 className="text-sm font-bold text-white">
-                  Deploy New Localhost Server Instance
-                </h3>
-              </div>
-              <button
-                onClick={() => setCreateModalOpen(false)}
-                className="text-outline hover:text-white cursor-pointer"
-              >
-                <span className="material-symbols-outlined text-[18px]">close</span>
-              </button>
-            </div>
-
-            <form onSubmit={handleDeployInstance} className="p-5 space-y-4">
-              <div>
-                <label className="text-xs font-semibold text-on-surface block mb-1">
-                  Server Instance Name
-                </label>
-                <input
-                  type="text"
-                  value={newName}
-                  onChange={(e) => setNewName(e.target.value)}
-                  placeholder="e.g., Creative Builders Hub"
-                  className="w-full bg-surface-lowest border border-outline-variant/25 focus:border-primary rounded-lg px-3 py-2 text-xs text-white focus:outline-none"
-                  autoFocus
-                />
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="text-xs font-semibold text-on-surface block mb-1">
-                    Server Engine
-                  </label>
-                  <select
-                    value={newEngine}
-                    onChange={(e) => setNewEngine(e.target.value)}
-                    className="w-full bg-surface-lowest border border-outline-variant/25 focus:border-primary rounded-lg px-3 py-2 text-xs text-white focus:outline-none"
-                  >
-                    <option value="PaperMC 1.20.4">PaperMC 1.20.4</option>
-                    <option value="Purpur 1.20.4">Purpur 1.20.4</option>
-                    <option value="Fabric 1.20.4">Fabric 1.20.4</option>
-                    <option value="Folia 1.20.4">Folia 1.20.4</option>
-                    <option value="Velocity 3.3.0">Velocity 3.3.0 Proxy</option>
-                  </select>
-                </div>
-
-                <div>
-                  <label className="text-xs font-semibold text-on-surface block mb-1">
-                    TCP/UDP Port
-                  </label>
-                  <input
-                    type="number"
-                    value={newPort}
-                    onChange={(e) => setNewPort(e.target.value)}
-                    className="w-full bg-surface-lowest border border-outline-variant/25 focus:border-primary rounded-lg px-3 py-2 text-xs font-mono text-primary focus:outline-none"
-                  />
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="text-xs font-semibold text-on-surface block mb-1">
-                    Max Heap Allocation (GB)
-                  </label>
-                  <input
-                    type="number"
-                    min={1}
-                    max={24}
-                    value={newRamMax}
-                    onChange={(e) => setNewRamMax(Number(e.target.value))}
-                    className="w-full bg-surface-lowest border border-outline-variant/25 focus:border-primary rounded-lg px-3 py-2 text-xs font-mono text-white focus:outline-none"
-                  />
-                </div>
-
-                <div>
-                  <label className="text-xs font-semibold text-on-surface block mb-1">
-                    Max Player Slots
-                  </label>
-                  <input
-                    type="number"
-                    min={1}
-                    max={500}
-                    value={newMaxPlayers}
-                    onChange={(e) => setNewMaxPlayers(Number(e.target.value))}
-                    className="w-full bg-surface-lowest border border-outline-variant/25 focus:border-primary rounded-lg px-3 py-2 text-xs font-mono text-white focus:outline-none"
-                  />
-                </div>
-              </div>
-
-              <div className="pt-2 flex items-center justify-end gap-2">
-                <button
-                  type="button"
-                  onClick={() => setCreateModalOpen(false)}
-                  className="px-4 py-2 rounded-lg bg-surface-container-high text-xs font-medium text-outline hover:text-white cursor-pointer"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  className="px-4 py-2 rounded-lg bg-gradient-to-r from-primary to-primary-container text-on-primary-container text-xs font-bold shadow-lg shadow-primary/20 cursor-pointer"
-                >
-                  Initialize &amp; Start Instance
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
+      <ServerInstallModal
+        isOpen={createModalOpen}
+        defaultRoot={serverInstallRootDir}
+        serverCount={servers.length}
+        maxLimit={maxServerLimit}
+        isSuperAdmin={isSuperAdmin}
+        discordVerified={isDiscordVerified}
+        username={currentUser?.username || 'Operator'}
+        onClose={() => setCreateModalOpen(false)}
+        onInstalled={(installed) => onCreateServerInstance(installed)}
+        onLimitReached={(attemptedName) => {
+          setCreateModalOpen(false);
+          onOpenDiscordBotGate?.(attemptedName);
+        }}
+        onShowToast={onShowToast}
+      />
     </main>
   );
 };

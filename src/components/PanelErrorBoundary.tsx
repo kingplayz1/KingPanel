@@ -9,7 +9,7 @@ interface PanelErrorBoundaryProps {
     title: string,
     body?: string,
     type?: 'success' | 'info' | 'warning' | 'error',
-    icon?: string
+    icon?: string,
   ) => void;
   children: React.ReactNode;
 }
