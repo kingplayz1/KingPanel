@@ -1,13 +1,7 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
-import {
-  ServerInstance,
-  FileItem,
-  PluginItem,
-  CronTask,
-  NavSection,
-  AuthUser,
-} from '../types';
+import { ServerInstance, FileItem, PluginItem, CronTask, NavSection, AuthUser } from '../types';
 import { DEFAULT_PROFILE_ICON_URL, resolveUserAvatarUrl } from '../utils/profileIcons';
+import { BrandMark } from './BrandMark';
 
 interface TitleBarProps {
   servers: ServerInstance[];
@@ -27,13 +21,18 @@ interface TitleBarProps {
     title: string,
     body?: string,
     type?: 'success' | 'info' | 'warning' | 'error',
-    icon?: string
+    icon?: string,
   ) => void;
   isMinimized: boolean;
+  isMaximized: boolean;
   onToggleMinimize: () => void;
+  onMinimize: () => void;
+  onToggleMaximize: () => void;
   isSimplePanelMode?: boolean;
   onToggleSimplePanel?: () => void;
   onOpenDiscordBotGate?: () => void;
+  /** Opens the exit dialog (hide-to-tray / quit) instead of closing directly. */
+  onRequestClose?: () => void;
 }
 
 type PaletteCategory = 'all' | 'servers' | 'files' | 'plugins' | 'crons';
@@ -70,13 +69,16 @@ export const TitleBar: React.FC<TitleBarProps> = ({
   onTriggerCron,
   onShowToast,
   onToggleMinimize,
+  onMinimize,
+  onToggleMaximize,
   isSimplePanelMode,
   onToggleSimplePanel,
   onOpenDiscordBotGate,
+  onRequestClose,
 }) => {
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [userMenuOpen, setUserMenuOpen] = useState(false);
-  const [isMaximized, setIsMaximized] = useState(true);
+  const [isMaximized, setIsMaximized] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [activeCategory, setActiveCategory] = useState<PaletteCategory>('all');
@@ -98,6 +100,19 @@ export const TitleBar: React.FC<TitleBarProps> = ({
     };
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  // Sync the real OS window state (Electron) into the title-bar buttons so the
+  // maximize glyph reflects the actual window, not local React state.
+  useEffect(() => {
+    if (!window.electronicState) return;
+    setIsMaximized(window.electronicState.isMaximized());
+    const unsubscribe = window.electronic?.onStateChange?.((state) => {
+      setIsMaximized(Boolean(state?.maximized));
+    });
+    return () => {
+      if (typeof unsubscribe === 'function') unsubscribe();
+    };
   }, []);
 
   // Global keyboard shortcut Ctrl+K / Cmd+K to toggle Command Palette
@@ -154,7 +169,7 @@ export const TitleBar: React.FC<TitleBarProps> = ({
           String(s.port).includes(q) ||
           String(s.pid).includes(q) ||
           s.path.toLowerCase().includes(q) ||
-          s.status.toLowerCase().includes(q)
+          s.status.toLowerCase().includes(q),
       );
 
       const mFiles = flattenedFiles.filter(
@@ -163,7 +178,7 @@ export const TitleBar: React.FC<TitleBarProps> = ({
           f.name.toLowerCase().includes(q) ||
           f.path.toLowerCase().includes(q) ||
           (f.language && f.language.toLowerCase().includes(q)) ||
-          (f.content && f.content.toLowerCase().includes(q))
+          (f.content && f.content.toLowerCase().includes(q)),
       );
 
       const mPlugins = plugins.filter(
@@ -173,7 +188,7 @@ export const TitleBar: React.FC<TitleBarProps> = ({
           p.author.toLowerCase().includes(q) ||
           p.category.toLowerCase().includes(q) ||
           p.source.toLowerCase().includes(q) ||
-          p.description.toLowerCase().includes(q)
+          p.description.toLowerCase().includes(q),
       );
 
       const mCrons = crons.filter(
@@ -182,7 +197,7 @@ export const TitleBar: React.FC<TitleBarProps> = ({
           c.title.toLowerCase().includes(q) ||
           c.cron.toLowerCase().includes(q) ||
           c.description.toLowerCase().includes(q) ||
-          c.status.toLowerCase().includes(q)
+          c.status.toLowerCase().includes(q),
       );
 
       const items: PaletteResultItem[] = [];
@@ -199,13 +214,13 @@ export const TitleBar: React.FC<TitleBarProps> = ({
               srv.status === 'running'
                 ? 'bg-secondary/15 text-secondary border-secondary/30'
                 : srv.status === 'restarting'
-                ? 'bg-primary/15 text-primary border-primary/30'
-                : 'bg-error/15 text-error border-error/30',
+                  ? 'bg-primary/15 text-primary border-primary/30'
+                  : 'bg-error/15 text-error border-error/30',
             icon: 'dns',
             iconColor:
               srv.status === 'running'
                 ? 'bg-secondary/10 text-secondary border-secondary/25'
-                : 'bg-surface-container-highest text-outline border-white/10',
+                : 'bg-surface-container-highest text-outline border-white/[0.08]',
             metaRight: `:${srv.port} • ${srv.playersOnline}/${srv.maxPlayers} Players`,
             rawServer: srv,
           });
@@ -240,14 +255,14 @@ export const TitleBar: React.FC<TitleBarProps> = ({
               plugin.status === 'update_ready'
                 ? `UPDATE → ${plugin.targetVersion}`
                 : plugin.status === 'installed'
-                ? 'INSTALLED'
-                : 'AVAILABLE',
+                  ? 'INSTALLED'
+                  : 'AVAILABLE',
             badgeColor:
               plugin.status === 'update_ready'
                 ? 'bg-primary-gold/15 text-primary-gold border-primary-gold/30'
                 : plugin.status === 'installed'
-                ? 'bg-secondary/15 text-secondary border-secondary/30'
-                : 'bg-tertiary/15 text-tertiary border-tertiary/30',
+                  ? 'bg-secondary/15 text-secondary border-secondary/30'
+                  : 'bg-tertiary/15 text-tertiary border-tertiary/30',
             icon: 'extension',
             iconColor: 'bg-tertiary/10 text-tertiary border-tertiary/25',
             metaRight: plugin.downloads,
@@ -304,7 +319,7 @@ export const TitleBar: React.FC<TitleBarProps> = ({
         `Focused Schedule: ${item.rawCron.title}`,
         `Cron Expression: ${item.rawCron.cron} (${item.rawCron.nextRun})`,
         'info',
-        'schedule'
+        'schedule',
       );
       setPaletteOpen(false);
     }
@@ -330,23 +345,24 @@ export const TitleBar: React.FC<TitleBarProps> = ({
     } else if (e.key === 'Tab') {
       e.preventDefault();
       const order: PaletteCategory[] = ['all', 'servers', 'files', 'plugins', 'crons'];
-      const nextIdx = (order.indexOf(activeCategory) + (e.shiftKey ? order.length - 1 : 1)) % order.length;
+      const nextIdx =
+        (order.indexOf(activeCategory) + (e.shiftKey ? order.length - 1 : 1)) % order.length;
       setActiveCategory(order[nextIdx]);
     }
   };
 
   const handleToggleFullscreen = () => {
-    setIsMaximized(!isMaximized);
-    if (!document.fullscreenElement) {
-      document.documentElement.requestFullscreen?.().catch(() => {});
+    if (window.electronic?.maximize) {
+      // Electron: toggle the real OS window; state syncs back via IPC.
+      window.electronic.maximize();
     } else {
-      document.exitFullscreen?.().catch(() => {});
+      onToggleMaximize();
     }
     onShowToast(
       isMaximized ? 'Window Restored' : 'Window Maximized',
       'Obsidian Sovereign workstation viewport adjusted.',
       'info',
-      'aspect_ratio'
+      'aspect_ratio',
     );
   };
 
@@ -358,48 +374,30 @@ export const TitleBar: React.FC<TitleBarProps> = ({
       <header className="mica-titlebar relative z-50 flex items-center justify-between px-3 py-1.5 select-none shrink-0 text-xs">
         {/* Left Window Identity & Active Server Switcher */}
         <div className="flex items-center gap-3">
-          {/* Brand Shield & Crown Crest */}
-          <div className="flex items-center gap-2">
-            <div className="size-6 rounded-md bg-gradient-to-br from-amber-400 via-amber-600 to-amber-700 flex items-center justify-center shadow-md shadow-amber-500/20 ring-1 ring-amber-300/40">
-              <svg className="size-3.5 text-black" fill="currentColor" viewBox="0 0 24 24">
-                <path d="M5 16L3 5l5.5 5L12 4l3.5 6L21 5l-2 11H5zm14 3c0 .6-.4 1-1 1H6c-.6 0-1-.4-1-1v-1h14v1z" />
-              </svg>
-            </div>
-            <div className="flex items-baseline gap-1.5">
-              <span className="font-bold tracking-tight text-white font-mono text-[13px] whitespace-nowrap">
-                IS King Panel
-              </span>
-              <span className="text-white/30 text-[11px] hidden lg:inline">—</span>
-              <span className="text-white/70 text-[11px] font-medium hidden lg:inline whitespace-nowrap">
-                v4.8 Localhost Engine
-              </span>
-            </div>
-          </div>
+          {/* Brand lockup: crown crest + KingPanel wordmark */}
+          <BrandMark />
 
           {/* Active Server Switcher Pill */}
           <div
-            className="hidden md:flex items-center gap-2 ml-2 pl-3 border-l border-white/10 relative"
+            className="hidden md:flex items-center gap-2 ml-2 pl-3 border-l border-white/[0.08] relative"
             ref={dropdownRef}
           >
             <button
               type="button"
               onClick={() => setDropdownOpen(!dropdownOpen)}
-              className="flex items-center gap-1.5 px-2.5 py-0.5 rounded-md bg-surface-container hover:bg-surface-container-high border border-white/10 text-on-surface text-[11px] transition-colors cursor-pointer"
+              className="flex items-center gap-1.5 px-2.5 py-0.5 rounded-md bg-surface-container hover:bg-surface-container-high border border-white/[0.08] text-on-surface text-[11px] transition-colors cursor-pointer"
             >
               <span
                 className={`size-2 rounded-full ${
                   activeServer.status === 'running'
                     ? 'bg-secondary animate-pulse'
                     : activeServer.status === 'restarting'
-                    ? 'bg-primary animate-spin'
-                    : 'bg-error'
+                      ? 'bg-primary animate-spin'
+                      : 'bg-error'
                 }`}
               />
               <span className="font-semibold text-white whitespace-nowrap">
                 {activeServer.name}
-              </span>
-              <span className="text-white/40 font-mono text-[10px] whitespace-nowrap">
-                (:{activeServer.port})
               </span>
               <span className="material-symbols-outlined text-xs text-white/40 ml-0.5">
                 unfold_more
@@ -408,7 +406,7 @@ export const TitleBar: React.FC<TitleBarProps> = ({
 
             {/* Server Instance Switcher Dropdown */}
             {dropdownOpen && (
-              <div className="absolute left-3 top-full mt-1.5 w-80 rounded-xl bg-surface-container-low border border-white/10 shadow-2xl p-1.5 z-50 space-y-1">
+              <div className="absolute left-3 top-full mt-1.5 w-80 rounded-xl bg-surface-container-low border border-white/[0.08] p-1.5 z-50 space-y-1">
                 <div className="px-2.5 py-1 text-[10px] font-mono uppercase tracking-wider text-white/40 flex items-center justify-between">
                   <span>Localhost Server Instances</span>
                   <span className="text-secondary">{servers.length} Nodes</span>
@@ -461,7 +459,7 @@ export const TitleBar: React.FC<TitleBarProps> = ({
         <div className="flex-1 max-w-md mx-4">
           <div
             onClick={() => setPaletteOpen(true)}
-            className="w-full flex items-center justify-between gap-2 px-3 py-1 rounded-lg bg-surface-lowest/90 hover:bg-surface-container border border-white/10 hover:border-primary/40 transition-all cursor-pointer group shadow-inner"
+            className="w-full flex items-center justify-between gap-2 px-3 py-1 rounded-lg bg-surface-lowest/90 hover:bg-surface-container border border-white/[0.08] hover:border-primary/40 transition-all cursor-pointer group "
           >
             <div className="flex items-center gap-2 min-w-0 flex-1">
               <span className="material-symbols-outlined text-[15px] text-outline group-hover:text-primary transition-colors">
@@ -472,13 +470,13 @@ export const TitleBar: React.FC<TitleBarProps> = ({
                 readOnly
                 value={searchQuery}
                 onFocus={() => setPaletteOpen(true)}
-                placeholder="Search servers, files, plugins, cron tasks..."
+                placeholder="Search or jump to…"
                 className="w-full bg-transparent text-[11px] font-mono text-on-surface placeholder:text-outline/70 focus:outline-none cursor-pointer truncate"
               />
             </div>
             <div className="flex items-center gap-1.5 shrink-0">
               <span className="hidden sm:inline-flex items-center gap-1 text-[10px] font-mono text-outline/70">
-                <span className="px-1.5 py-0.2 rounded bg-surface-container-high border border-white/10 text-[9px] text-white/70">
+                <span className="px-1.5 py-0.2 rounded bg-surface-container-high border border-white/[0.08] text-[9px] text-white/70">
                   Ctrl K
                 </span>
               </span>
@@ -488,23 +486,6 @@ export const TitleBar: React.FC<TitleBarProps> = ({
 
         {/* Right: Operator Account Menu + IPC Badge + Window Management Icons */}
         <div className="flex items-center gap-2">
-          {currentUser && (
-            <button
-              type="button"
-              onClick={() => {
-                if (isSimplePanelMode && onToggleSimplePanel) {
-                  onToggleSimplePanel();
-                }
-                onNavigate('setup_guide');
-              }}
-              className="hidden sm:inline-flex px-2.5 py-0.5 rounded-lg text-[10px] font-mono font-bold border bg-secondary/15 hover:bg-secondary/25 text-secondary border-secondary/35 items-center gap-1 cursor-pointer transition-colors"
-              title="Open New User Setup Panel Guide (6-Step Walkthrough)"
-            >
-              <span className="material-symbols-outlined text-[13px]">school</span>
-              Setup Guide
-            </button>
-          )}
-
           {currentUser && onToggleSimplePanel && (
             <button
               type="button"
@@ -532,20 +513,16 @@ export const TitleBar: React.FC<TitleBarProps> = ({
                   ? 'bg-secondary/15 text-secondary border-secondary/35'
                   : 'bg-[#5865F2]/20 hover:bg-[#5865F2]/30 text-[#8ea1e1] border-[#5865F2]/40'
               }`}
-              title="Verify Discord Bot or Join Official Discord Server"
+              title="Verify Discord membership or join the official Discord server"
             >
               <span className="material-symbols-outlined text-[13px]">
                 {currentUser.discordVerified ? 'verified' : 'forum'}
               </span>
               {currentUser.discordVerified
                 ? `Bot Verified (${servers.length}/${currentUser.maxServerLimit || 10})`
-                : `Verify Discord Bot (${servers.length}/2)`}
+                : `Verify Discord (${servers.length}/2)`}
             </button>
           )}
-
-          <span className="hidden xl:inline-flex text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 whitespace-nowrap">
-            IPC FastPipe: PID {activeServer.pid}
-          </span>
 
           {/* Operator Identity & Auth Menu */}
           {currentUser ? (
@@ -553,7 +530,7 @@ export const TitleBar: React.FC<TitleBarProps> = ({
               <button
                 type="button"
                 onClick={() => setUserMenuOpen(!userMenuOpen)}
-                className="flex items-center gap-2 px-2 py-0.5 rounded-lg bg-surface-container hover:bg-surface-container-high border border-white/10 hover:border-primary/40 transition-colors cursor-pointer"
+                className="flex items-center gap-2 px-2 py-0.5 rounded-lg bg-surface-container hover:bg-surface-container-high border border-white/[0.08] hover:border-primary/40 transition-colors cursor-pointer"
               >
                 <img
                   src={resolveUserAvatarUrl(currentUser.avatarUrl)}
@@ -566,17 +543,14 @@ export const TitleBar: React.FC<TitleBarProps> = ({
                 <span className="font-semibold text-[11px] text-white hidden sm:inline">
                   {currentUser.username}
                 </span>
-                <span className="px-1.5 py-0.2 rounded text-[9px] font-mono uppercase bg-primary/15 text-primary border border-primary/25">
-                  {currentUser.provider}
-                </span>
                 <span className="material-symbols-outlined text-[14px] text-white/50">
                   expand_more
                 </span>
               </button>
 
               {userMenuOpen && (
-                <div className="absolute right-0 top-full mt-1.5 w-72 rounded-xl bg-surface-container-low border border-white/15 shadow-2xl p-3 z-50 space-y-3">
-                  <div className="flex items-center gap-3 pb-2.5 border-b border-white/10">
+                <div className="absolute right-0 top-full mt-1.5 w-72 rounded-xl bg-surface-container-low border border-white/15 p-3 z-50 space-y-3">
+                  <div className="flex items-center gap-3 pb-2.5 border-b border-white/[0.08]">
                     <img
                       src={resolveUserAvatarUrl(currentUser.avatarUrl)}
                       onError={(e) => {
@@ -616,34 +590,7 @@ export const TitleBar: React.FC<TitleBarProps> = ({
                     </div>
                   </div>
 
-                  <div className="pt-2 border-t border-white/10 space-y-1.5">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setUserMenuOpen(false);
-                        if (isSimplePanelMode && onToggleSimplePanel) {
-                          onToggleSimplePanel();
-                        }
-                        onNavigate('setup_guide');
-                      }}
-                      className="w-full px-3 py-1.5 rounded-lg bg-secondary/15 hover:bg-secondary/25 border border-secondary/35 text-xs font-bold text-secondary flex items-center gap-2 transition-colors cursor-pointer"
-                    >
-                      <span className="material-symbols-outlined text-[16px]">school</span>
-                      New User Setup Panel Guide
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setUserMenuOpen(false);
-                        onNavigate('panel_control');
-                      }}
-                      className="w-full px-3 py-1.5 rounded-lg bg-primary/15 hover:bg-primary/25 border border-primary/30 text-xs font-bold text-primary flex items-center gap-2 transition-colors cursor-pointer"
-                    >
-                      <span className="material-symbols-outlined text-[16px]">
-                        admin_panel_settings
-                      </span>
-                      Panel Control, RAM &amp; User Profile
-                    </button>
+                  <div className="pt-2 border-t border-white/[0.08] space-y-1.5">
                     <button
                       type="button"
                       onClick={() => {
@@ -699,9 +646,17 @@ export const TitleBar: React.FC<TitleBarProps> = ({
           <div className="flex items-center">
             <button
               type="button"
-              onClick={onToggleMinimize}
+              onClick={() => {
+                if (window.electronic?.minimize) {
+                  // Electron: minimize the real OS window.
+                  window.electronic.minimize();
+                } else {
+                  onMinimize();
+                  onToggleMinimize();
+                }
+              }}
               className="px-3 py-1 hover:bg-white/10 text-white/70 hover:text-white transition-colors"
-              title="Minimize to Tray"
+              title="Minimize"
             >
               <svg className="size-3" fill="currentColor" viewBox="0 0 12 12">
                 <rect height="1" width="10" x="1" y="6" />
@@ -725,14 +680,13 @@ export const TitleBar: React.FC<TitleBarProps> = ({
             </button>
             <button
               type="button"
-              onClick={() =>
-                onShowToast(
-                  'Daemon Protected Mode',
-                  'IS King Panel stays active in background tray while PaperMC server is running.',
-                  'warning',
-                  'shield_lock'
-                )
-              }
+              onClick={() => {
+                if (onRequestClose) {
+                  onRequestClose();
+                } else if (window.electronic?.close) {
+                  window.electronic.close();
+                }
+              }}
               className="px-3 py-1 hover:bg-red-600 text-white/70 hover:text-white transition-colors"
               title="Close Window"
             >
@@ -757,11 +711,11 @@ export const TitleBar: React.FC<TitleBarProps> = ({
           onClick={() => setPaletteOpen(false)}
         >
           <div
-            className="w-full max-w-2xl rounded-2xl bg-surface border border-primary/30 shadow-2xl overflow-hidden flex flex-col max-h-[80vh] ring-1 ring-white/10"
+            className="w-full max-w-2xl rounded-xl bg-surface border border-primary/30 overflow-hidden flex flex-col max-h-[80vh] ring-1 ring-white/10"
             onClick={(e) => e.stopPropagation()}
           >
             {/* Top Search Bar Input */}
-            <div className="px-4 py-3.5 bg-surface-container border-b border-outline-variant/20 flex items-center gap-3">
+            <div className="px-4 py-3.5 bg-surface-container border-b border-white/[0.06] flex items-center gap-3">
               <span className="material-symbols-outlined text-primary text-[22px]">
                 manage_search
               </span>
@@ -783,13 +737,13 @@ export const TitleBar: React.FC<TitleBarProps> = ({
                   Clear
                 </button>
               )}
-              <span className="px-2 py-0.5 rounded bg-surface-lowest border border-outline-variant/25 text-[10px] font-mono text-outline">
+              <span className="px-2 py-0.5 rounded bg-surface-lowest border border-white/[0.06] text-[10px] font-mono text-outline">
                 ESC
               </span>
             </div>
 
             {/* Category Filter Pills */}
-            <div className="px-4 py-2 bg-surface-container-low border-b border-outline-variant/15 flex items-center justify-between gap-2 flex-wrap">
+            <div className="px-4 py-2 bg-surface-container-low border-b border-white/[0.06] flex items-center justify-between gap-2 flex-wrap">
               <div className="flex items-center gap-1.5 flex-wrap">
                 {(
                   [
@@ -829,7 +783,7 @@ export const TitleBar: React.FC<TitleBarProps> = ({
                       className={`px-2.5 py-1 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-all cursor-pointer ${
                         isActive
                           ? 'bg-primary text-on-primary-container font-bold shadow'
-                          : 'bg-surface-lowest text-outline hover:text-white border border-outline-variant/15'
+                          : 'bg-surface-lowest text-outline hover:text-white border border-white/[0.06]'
                       }`}
                     >
                       <span className="material-symbols-outlined text-[14px]">{tab.icon}</span>
@@ -863,7 +817,8 @@ export const TitleBar: React.FC<TitleBarProps> = ({
                     No matching servers, files, plugins, or cron tasks
                   </div>
                   <p className="text-xs font-mono text-outline">
-                    Try searching for &quot;PaperMC&quot;, &quot;server.properties&quot;, &quot;LuckPerms&quot;, or &quot;Snapshot&quot;
+                    Try searching for &quot;PaperMC&quot;, &quot;server.properties&quot;,
+                    &quot;LuckPerms&quot;, or &quot;Snapshot&quot;
                   </p>
                 </div>
               ) : (
@@ -883,17 +838,15 @@ export const TitleBar: React.FC<TitleBarProps> = ({
                       onClick={() => handleExecuteItem(item)}
                       className={`p-3 rounded-xl border transition-all flex items-center justify-between gap-3 cursor-pointer ${
                         isHighlighted
-                          ? 'bg-primary/10 border-primary/40 shadow-md'
-                          : 'bg-surface-container-low/60 border-transparent hover:border-outline-variant/20'
+                          ? 'bg-primary/10 border-primary/40 '
+                          : 'bg-surface-container-low/60 border-transparent hover:border-white/[0.06]'
                       }`}
                     >
                       <div className="flex items-center gap-3 min-w-0 flex-1">
                         <div
                           className={`w-9 h-9 rounded-lg border flex items-center justify-center shrink-0 ${item.iconColor}`}
                         >
-                          <span className="material-symbols-outlined text-[19px]">
-                            {item.icon}
-                          </span>
+                          <span className="material-symbols-outlined text-[19px]">{item.icon}</span>
                         </div>
 
                         <div className="min-w-0 flex-1">
@@ -946,10 +899,10 @@ export const TitleBar: React.FC<TitleBarProps> = ({
                           {item.category === 'servers'
                             ? 'Switch'
                             : item.category === 'files'
-                            ? 'Edit File'
-                            : item.category === 'plugins'
-                            ? 'Inspect'
-                            : 'Open'}
+                              ? 'Edit File'
+                              : item.category === 'plugins'
+                                ? 'Inspect'
+                                : 'Open'}
                           <span className="material-symbols-outlined text-[12px]">
                             keyboard_return
                           </span>
@@ -962,30 +915,30 @@ export const TitleBar: React.FC<TitleBarProps> = ({
             </div>
 
             {/* Bottom Keyboard Navigation Legend */}
-            <div className="px-4 py-2.5 bg-surface-container border-t border-outline-variant/15 flex items-center justify-between text-[11px] font-mono text-outline">
+            <div className="px-4 py-2.5 bg-surface-container border-t border-white/[0.06] flex items-center justify-between text-[11px] font-mono text-outline">
               <div className="flex items-center gap-4">
                 <span className="flex items-center gap-1">
-                  <kbd className="px-1.5 py-0.5 rounded bg-surface-lowest border border-white/10 text-[10px] text-white">
+                  <kbd className="px-1.5 py-0.5 rounded bg-surface-lowest border border-white/[0.08] text-[10px] text-white">
                     ↑↓
                   </kbd>
                   Navigate
                 </span>
                 <span className="flex items-center gap-1">
-                  <kbd className="px-1.5 py-0.5 rounded bg-surface-lowest border border-white/10 text-[10px] text-white">
+                  <kbd className="px-1.5 py-0.5 rounded bg-surface-lowest border border-white/[0.08] text-[10px] text-white">
                     ↵
                   </kbd>
                   Open / Jump
                 </span>
                 <span className="flex items-center gap-1">
-                  <kbd className="px-1.5 py-0.5 rounded bg-surface-lowest border border-white/10 text-[10px] text-white">
+                  <kbd className="px-1.5 py-0.5 rounded bg-surface-lowest border border-white/[0.08] text-[10px] text-white">
                     Tab
                   </kbd>
                   Filter Type
                 </span>
               </div>
               <div>
-                Indexed: {servers.length} Servers • {flattenedFiles.length} Files •{' '}
-                {plugins.length} Plugins • {crons.length} Crons
+                Indexed: {servers.length} Servers • {flattenedFiles.length} Files • {plugins.length}{' '}
+                Plugins • {crons.length} Crons
               </div>
             </div>
           </div>

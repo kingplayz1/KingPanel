@@ -8,7 +8,7 @@ interface PrivacyPolicyViewProps {
     title: string,
     body?: string,
     type?: 'success' | 'info' | 'warning' | 'error',
-    icon?: string
+    icon?: string,
   ) => void;
 }
 
@@ -27,7 +27,7 @@ export const PrivacyPolicyView: React.FC<PrivacyPolicyViewProps> = ({
       'Data Sovereignty Manifest Exported',
       `Saved privacy-compliance-v4.8.json to ${server.path}\\logs`,
       'success',
-      'verified_user'
+      'verified_user',
     );
   };
 
@@ -38,7 +38,7 @@ export const PrivacyPolicyView: React.FC<PrivacyPolicyViewProps> = ({
         'Player UUID or Username Required',
         'Enter a player username or Mojang UUID to execute a GDPR erasure sweep.',
         'warning',
-        'warning'
+        'warning',
       );
       return;
     }
@@ -46,7 +46,7 @@ export const PrivacyPolicyView: React.FC<PrivacyPolicyViewProps> = ({
       'GDPR Right-to-Erasure Executed',
       `Purged ${purgeUuidInput.trim()} from playerdata/, CoreProtect SQLite, and latest.log.`,
       'success',
-      'delete_forever'
+      'delete_forever',
     );
     setPurgeUuidInput('');
   };
@@ -54,45 +54,38 @@ export const PrivacyPolicyView: React.FC<PrivacyPolicyViewProps> = ({
   return (
     <main className="flex-1 flex flex-col bg-surface-dim overflow-hidden">
       {/* Top Contextual Header */}
-      <header className="h-16 px-6 bg-surface border-b border-outline-variant/25 flex items-center justify-between shrink-0">
-        <div className="flex items-center gap-4">
-          <div className="w-10 h-10 rounded-lg bg-secondary/15 border border-secondary/35 flex items-center justify-center text-secondary">
-            <span className="material-symbols-outlined text-[22px]">privacy_tip</span>
-          </div>
-          <div>
-            <div className="flex items-center gap-2.5">
-              <h1 className="text-base font-bold tracking-tight text-on-surface">
-                Privacy Policy &amp; Localhost Data Sovereignty
-              </h1>
-              <span className="px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider bg-secondary/15 text-secondary rounded border border-secondary/30 font-bold">
-                100% Local-First Architecture
-              </span>
-              <span className="px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider bg-surface-container-highest text-on-surface-variant rounded border border-outline-variant/30">
-                Effective: Oct 2026 (v4.8)
-              </span>
-            </div>
-            <p className="text-xs text-outline font-mono mt-0.5">
-              Zero Cloud Surveillance • GDPR &amp; CCPA Player Log Compliance • OAuth 2.0 PKCE Isolation
-            </p>
-          </div>
+      <header className="min-h-[54px] px-6 py-2 bg-surface border-b border-white/[0.06] flex flex-wrap items-center justify-between gap-x-4 gap-y-2 shrink-0">
+        <div className="flex items-center gap-2.5 min-w-0">
+          <span className="material-symbols-outlined text-[18px] text-primary">privacy_tip</span>
+          <h1 className="text-[14.5px] font-semibold tracking-tight text-on-surface whitespace-nowrap">
+            Privacy
+          </h1>
+          <span className="w-px h-4 bg-white/10 shrink-0" />
+          <p className="text-[11.5px] text-outline font-mono truncate">
+            Local-first data sovereignty · v4.8 · Oct 2026
+          </p>
+          <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md border border-secondary/25 bg-secondary/10 text-secondary font-mono text-[10.5px] shrink-0">
+            <span className="size-1.5 rounded-full bg-secondary" />
+            no cloud sync
+          </span>
         </div>
 
-        <div className="flex items-center gap-2.5">
+        <div className="flex items-center gap-2 shrink-0">
           <button
             type="button"
             onClick={() => onNavigate('terms')}
-            className="px-3.5 py-2 rounded-lg bg-surface-container-high hover:bg-surface-bright text-xs font-semibold text-on-surface border border-outline-variant/30 transition-all flex items-center gap-1.5 cursor-pointer"
+            className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg border border-white/10 bg-white/[0.02] hover:bg-white/[0.06] text-[11.5px] font-medium text-on-surface transition-colors cursor-pointer"
           >
             <span className="material-symbols-outlined text-[16px] text-primary">gavel</span>
-            View Terms &amp; Conditions
+            Terms
           </button>
           <button
             type="button"
             onClick={handleExportAuditJson}
-            className="px-4 py-2 rounded-lg bg-gradient-to-r from-primary to-primary-container text-on-primary-container text-xs font-bold shadow-lg shadow-primary/15 transition-all flex items-center gap-1.5 cursor-pointer"
+            className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg bg-primary hover:brightness-105 text-[11.5px] font-semibold text-on-primary transition-all cursor-pointer"
           >
             <span className="material-symbols-outlined text-[16px]">download</span>
-            Export Compliance Report
+            Export report
           </button>
         </div>
       </header>
@@ -101,7 +94,7 @@ export const PrivacyPolicyView: React.FC<PrivacyPolicyViewProps> = ({
       <div className="flex-1 overflow-y-auto p-6 space-y-6">
         {/* Top 3 Sovereignty Guarantees */}
         <section className="grid grid-cols-1 md:grid-cols-3 gap-4">
-          <div className="p-4 rounded-xl bg-surface border border-outline-variant/25 space-y-2 shadow-lg">
+          <div className="p-4 rounded-xl bg-surface border border-white/[0.06] space-y-2 ">
             <div className="flex items-center justify-between">
               <span className="text-xs font-bold uppercase tracking-wider text-secondary font-mono">
                 01. Local NVMe Storage Only
@@ -118,7 +111,7 @@ export const PrivacyPolicyView: React.FC<PrivacyPolicyViewProps> = ({
             </p>
           </div>
 
-          <div className="p-4 rounded-xl bg-surface border border-outline-variant/25 space-y-2 shadow-lg">
+          <div className="p-4 rounded-xl bg-surface border border-white/[0.06] space-y-2 ">
             <div className="flex items-center justify-between">
               <span className="text-xs font-bold uppercase tracking-wider text-primary font-mono">
                 02. Scoped OAuth 2.0 Identity
@@ -129,7 +122,7 @@ export const PrivacyPolicyView: React.FC<PrivacyPolicyViewProps> = ({
             </div>
             <p className="text-xs text-on-surface-variant leading-relaxed">
               When authenticating via <strong>Discord</strong>, <strong>GitHub</strong>, or{' '}
-              <strong>Google</strong>, IS King Panel requests only read-only identity scopes (
+              <strong>Google</strong>, KingPanel requests only read-only identity scopes (
               <code className="text-primary font-mono">identify</code>,{' '}
               <code className="text-primary font-mono">read:user</code>,{' '}
               <code className="text-primary font-mono">openid email</code>). Session tokens are
@@ -137,7 +130,7 @@ export const PrivacyPolicyView: React.FC<PrivacyPolicyViewProps> = ({
             </p>
           </div>
 
-          <div className="p-4 rounded-xl bg-surface border border-outline-variant/25 space-y-2 shadow-lg">
+          <div className="p-4 rounded-xl bg-surface border border-white/[0.06] space-y-2 ">
             <div className="flex items-center justify-between">
               <span className="text-xs font-bold uppercase tracking-wider text-tertiary font-mono">
                 03. Player IP &amp; UUID Protection
@@ -157,14 +150,14 @@ export const PrivacyPolicyView: React.FC<PrivacyPolicyViewProps> = ({
         {/* Detailed Policy Document + Live Privacy Controls */}
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
           {/* Left 8 Columns: Full Policy Clauses */}
-          <div className="lg:col-span-8 bg-surface rounded-xl border border-outline-variant/25 overflow-hidden shadow-xl divide-y divide-outline-variant/15">
+          <div className="lg:col-span-8 bg-surface rounded-xl border border-white/[0.06] overflow-hidden divide-y divide-outline-variant/15">
             <div className="p-5 space-y-2">
               <h2 className="text-sm font-bold text-white flex items-center gap-2">
                 <span className="text-primary font-mono">§ 1.0</span> Data Collection &amp;
                 Localhost IPC Boundaries
               </h2>
               <p className="text-xs text-on-surface-variant leading-relaxed">
-                IS King Panel v4.8 operates as a self-hosted desktop and local network server
+                KingPanel v4.8 operates as a self-hosted desktop and local network server
                 management engine. Hardware telemetry (CPU package temperature, DDR5 heap usage,
                 NVMe IOPS, and tick loop latency) is sampled via the local FastPipe IPC daemon at{' '}
                 <code className="text-primary font-mono">127.0.0.1</code> and rendered directly in
@@ -221,8 +214,8 @@ export const PrivacyPolicyView: React.FC<PrivacyPolicyViewProps> = ({
 
           {/* Right 4 Columns: Interactive Privacy Enforcement Controls */}
           <div className="lg:col-span-4 space-y-4">
-            <div className="bg-surface rounded-xl border border-outline-variant/25 p-5 space-y-4 shadow-xl">
-              <div className="flex items-center justify-between border-b border-outline-variant/15 pb-3">
+            <div className="bg-surface rounded-xl border border-white/[0.06] p-5 space-y-4 ">
+              <div className="flex items-center justify-between border-b border-white/[0.06] pb-3">
                 <h3 className="text-xs font-bold uppercase tracking-wider text-white font-mono">
                   Live Privacy Controls
                 </h3>
@@ -239,10 +232,10 @@ export const PrivacyPolicyView: React.FC<PrivacyPolicyViewProps> = ({
                     !ipMaskingEnabled ? 'Player IP Masking Enabled' : 'Player IP Masking Disabled',
                     'Updated log-player-ip-addresses in paper-global.yml.',
                     'info',
-                    'privacy_tip'
+                    'privacy_tip',
                   );
                 }}
-                className="p-3 rounded-xl bg-surface-container-low border border-outline-variant/20 flex items-center justify-between cursor-pointer"
+                className="p-3 rounded-xl bg-surface-container-low border border-white/[0.06] flex items-center justify-between cursor-pointer"
               >
                 <div>
                   <div className="text-xs font-bold text-white">Mask Player IPs in Logs</div>
@@ -269,10 +262,10 @@ export const PrivacyPolicyView: React.FC<PrivacyPolicyViewProps> = ({
                     'bStats & Mojang Snooper Blocked',
                     'Enforced zero external plugin metrics in plugins/bStats/config.yml.',
                     'success',
-                    'shield'
+                    'shield',
                   );
                 }}
-                className="p-3 rounded-xl bg-surface-container-low border border-outline-variant/20 flex items-center justify-between cursor-pointer"
+                className="p-3 rounded-xl bg-surface-container-low border border-white/[0.06] flex items-center justify-between cursor-pointer"
               >
                 <div>
                   <div className="text-xs font-bold text-white">Block Plugin bStats / Snooper</div>
@@ -292,7 +285,7 @@ export const PrivacyPolicyView: React.FC<PrivacyPolicyViewProps> = ({
               </div>
 
               {/* Slider: Log Retention */}
-              <div className="p-3 rounded-xl bg-surface-container-low border border-outline-variant/20 space-y-2">
+              <div className="p-3 rounded-xl bg-surface-container-low border border-white/[0.06] space-y-2">
                 <div className="flex justify-between text-xs">
                   <span className="font-bold text-white">Audit &amp; Chat Log Retention</span>
                   <span className="font-mono text-primary font-bold">{autoPurgeDays} Days</span>
@@ -318,7 +311,7 @@ export const PrivacyPolicyView: React.FC<PrivacyPolicyViewProps> = ({
                     value={purgeUuidInput}
                     onChange={(e) => setPurgeUuidInput(e.target.value)}
                     placeholder="Player IGN or UUID..."
-                    className="flex-1 bg-surface-lowest border border-outline-variant/30 focus:border-primary rounded-lg px-3 py-1.5 text-xs font-mono text-white focus:outline-none"
+                    className="flex-1 bg-surface-lowest border border-white/[0.06] focus:border-primary rounded-lg px-3 py-1.5 text-xs font-mono text-white focus:outline-none"
                   />
                   <button
                     type="submit"

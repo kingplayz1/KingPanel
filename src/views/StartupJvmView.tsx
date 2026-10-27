@@ -3,8 +3,18 @@ import { ServerInstance } from '../types';
 
 interface StartupJvmViewProps {
   server: ServerInstance;
-  onUpdateServerEngine?: (engineLabel: string, buildLabel: string, jarFilename: string) => void;
-  onShowToast: (title: string, body?: string, type?: 'success' | 'info' | 'warning' | 'error', icon?: string) => void;
+  onUpdateServerEngine?: (
+    engineLabel: string,
+    buildLabel: string,
+    jarFilename: string,
+    build?: { downloadUrl: string; filename: string; build: string | number },
+  ) => void | Promise<void>;
+  onShowToast: (
+    title: string,
+    body?: string,
+    type?: 'success' | 'info' | 'warning' | 'error',
+    icon?: string,
+  ) => void;
 }
 
 interface LiveJarBuild {
@@ -25,7 +35,6 @@ export const StartupJvmView: React.FC<StartupJvmViewProps> = ({
   const [selectedPreset, setSelectedPreset] = useState<string>('aikar');
   const [xmsGb, setXmsGb] = useState<number>(4);
   const [xmxGb, setXmxGb] = useState<number>(8);
-  const [selectedJdk, setSelectedJdk] = useState<string>('zulu');
 
   // Real-time server.jar fetcher state
   const [jarEngine, setJarEngine] = useState<string>('paper');
@@ -34,6 +43,50 @@ export const StartupJvmView: React.FC<StartupJvmViewProps> = ({
   const [jarBuilds, setJarBuilds] = useState<LiveJarBuild[]>([]);
   const [activeJarFilename, setActiveJarFilename] = useState<string>('paper-1.20.4-498.jar');
   const [jarLoading, setJarLoading] = useState<boolean>(false);
+  const [jarInstalling, setJarInstalling] = useState<boolean>(false);
+
+  // Real host RAM and the Java runtime actually installed on this machine.
+  interface JavaCheckReport {
+    installed: boolean;
+    versionRaw: string;
+    vendor: string;
+    javaMajorVersion: number | null;
+    javaHome: string;
+    requiredJava: number | null;
+    meetsRequirement: boolean | null;
+    notFoundMessage?: string;
+  }
+  const [hostRamGb, setHostRamGb] = useState<number>(0);
+  const [javaCheck, setJavaCheck] = useState<JavaCheckReport | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch('/api/panel/telemetry');
+        const data = await res.json();
+        if (!cancelled && data?.ok && Number(data.host?.osTotalGb) > 0) {
+          setHostRamGb(Math.round(Number(data.host.osTotalGb)));
+        }
+      } catch {
+        // telemetry unavailable — leave the limit unknown rather than inventing one
+      }
+      try {
+        const res = await fetch(
+          `/api/server-runtime/java-check?serverId=${encodeURIComponent(
+            server.id,
+          )}&serverName=${encodeURIComponent(server.name)}`,
+        );
+        const data = await res.json();
+        if (!cancelled && data?.ok) setJavaCheck(data as JavaCheckReport);
+      } catch {
+        // java -version could not be sampled
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [server.id, server.name]);
 
   const fetchJarVersions = useCallback(async (eng: string) => {
     setJarLoading(true);
@@ -57,7 +110,7 @@ export const StartupJvmView: React.FC<StartupJvmViewProps> = ({
     setJarLoading(true);
     try {
       const r = await fetch(
-        `/api/jars/engines/${encodeURIComponent(eng)}/${encodeURIComponent(ver)}`
+        `/api/jars/engines/${encodeURIComponent(eng)}/${encodeURIComponent(ver)}`,
       );
       const data = await r.json();
       if (data.ok && Array.isArray(data.builds) && data.builds.length > 0) {
@@ -80,6 +133,33 @@ export const StartupJvmView: React.FC<StartupJvmViewProps> = ({
       fetchJarBuilds(jarEngine, jarMcVersion);
     }
   }, [jarEngine, jarMcVersion, fetchJarBuilds]);
+
+  // Reinstall really writes <serverDir>/server.jar: the selected build's URL
+  // goes to the backend, which downloads, verifies and records it.
+  const reinstallSelectedJar = async () => {
+    const currentBuild = jarBuilds.find((b) => b.filename === activeJarFilename) || jarBuilds[0];
+    if (!currentBuild) {
+      onShowToast('Pick a build first', 'No builds are listed for this engine/version.', 'warning');
+      return;
+    }
+    setJarInstalling(true);
+    try {
+      // The panel owner (App) performs the single download so the chosen build —
+      // not "latest" — is what lands in the server folder.
+      await onUpdateServerEngine?.(
+        `${jarEngine.toUpperCase()} ${jarMcVersion}`,
+        `Build #${currentBuild.build}`,
+        currentBuild.filename,
+        {
+          downloadUrl: currentBuild.downloadUrl,
+          filename: currentBuild.filename,
+          build: currentBuild.build,
+        },
+      );
+    } finally {
+      setJarInstalling(false);
+    }
+  };
 
   const [flags, setFlags] = useState<Record<string, boolean>>({
     UseG1GC: true,
@@ -107,14 +187,18 @@ export const StartupJvmView: React.FC<StartupJvmViewProps> = ({
       DisableExplicitGC: true,
       G1ReservePercent: true,
     });
-    onShowToast('Recommended Flags Enabled', "Restored all 8 Aikar's GC heuristic flags.", 'success', 'tune');
+    onShowToast(
+      'Recommended Flags Enabled',
+      "Restored all 8 Aikar's GC heuristic flags.",
+      'success',
+      'tune',
+    );
   };
 
   const handleRevertDefaults = () => {
     setSelectedPreset('aikar');
     setXmsGb(4);
     setXmxGb(8);
-    setSelectedJdk('zulu');
     enableAllRecommended();
   };
 
@@ -137,7 +221,9 @@ export const StartupJvmView: React.FC<StartupJvmViewProps> = ({
     if (flags.AlwaysPreTouch) parts.push('-XX:+AlwaysPreTouch');
     if (flags.G1NewSizePercent) parts.push('-XX:G1NewSizePercent=30 -XX:G1MaxNewSizePercent=40');
     if (flags.G1ReservePercent) parts.push('-XX:G1ReservePercent=20');
-    parts.push('-XX:SurvivorRatio=32 -Dusing.aikars.flags=https://mcflags.emc.gs -Daikars.new.flags=true');
+    parts.push(
+      '-XX:SurvivorRatio=32 -Dusing.aikars.flags=https://mcflags.emc.gs -Daikars.new.flags=true',
+    );
     parts.push(`-jar ${activeJarFilename} --nogui`);
     return parts.join(' ');
   };
@@ -180,95 +266,91 @@ export const StartupJvmView: React.FC<StartupJvmViewProps> = ({
     },
   ];
 
-  const jdks = [
-    {
-      id: 'zulu',
-      name: 'Azul Zulu 21.0.2',
-      sub: 'Current Default',
-      note: 'High compatibility G1GC',
-      path: 'C:\\KingEngine\\runtimes\\zulu-21-x64\\bin\\java.exe',
-    },
-    {
-      id: 'temurin',
-      name: 'Eclipse Temurin 21.0.2',
-      sub: 'Adoptium Certified',
-      note: 'Standard Enterprise HotSpot',
-      path: 'C:\\KingEngine\\runtimes\\temurin-21-x64\\bin\\java.exe',
-    },
-    {
-      id: 'graalvm',
-      name: 'Oracle GraalVM EE 21',
-      sub: 'Max Throughput',
-      note: 'Advanced polyglot & C2',
-      path: 'C:\\KingEngine\\runtimes\\graalvm-ce-21\\bin\\java.exe',
-    },
-    {
-      id: 'corretto',
-      name: 'Amazon Corretto 21',
-      sub: 'Cloud Optimized',
-      note: 'AWS production validated',
-      path: 'C:\\KingEngine\\runtimes\\corretto-21\\bin\\java.exe',
-    },
-  ];
-
-  const activeJdkObj = jdks.find((j) => j.id === selectedJdk) || jdks[0];
-
+  const ramScaleGb = Math.max(hostRamGb || 32, xmxGb + 2);
+  const javaVersionNumber = javaCheck?.versionRaw?.match(/version "([^"]+)"/)?.[1] || '';
+  const detectedJavaName = javaCheck
+    ? javaCheck.installed
+      ? `${javaCheck.vendor === 'Unknown' ? 'Java' : javaCheck.vendor} ${javaVersionNumber}`.trim()
+      : 'No Java runtime on PATH'
+    : 'Detecting Java runtime…';
+  const detectedJavaNote = javaCheck
+    ? javaCheck.meetsRequirement === false
+      ? `Requires Java ${javaCheck.requiredJava}+ for this Minecraft version`
+      : javaCheck.meetsRequirement
+        ? 'Meets the requirement for this Minecraft version'
+        : 'Minecraft version unknown — requirement not evaluated'
+    : 'Reading system runtime';
+  const activeJdkObj = {
+    id: 'detected',
+    name: detectedJavaName,
+    sub: javaCheck
+      ? javaCheck.installed
+        ? 'Detected on this host'
+        : javaCheck.notFoundMessage || 'java -version failed'
+      : 'Running java -version…',
+    note: detectedJavaNote,
+    path: javaCheck?.javaHome || (javaCheck?.installed ? 'java (resolved from PATH)' : '—'),
+  };
+  const jdks = javaCheck?.installed ? [activeJdkObj] : [];
   return (
     <div className="flex flex-col xl:flex-row gap-6 items-start">
       {/* CENTER SCROLLABLE WORK AREA */}
       <div className="flex-1 space-y-6 min-w-0">
         {/* 1. Top Section Header */}
-        <div className="flex flex-col gap-4">
-          <div className="flex items-center gap-2 text-label-caps text-outline tracking-wider font-semibold">
-            <span>SERVER OPERATIONS</span>
-            <span>/</span>
-            <span>CONFIGURATION</span>
-            <span>/</span>
-            <span className="text-primary-container">STARTUP &amp; JVM FLAGS OPTIMIZER</span>
-          </div>
-
-          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 pb-4 border-b border-outline-variant/20">
-            <div className="max-w-2xl">
-              <h1 className="text-display-lg text-on-surface font-headline-lg flex flex-wrap items-center gap-3">
-                Startup &amp; JVM Flags Optimizer
-                <span className="text-label-caps bg-secondary-container/20 text-secondary border border-secondary/30 px-2 py-0.5 rounded font-mono uppercase font-bold">
-                  PaperMC Verified
+        <div className="flex flex-col gap-3">
+          <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-3 pb-4 border-b border-white/[0.06]">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2.5">
+                <span className="material-symbols-outlined text-[17px] text-primary">tune</span>
+                <h1 className="text-[14.5px] font-semibold text-on-surface whitespace-nowrap">
+                  Startup &amp; JVM
+                </h1>
+                <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md border border-secondary/25 bg-secondary/10 text-secondary font-mono text-[10.5px]">
+                  <span className="material-symbols-outlined text-[13px]">verified</span>
+                  PaperMC
                 </span>
-              </h1>
-              <p className="text-body-md text-on-surface-variant mt-1.5 leading-relaxed">
-                Fine-tune generational heap sizing, garbage collector flags, and Java VM runtime
-                arguments for maximum TPS stability.
+              </div>
+              <p className="font-mono text-[11px] text-outline mt-1.5">
+                Heap sizing, collector flags and VM arguments for {server.name}
               </p>
             </div>
 
-            <div className="flex flex-wrap items-center gap-2.5">
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
               <button
                 type="button"
                 onClick={handleRevertDefaults}
-                className="px-3.5 py-2 rounded-lg bg-surface-container-high hover:bg-surface-bright text-on-surface text-body-sm font-semibold border border-outline-variant/40 transition-colors flex items-center gap-2 cursor-pointer"
+                className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg border border-white/10 bg-white/[0.02] hover:bg-white/[0.06] text-[11.5px] font-medium text-on-surface transition-colors cursor-pointer"
               >
-                <span className="material-symbols-outlined text-base">history</span>
-                <span>Revert to Recommended Aikar Defaults</span>
+                <span className="material-symbols-outlined text-[16px] text-outline">history</span>
+                <span>Revert to Aikar</span>
               </button>
               <button
                 type="button"
                 onClick={() => {
                   const cmd = buildCommandString();
-                  const blob = new Blob([`@echo off\nREM IS King Panel Auto-Generated Launch Script\n${cmd}\npause`], {
-                    type: 'text/plain',
-                  });
+                  const blob = new Blob(
+                    [`@echo off\nREM KingPanel Auto-Generated Launch Script\n${cmd}\npause`],
+                    {
+                      type: 'text/plain',
+                    },
+                  );
                   const url = URL.createObjectURL(blob);
                   const a = document.createElement('a');
                   a.href = url;
                   a.download = `start-${server.id}.bat`;
                   a.click();
                   URL.revokeObjectURL(url);
-                  onShowToast('Launch Script Exported', `Saved start-${server.id}.bat to Downloads.`, 'success', 'download');
+                  onShowToast(
+                    'Launch Script Exported',
+                    `Saved start-${server.id}.bat to Downloads.`,
+                    'success',
+                    'download',
+                  );
                 }}
-                className="px-3.5 py-2 rounded-lg bg-surface-container-high hover:bg-surface-bright text-on-surface text-body-sm font-semibold border border-outline-variant/40 transition-colors flex items-center gap-2 cursor-pointer"
+                className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg border border-white/10 bg-white/[0.02] hover:bg-white/[0.06] text-[11.5px] font-medium text-on-surface transition-colors cursor-pointer"
               >
-                <span className="material-symbols-outlined text-base">download</span>
-                <span>Export Script (.bat / .sh / .ps1)</span>
+                <span className="material-symbols-outlined text-[16px] text-outline">download</span>
+                <span>Export script</span>
               </button>
               <button
                 type="button"
@@ -277,28 +359,28 @@ export const StartupJvmView: React.FC<StartupJvmViewProps> = ({
                     'JVM Flags Staged for Restart',
                     'Written to user_jvm_args.txt. Will apply cleanly on next server restart.',
                     'success',
-                    'restart_alt'
+                    'restart_alt',
                   )
                 }
-                className="px-4 py-2 rounded-lg bg-primary-container text-on-primary font-bold text-body-sm shadow-[0_0_20px_rgba(245,158,11,0.25)] hover:bg-primary-gold transition-all flex items-center gap-2 cursor-pointer"
+                className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg bg-primary hover:brightness-105 text-[11.5px] font-semibold text-on-primary transition-all cursor-pointer"
               >
-                <span className="material-symbols-outlined text-base font-bold">restart_alt</span>
-                <span>Apply &amp; Stage on Next Restart</span>
+                <span className="material-symbols-outlined text-[16px]">restart_alt</span>
+                <span>Apply on restart</span>
               </button>
             </div>
           </div>
         </div>
 
         {/* 1B. REAL-TIME SERVER.JAR ENGINE & ALL-VERSION FETCHER */}
-        <section className="bg-surface-container rounded-2xl p-6 border border-outline-variant/30 space-y-4">
+        <section className="bg-surface-container rounded-xl p-6 border border-white/[0.06] space-y-4">
           <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
-            <div>
-              <h2 className="text-headline-sm text-on-surface font-title-md flex items-center gap-2.5">
-                <span className="material-symbols-outlined text-primary">dns</span>
-                Real-Time Server.jar Binary Fetcher (All Engines &amp; Versions)
+            <div className="min-w-0">
+              <h2 className="text-[13px] font-semibold text-white flex items-center gap-2">
+                <span className="material-symbols-outlined text-[16px] text-outline">dns</span>
+                Server.jar fetcher
               </h2>
-              <p className="text-body-sm text-on-surface-variant">
-                Live upstream sync with PaperMC, PurpurMC, Folia, Fabric Meta, Velocity, and Mojang Piston v2 APIs
+              <p className="font-mono text-[11px] text-outline mt-0.5">
+                PaperMC, PurpurMC, Folia, Fabric, Velocity and Mojang Piston v2
               </p>
             </div>
             <div className="flex items-center gap-2">
@@ -313,7 +395,7 @@ export const StartupJvmView: React.FC<StartupJvmViewProps> = ({
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             {/* Engine Select */}
-            <div className="p-3.5 rounded-xl bg-surface-container-low border border-outline-variant/30 space-y-1.5">
+            <div className="p-3.5 rounded-xl bg-surface-container-low border border-white/[0.06] space-y-1.5">
               <label className="text-label-caps uppercase text-outline block">
                 1. Server Engine Type
               </label>
@@ -336,7 +418,7 @@ export const StartupJvmView: React.FC<StartupJvmViewProps> = ({
             </div>
 
             {/* Minecraft Version Select (All Fetched Versions) */}
-            <div className="p-3.5 rounded-xl bg-surface-container-low border border-outline-variant/30 space-y-1.5">
+            <div className="p-3.5 rounded-xl bg-surface-container-low border border-white/[0.06] space-y-1.5">
               <label className="text-label-caps uppercase text-outline block">
                 2. Minecraft Version ({jarVersions.length} Live Versions)
               </label>
@@ -354,7 +436,7 @@ export const StartupJvmView: React.FC<StartupJvmViewProps> = ({
             </div>
 
             {/* Build Select & Download / Bind */}
-            <div className="p-3.5 rounded-xl bg-surface-container-low border border-outline-variant/30 space-y-1.5">
+            <div className="p-3.5 rounded-xl bg-surface-container-low border border-white/[0.06] space-y-1.5">
               <label className="text-label-caps uppercase text-outline block">
                 3. Live Build &amp; Binary Artifact
               </label>
@@ -373,7 +455,7 @@ export const StartupJvmView: React.FC<StartupJvmViewProps> = ({
           </div>
 
           {jarBuilds.length > 0 && (
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3.5 rounded-xl bg-surface-container-lowest border border-outline-variant/30">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3.5 rounded-xl bg-surface-container-lowest border border-white/[0.06]">
               <div className="space-y-0.5">
                 <div className="flex items-center gap-2 font-mono text-xs text-white font-bold">
                   <span className="material-symbols-outlined text-sm text-secondary">verified</span>
@@ -381,13 +463,17 @@ export const StartupJvmView: React.FC<StartupJvmViewProps> = ({
                   <span className="text-outline">•</span>
                   <span className="text-tertiary">
                     SHA-256:{' '}
-                    {(
-                      jarBuilds.find((b) => b.filename === activeJarFilename) || jarBuilds[0]
-                    ).sha256}
+                    {
+                      (jarBuilds.find((b) => b.filename === activeJarFilename) || jarBuilds[0])
+                        .sha256
+                    }
                   </span>
                 </div>
                 <p className="text-xs text-on-surface-variant">
-                  {(jarBuilds.find((b) => b.filename === activeJarFilename) || jarBuilds[0]).summary}
+                  {
+                    (jarBuilds.find((b) => b.filename === activeJarFilename) || jarBuilds[0])
+                      .summary
+                  }
                 </p>
               </div>
               <div className="flex items-center gap-2 shrink-0">
@@ -403,7 +489,7 @@ export const StartupJvmView: React.FC<StartupJvmViewProps> = ({
                       `Downloading ${activeJarFilename}`,
                       'Streaming official server.jar binary from upstream CDN.',
                       'info',
-                      'download'
+                      'download',
                     )
                   }
                   className="px-3 py-1.5 rounded-lg bg-surface-container-high hover:bg-surface-bright text-on-surface font-mono text-xs font-semibold flex items-center gap-1.5 border border-outline-variant/40"
@@ -413,27 +499,15 @@ export const StartupJvmView: React.FC<StartupJvmViewProps> = ({
                 </a>
                 <button
                   type="button"
-                  onClick={() => {
-                    const currentBuild =
-                      jarBuilds.find((b) => b.filename === activeJarFilename) || jarBuilds[0];
-                    if (onUpdateServerEngine) {
-                      onUpdateServerEngine(
-                        `${jarEngine.toUpperCase()} ${jarMcVersion}`,
-                        `Build #${currentBuild.build}`,
-                        activeJarFilename
-                      );
-                    }
-                    onShowToast(
-                      `Mounted ${activeJarFilename}`,
-                      `Updated ${server.name} startup target to -jar ${activeJarFilename}.`,
-                      'success',
-                      'check_circle'
-                    );
-                  }}
-                  className="px-3.5 py-1.5 rounded-lg bg-primary text-on-primary font-bold text-xs flex items-center gap-1.5 cursor-pointer"
+                  onClick={() => void reinstallSelectedJar()}
+                  disabled={jarInstalling}
+                  className="px-3.5 py-1.5 rounded-lg bg-primary text-on-primary font-bold text-xs flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                  title="Download this build and replace server.jar in the server folder"
                 >
-                  <span className="material-symbols-outlined text-sm">bolt</span>
-                  <span>Set as Server Startup JAR</span>
+                  <span className="material-symbols-outlined text-sm">
+                    {jarInstalling ? 'progress_activity' : 'bolt'}
+                  </span>
+                  <span>{jarInstalling ? 'Reinstalling…' : 'Reinstall server.jar'}</span>
                 </button>
               </div>
             </div>
@@ -469,8 +543,8 @@ export const StartupJvmView: React.FC<StartupJvmViewProps> = ({
                   }}
                   className={`relative rounded-xl p-4 cursor-pointer transition-all flex flex-col justify-between group ${
                     isSelected
-                      ? 'bg-surface-container border-2 border-primary-container shadow-lg'
-                      : 'bg-surface-container-low border border-outline-variant/30 hover:border-outline hover:bg-surface-container'
+                      ? 'bg-surface-container border-2 border-primary-container '
+                      : 'bg-surface-container-low border border-white/[0.06] hover:border-outline hover:bg-surface-container'
                   }`}
                 >
                   {isSelected && (
@@ -491,7 +565,7 @@ export const StartupJvmView: React.FC<StartupJvmViewProps> = ({
                     </div>
                     <p className="text-body-sm text-on-surface-variant">{p.desc}</p>
                   </div>
-                  <div className="flex flex-wrap gap-1.5 mt-4 pt-3 border-t border-outline-variant/20">
+                  <div className="flex flex-wrap gap-1.5 mt-4 pt-3 border-t border-white/[0.06]">
                     {p.tags.map((t, idx) => (
                       <span
                         key={t}
@@ -500,8 +574,8 @@ export const StartupJvmView: React.FC<StartupJvmViewProps> = ({
                             ? idx === 0
                               ? 'text-primary'
                               : idx === 1
-                              ? 'text-secondary'
-                              : 'text-tertiary'
+                                ? 'text-secondary'
+                                : 'text-tertiary'
                             : 'text-outline'
                         }`}
                       >
@@ -516,7 +590,7 @@ export const StartupJvmView: React.FC<StartupJvmViewProps> = ({
         </section>
 
         {/* 3. Visual JVM Heap Memory Allocator & Generational Breakdown */}
-        <section className="bg-surface-container rounded-2xl p-6 border border-outline-variant/30 space-y-6">
+        <section className="bg-surface-container rounded-xl p-6 border border-white/[0.06] space-y-6">
           <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
             <div>
               <h2 className="text-headline-sm text-on-surface font-title-md flex items-center gap-2.5">
@@ -524,11 +598,17 @@ export const StartupJvmView: React.FC<StartupJvmViewProps> = ({
                 JVM Heap Memory Allocator &amp; Generational Layout
               </h2>
               <p className="text-body-sm text-on-surface-variant">
-                Host Hardware Limit: 32 GB DDR5 RAM (Safe recommendation cap: 16 GB)
+                {hostRamGb > 0
+                  ? 'Host RAM detected: ' +
+                    hostRamGb +
+                    ' GB (recommended heap cap ' +
+                    Math.max(2, Math.round(hostRamGb * 0.85)) +
+                    ' GB)'
+                  : 'Host RAM not measured yet'}
               </p>
             </div>
             <div className="flex flex-wrap items-center gap-3">
-              <div className="flex items-center gap-2 px-3 py-1.5 bg-surface-container-high rounded-lg border border-outline-variant/20">
+              <div className="flex items-center gap-2 px-3 py-1.5 bg-surface-container-high rounded-lg border border-white/[0.06]">
                 <span className="text-body-sm text-outline font-code-sm">Initial Heap (-Xms):</span>
                 <select
                   value={xmsGb}
@@ -572,19 +652,19 @@ export const StartupJvmView: React.FC<StartupJvmViewProps> = ({
               <span>0 GB</span>
               <span>{xmsGb} GB (-Xms)</span>
               <span className="text-primary font-bold">{xmxGb} GB (-Xmx)</span>
-              <span>16 GB (Cap)</span>
-              <span>32 GB (Host Hardware Limit)</span>
+              <span>{Math.max(2, Math.round((hostRamGb || 32) * 0.85))} GB (Cap)</span>
+              <span>{hostRamGb > 0 ? hostRamGb : 32} GB (Host RAM)</span>
             </div>
-            <div className="relative h-7 bg-surface-container-lowest rounded-lg overflow-hidden border border-outline-variant/30 flex p-1">
+            <div className="relative h-7 bg-surface-container-lowest rounded-lg overflow-hidden border border-white/[0.06] flex p-1">
               <div
                 className="h-full bg-primary-container/30 border-r-2 border-primary-container rounded-l relative flex items-center justify-center text-label-caps font-bold text-primary transition-all"
-                style={{ width: `${(xmsGb / 32) * 100}%` }}
+                style={{ width: `${(xmsGb / ramScaleGb) * 100}%` }}
               >
                 -Xms {xmsGb}GB
               </div>
               <div
                 className="h-full bg-primary/20 border-r-2 border-primary rounded-r relative flex items-center justify-center text-label-caps font-bold text-on-surface-variant transition-all"
-                style={{ width: `${Math.max(8, ((xmxGb - xmsGb) / 32) * 100)}%` }}
+                style={{ width: `${Math.max(8, ((xmxGb - xmsGb) / ramScaleGb) * 100)}%` }}
               >
                 -Xmx ({xmxGb}GB Max)
               </div>
@@ -599,7 +679,7 @@ export const StartupJvmView: React.FC<StartupJvmViewProps> = ({
               </span>
               <span className="text-body-sm text-outline font-mono">Calculated for G1GC Epoch</span>
             </div>
-            <div className="w-full h-8 rounded-lg overflow-hidden flex border border-outline-variant/40 shadow-inner">
+            <div className="w-full h-8 rounded-lg overflow-hidden flex border border-outline-variant/40 ">
               <div
                 className="bg-primary-container flex items-center justify-center text-on-primary text-label-caps font-bold"
                 style={{ width: '22.5%' }}
@@ -654,7 +734,7 @@ export const StartupJvmView: React.FC<StartupJvmViewProps> = ({
         </section>
 
         {/* 4. Java Runtime Environment (JDK) Switcher */}
-        <section className="bg-surface-container rounded-2xl p-6 border border-outline-variant/30 space-y-5">
+        <section className="bg-surface-container rounded-xl p-6 border border-white/[0.06] space-y-5">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div>
               <h2 className="text-headline-sm text-on-surface font-title-md flex items-center gap-2.5">
@@ -666,13 +746,19 @@ export const StartupJvmView: React.FC<StartupJvmViewProps> = ({
               </p>
             </div>
             <span className="px-2.5 py-1 rounded bg-tertiary-container/20 text-tertiary border border-tertiary/30 text-label-caps font-bold">
-              JIT C2 COMPILER VALIDATED
+              {javaCheck
+                ? javaCheck.installed
+                  ? javaCheck.meetsRequirement === false
+                    ? 'JAVA TOO OLD'
+                    : 'RUNTIME DETECTED'
+                  : 'JAVA NOT ON PATH'
+                : 'CHECKING RUNTIME'}
             </span>
           </div>
 
           <div className="bg-surface-container-low border border-outline-variant/40 rounded-xl p-4 flex flex-col md:flex-row md:items-center justify-between gap-4">
             <div className="flex items-center gap-4">
-              <div className="size-12 rounded-lg bg-surface-container-high border border-outline-variant/30 flex items-center justify-center text-primary shrink-0">
+              <div className="size-12 rounded-lg bg-surface-container-high border border-white/[0.06] flex items-center justify-center text-primary shrink-0">
                 <span className="material-symbols-outlined text-2xl">developer_board</span>
               </div>
               <div>
@@ -685,12 +771,14 @@ export const StartupJvmView: React.FC<StartupJvmViewProps> = ({
                   </span>
                 </div>
                 <p className="text-body-sm text-on-surface-variant font-code-sm mt-0.5">
-                  Architecture: x86_64 • GraalVM JIT &amp; Compact String optimizations active
+                  {javaCheck?.installed
+                    ? javaCheck.versionRaw || 'java -version output unavailable'
+                    : 'Install a JDK and make sure java is on PATH.'}
                 </p>
               </div>
             </div>
 
-            <div className="flex items-center gap-2 bg-surface-container-lowest px-3 py-2 rounded-lg border border-outline-variant/30 max-w-md">
+            <div className="flex items-center gap-2 bg-surface-container-lowest px-3 py-2 rounded-lg border border-white/[0.06] max-w-md">
               <span className="material-symbols-outlined text-outline text-base">folder_open</span>
               <span className="text-code-sm text-on-surface font-mono truncate select-all">
                 {activeJdkObj.path}
@@ -701,7 +789,7 @@ export const StartupJvmView: React.FC<StartupJvmViewProps> = ({
                   navigator.clipboard?.writeText(activeJdkObj.path).catch(() => {});
                   onShowToast('Binary Path Copied', activeJdkObj.path, 'success', 'content_copy');
                 }}
-                className="text-outline hover:text-primary transition-colors pl-2 border-l border-outline-variant/30 cursor-pointer"
+                className="text-outline hover:text-primary transition-colors pl-2 border-l border-white/[0.06] cursor-pointer"
                 title="Copy Binary Path"
               >
                 <span className="material-symbols-outlined text-base">content_copy</span>
@@ -711,18 +799,18 @@ export const StartupJvmView: React.FC<StartupJvmViewProps> = ({
 
           <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3 pt-1">
             {jdks.map((j) => {
-              const isSelected = selectedJdk === j.id;
+              const isSelected = true;
               return (
                 <div
                   key={j.id}
                   onClick={() => {
-                    setSelectedJdk(j.id);
-                    onShowToast(`Switched JDK Runtime: ${j.name}`, `Binary target set to ${j.path}`, 'info', 'developer_board');
+                    navigator.clipboard?.writeText(j.path).catch(() => {});
+                    onShowToast('Runtime path copied', j.path, 'info', 'content_copy');
                   }}
                   className={`p-3.5 rounded-xl cursor-pointer transition-all flex flex-col justify-between ${
                     isSelected
                       ? 'border-2 border-primary-container bg-surface-container-high'
-                      : 'border border-outline-variant/30 bg-surface-container-low hover:border-outline hover:bg-surface-container'
+                      : 'border border-white/[0.06] bg-surface-container-low hover:border-outline hover:bg-surface-container'
                   }`}
                 >
                   <div className="flex items-start justify-between">
@@ -752,7 +840,7 @@ export const StartupJvmView: React.FC<StartupJvmViewProps> = ({
         </section>
 
         {/* 5. Garbage Collector Tuning Matrix */}
-        <section className="bg-surface-container rounded-2xl p-6 border border-outline-variant/30 space-y-5">
+        <section className="bg-surface-container rounded-xl p-6 border border-white/[0.06] space-y-5">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div>
               <h2 className="text-headline-sm text-on-surface font-title-md flex items-center gap-2.5">
@@ -831,7 +919,7 @@ export const StartupJvmView: React.FC<StartupJvmViewProps> = ({
               return (
                 <div
                   key={item.key}
-                  className="bg-surface-container-low border border-outline-variant/30 rounded-xl p-4 flex items-start justify-between gap-4"
+                  className="bg-surface-container-low border border-white/[0.06] rounded-xl p-4 flex items-start justify-between gap-4"
                 >
                   <div className="space-y-1">
                     <div className="flex items-center gap-2 flex-wrap">
@@ -866,8 +954,8 @@ export const StartupJvmView: React.FC<StartupJvmViewProps> = ({
         </section>
 
         {/* 6. Live Generated Startup Command Line String */}
-        <section className="bg-surface-container rounded-2xl border border-outline-variant/30 overflow-hidden shadow-2xl">
-          <div className="bg-surface-container-lowest px-4 py-3 border-b border-outline-variant/30 flex flex-wrap items-center justify-between gap-2">
+        <section className="bg-surface-container rounded-xl border border-white/[0.06] overflow-hidden ">
+          <div className="bg-surface-container-lowest px-4 py-3 border-b border-white/[0.06] flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-3">
               <div className="flex items-center gap-1.5">
                 <span className="size-3 rounded-full bg-error inline-block" />
@@ -888,9 +976,14 @@ export const StartupJvmView: React.FC<StartupJvmViewProps> = ({
                 onClick={() => {
                   const cmd = buildCommandString();
                   navigator.clipboard?.writeText(cmd).catch(() => {});
-                  onShowToast('Launch Command Copied', 'Copied full JVM startup command to clipboard.', 'success', 'copy_all');
+                  onShowToast(
+                    'Launch Command Copied',
+                    'Copied full JVM startup command to clipboard.',
+                    'success',
+                    'copy_all',
+                  );
                 }}
-                className="px-3 py-1 bg-surface-container hover:bg-surface-bright text-on-surface text-code-sm rounded border border-outline-variant/30 transition-colors flex items-center gap-1.5 font-semibold cursor-pointer"
+                className="px-3 py-1 bg-surface-container hover:bg-surface-bright text-on-surface text-code-sm rounded border border-white/[0.06] transition-colors flex items-center gap-1.5 font-semibold cursor-pointer"
               >
                 <span className="material-symbols-outlined text-base">copy_all</span>
                 <span>Copy Launch Command</span>
@@ -901,109 +994,103 @@ export const StartupJvmView: React.FC<StartupJvmViewProps> = ({
           <div className="p-4 bg-surface-container-lowest/90 font-code-md text-code-md leading-relaxed select-all overflow-x-auto">
             <p className="whitespace-pre-wrap text-primary font-mono">{buildCommandString()}</p>
           </div>
-          <div className="bg-surface-container-low px-4 py-2 border-t border-outline-variant/20 flex items-center justify-between text-body-sm text-outline">
-            <span className="font-mono">
-              Payload: {buildCommandString().length} characters • Process spawn: Native IO High-Priority
-            </span>
-            <span>Target JVM: HotSpot 64-Bit Server VM</span>
+          <div className="bg-surface-container-low px-4 py-2 border-t border-white/[0.06] flex items-center justify-between text-body-sm text-outline">
+            <span className="font-mono">Payload: {buildCommandString().length} characters</span>
+            <span>Target JVM: {activeJdkObj.name}</span>
           </div>
         </section>
       </div>
 
-      {/* 7. RIGHT DIAGNOSTIC RAIL */}
-      <aside className="w-full xl:w-80 bg-surface-container-low rounded-2xl border border-outline-variant/30 p-6 flex flex-col gap-6 shrink-0">
-        <div className="flex items-center justify-between pb-3 border-b border-outline-variant/20">
+      {/* 7. RIGHT RAIL — only measured runtime facts */}
+      <aside className="w-full xl:w-80 bg-surface-container-low rounded-xl border border-white/[0.06] p-6 flex flex-col gap-6 shrink-0">
+        <div className="flex items-center justify-between pb-3 border-b border-white/[0.06]">
           <h3 className="text-title-md font-bold text-on-surface flex items-center gap-2">
             <span className="material-symbols-outlined text-secondary">monitor_heart</span>
-            GC Latency Profile
+            Java Runtime
           </h3>
-          <span className="text-label-caps text-secondary font-mono font-bold">SIMULATED</span>
+          <span className="text-label-caps font-mono font-bold text-secondary">
+            {javaCheck ? (javaCheck.installed ? 'LIVE' : 'MISSING') : 'PROBING'}
+          </span>
         </div>
 
-        <div className="bg-surface-container rounded-xl p-4 border border-outline-variant/20 space-y-4">
-          <div className="flex items-center justify-between">
-            <span className="text-body-sm text-on-surface-variant">Est. Max Pause</span>
-            <span className="text-headline-sm font-bold text-secondary font-mono">
-              {selectedPreset === 'zgc' ? '1.1 ms' : selectedPreset === 'shenandoah' ? '3.8 ms' : '14.2 ms'}
+        <div className="bg-surface-container rounded-xl p-4 border border-white/[0.06] space-y-4">
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-body-sm text-on-surface-variant">Detected</span>
+            <span className="text-body-sm font-bold font-mono text-on-surface text-right">
+              {activeJdkObj.name}
             </span>
           </div>
-          <div className="w-full bg-surface-container-lowest h-2 rounded-full overflow-hidden">
-            <div
-              className="bg-secondary h-full rounded-full transition-all"
-              style={{ width: selectedPreset === 'zgc' ? '8%' : '28%' }}
-            />
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-body-sm text-on-surface-variant">Major version</span>
+            <span className="text-body-sm font-mono text-on-surface">
+              {javaCheck?.javaMajorVersion ?? '—'}
+            </span>
           </div>
-          <div className="flex justify-between text-label-caps text-outline font-mono">
-            <span>Target: 20 ms</span>
-            <span>Critical: &gt; 50 ms</span>
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-body-sm text-on-surface-variant">Required</span>
+            <span className="text-body-sm font-mono text-on-surface">
+              {javaCheck?.requiredJava ?? '—'}
+            </span>
           </div>
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-body-sm text-on-surface-variant">JAVA_HOME</span>
+            <span
+              className="text-code-sm font-mono text-on-surface truncate max-w-[170px]"
+              title={javaCheck?.javaHome || ''}
+            >
+              {javaCheck?.javaHome || 'not set'}
+            </span>
+          </div>
+          <p className="text-body-sm text-outline leading-relaxed">
+            {javaCheck?.installed
+              ? 'Reported by java -version on this host.'
+              : javaCheck?.notFoundMessage || 'The panel has not run java -version yet.'}
+          </p>
         </div>
 
-        <div className="bg-surface-container rounded-xl p-4 border border-outline-variant/20 space-y-3">
+        <div className="bg-surface-container rounded-xl p-4 border border-white/[0.06] space-y-3">
           <div className="flex items-center justify-between">
-            <span className="text-body-sm font-semibold text-on-surface">GC Pauses (Last 60s)</span>
-            <span className="text-label-caps text-outline font-mono">3 Cycles</span>
+            <span className="text-body-sm font-semibold text-on-surface">Host memory</span>
+            <span className="text-label-caps text-outline font-mono">
+              {hostRamGb > 0 ? hostRamGb + ' GB' : 'unknown'}
+            </span>
           </div>
-          <div className="h-16 w-full flex items-end gap-1.5 pt-2">
-            {[25, 35, 20, 30, 70, 22, 18, 40, 25, 30].map((h, i) => (
-              <div
-                key={i}
-                className="w-full bg-secondary-container/30 hover:bg-secondary rounded-t transition-all"
-                style={{ height: `${h}%` }}
-              />
-            ))}
-          </div>
-        </div>
-
-        <div className="grid grid-cols-2 gap-3">
-          <div className="bg-surface-container rounded-xl p-3 border border-outline-variant/20">
-            <span className="text-body-sm text-outline block">Eden Cycle</span>
-            <span className="text-body-lg font-bold font-mono text-on-surface">~42 sec</span>
-            <span className="text-label-caps text-secondary font-mono">Normal cadence</span>
-          </div>
-          <div className="bg-surface-container rounded-xl p-3 border border-outline-variant/20">
-            <span className="text-body-sm text-outline block">Tick Loss Risk</span>
-            <span className="text-body-lg font-bold font-mono text-secondary">0.02%</span>
-            <span className="text-label-caps text-secondary font-mono">Negligible</span>
-          </div>
+          <p className="text-body-sm text-outline leading-relaxed">
+            {hostRamGb > 0
+              ? 'Heap is carved out of ' +
+                hostRamGb +
+                ' GB of physical RAM. Leave room for the OS, the panel and disk cache.'
+              : 'Host memory could not be measured; no limit is assumed.'}
+          </p>
         </div>
 
         <div className="space-y-3 pt-2">
           <h4 className="text-body-md font-bold text-on-surface flex items-center gap-2">
             <span className="material-symbols-outlined text-primary text-base">rule</span>
-            <span>Environment &amp; Integrity</span>
+            <span>Applied configuration</span>
           </h4>
           <div className="space-y-2">
-            <div className="flex items-start gap-2.5 p-2.5 rounded-lg bg-surface-container text-body-sm border border-outline-variant/20">
+            <div className="flex items-start gap-2.5 p-2.5 rounded-lg bg-surface-container text-body-sm border border-white/[0.06]">
               <span className="material-symbols-outlined text-secondary text-base shrink-0 mt-0.5">
-                check_circle
+                memory
               </span>
               <div>
-                <span className="font-medium text-on-surface">No conflicting GC flags</span>
+                <span className="font-medium text-on-surface">
+                  Heap {xmsGb}–{xmxGb} GB
+                </span>
                 <p className="text-outline text-body-sm mt-0.5">
-                  Shenandoah &amp; ParallelGC explicitly omitted.
+                  -Xms/-Xmx come straight from the sliders above.
                 </p>
               </div>
             </div>
-            <div className="flex items-start gap-2.5 p-2.5 rounded-lg bg-surface-container text-body-sm border border-outline-variant/20">
+            <div className="flex items-start gap-2.5 p-2.5 rounded-lg bg-surface-container text-body-sm border border-white/[0.06]">
               <span className="material-symbols-outlined text-secondary text-base shrink-0 mt-0.5">
-                check_circle
+                tune
               </span>
               <div>
-                <span className="font-medium text-on-surface">Azul Zulu JIT Tier Verified</span>
+                <span className="font-medium text-on-surface">GC preset: {selectedPreset}</span>
                 <p className="text-outline text-body-sm mt-0.5">
-                  TieredCompilation enabled (Levels 1-4 active).
-                </p>
-              </div>
-            </div>
-            <div className="flex items-start gap-2.5 p-2.5 rounded-lg bg-surface-container text-body-sm border border-outline-variant/20">
-              <span className="material-symbols-outlined text-tertiary text-base shrink-0 mt-0.5">
-                info
-              </span>
-              <div>
-                <span className="font-medium text-on-surface">Large Page Support</span>
-                <p className="text-outline text-body-sm mt-0.5">
-                  Host kernel supports transparent huge pages (THP).
+                  Only flags enabled in this preset are emitted.
                 </p>
               </div>
             </div>
@@ -1012,15 +1099,15 @@ export const StartupJvmView: React.FC<StartupJvmViewProps> = ({
 
         <div className="p-3.5 rounded-xl bg-primary-container/15 border border-primary-container/30 text-body-sm space-y-2">
           <div className="flex items-center gap-2 text-primary font-bold">
-            <span className="material-symbols-outlined text-base">schedule</span>
-            <span>Scheduled Execution</span>
+            <span className="material-symbols-outlined text-base">memory</span>
+            <span>Launch command</span>
           </div>
           <p className="text-on-surface-variant text-body-sm">
-            Flags will stage to{' '}
+            Copy the generated flags into{' '}
             <code className="text-code-sm bg-surface-container px-1 py-0.5 rounded text-on-surface font-mono">
               user_jvm_args.txt
             </code>{' '}
-            and apply at 04:00 AM UTC maintenance restart.
+            or your start script — the panel does not write them for you.
           </p>
         </div>
       </aside>

@@ -1,5 +1,5 @@
 {
-  "name": "IS King Panel — King Control Panel",
+  "name": "KingPanel — Minecraft Server Control Panel",
   "description": "Professional localhost server management engine for Minecraft PaperMC, telemetry, file management, plugin marketplace, UPnP port forwarding, JVM tuning, and zero-downtime snapshots.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]

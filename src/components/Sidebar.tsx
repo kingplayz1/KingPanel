@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { NavSection, ServerInstance, AuthUser } from '../types';
 import { DEFAULT_PROFILE_ICON_URL, resolveUserAvatarUrl } from '../utils/profileIcons';
 
@@ -17,6 +17,13 @@ interface SidebarProps {
   onSignOut: () => void;
 }
 
+interface NavItemDef {
+  key: NavSection;
+  label: string;
+  icon: string;
+  trailing?: string;
+}
+
 export const Sidebar: React.FC<SidebarProps> = ({
   activeSection,
   onSelectSection,
@@ -26,374 +33,246 @@ export const Sidebar: React.FC<SidebarProps> = ({
   snapshotCount,
   hostTotalRamGb = 32,
   currentUser,
-  onOpenAuthModal,
   onOpenDiscordBotGate,
   onLeaveDiscordServer,
   onSignOut,
 }) => {
+  // Real host identity shown in the footer, straight from panel telemetry.
+  const [hostCpuModel, setHostCpuModel] = useState('');
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch('/api/panel/telemetry');
+        const data = await res.json();
+        if (!cancelled && data?.ok && data.host?.cpuModel) {
+          setHostCpuModel(String(data.host.cpuModel));
+        }
+      } catch {
+        // telemetry unavailable — the footer falls back to a neutral label
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const handleCycleServer = () => {
+    if (!servers.length) return;
     const idx = servers.findIndex((s) => s.id === activeServer.id);
     const next = servers[(idx + 1) % servers.length];
     onSelectServer(next);
   };
 
-  const navItemClass = (section: NavSection) =>
-    `sidebar-link w-full flex items-center gap-2.5 px-3 py-2 rounded-lg font-medium transition-colors cursor-pointer text-left ${
-      activeSection === section
-        ? 'active text-white'
-        : 'text-white/70 hover:text-white hover:bg-white/5'
-    }`;
-
-  const iconClass = (section: NavSection) =>
-    `material-symbols-outlined text-base ${
-      activeSection === section ? 'text-primary' : 'text-white/60'
-    }`;
-
-  const runningServers = servers.filter(
-    (s) => s.status === 'running' || s.status === 'restarting'
-  );
+  const runningServers = servers.filter((s) => s.status === 'running' || s.status === 'restarting');
   const combinedCpu = Math.min(
     100,
-    runningServers.reduce((acc, s) => acc + s.cpuUsage, 0)
+    runningServers.reduce((acc, s) => acc + s.cpuUsage, 0),
   );
-  const combinedRam = Number(
-    runningServers.reduce((acc, s) => acc + s.ramUsedGb, 0).toFixed(1)
-  );
+  const combinedRam = Number(runningServers.reduce((acc, s) => acc + s.ramUsedGb, 0).toFixed(1));
   const combinedRamPercent = Math.min(100, Math.round((combinedRam / hostTotalRamGb) * 100));
+  const isSuperAdmin = currentUser?.isSuperAdmin || currentUser?.role === 'Super Admin';
+  const serverLimit = isSuperAdmin
+    ? currentUser?.maxServerLimit || 999
+    : currentUser?.discordVerified
+      ? currentUser?.maxServerLimit || 10
+      : 2;
+
+  const groups: Array<{ label: string; items: NavItemDef[] }> = [
+    {
+      label: 'Server',
+      items: [
+        {
+          key: 'overview',
+          label: 'Overview',
+          icon: 'space_dashboard',
+          trailing: `${runningServers.length}/${servers.length}`,
+        },
+        { key: 'console', label: 'Console', icon: 'terminal' },
+        { key: 'files', label: 'Files', icon: 'folder_open' },
+        { key: 'plugins', label: 'Mods & Plugins', icon: 'extension' },
+        { key: 'logs', label: 'Logs', icon: 'receipt_long' },
+      ],
+    },
+    {
+      label: 'Automation',
+      items: [
+        { key: 'schedules', label: 'Schedules', icon: 'schedule' },
+        { key: 'backups', label: 'Backups', icon: 'backup', trailing: String(snapshotCount) },
+        { key: 'network', label: 'Network', icon: 'hub' },
+        { key: 'databases', label: 'Databases', icon: 'database' },
+      ],
+    },
+    {
+      label: 'Configuration',
+      items: [
+        { key: 'jvm', label: 'Startup & JVM', icon: 'tune' },
+        { key: 'settings', label: 'Server Settings', icon: 'settings' },
+        { key: 'panel_control', label: 'Panel Control', icon: 'admin_panel_settings' },
+      ],
+    },
+    {
+      label: 'Account',
+      items: [
+        { key: 'setup_guide', label: 'Setup Guide', icon: 'school' },
+        { key: 'account', label: 'Sessions', icon: 'security' },
+        { key: 'privacy', label: 'Privacy', icon: 'shield_lock' },
+        { key: 'terms', label: 'Terms', icon: 'gavel' },
+      ],
+    },
+  ];
+
+  const NavItem: React.FC<{ item: NavItemDef }> = ({ item }) => {
+    const active = activeSection === item.key;
+    return (
+      <button
+        type="button"
+        onClick={() => onSelectSection(item.key)}
+        className={`relative w-full flex items-center gap-2.5 h-8 pl-3 pr-2.5 rounded-lg text-[12.5px] font-medium transition-colors cursor-pointer ${
+          active
+            ? 'bg-white/[0.055] text-white'
+            : 'text-[#a7b1c6] hover:text-white hover:bg-white/[0.03]'
+        }`}
+        title={item.label}
+      >
+        {active && (
+          <span className="absolute left-0 top-2 bottom-2 w-[2px] rounded-full bg-primary" />
+        )}
+        <span
+          className={`material-symbols-outlined text-[17px] ${
+            active ? 'text-primary' : 'text-[#7f8a9f]'
+          }`}
+        >
+          {item.icon}
+        </span>
+        <span className="truncate">{item.label}</span>
+        {item.trailing !== undefined && (
+          <span className="ml-auto font-mono text-[10px] text-[#758093]">{item.trailing}</span>
+        )}
+      </button>
+    );
+  };
 
   return (
-    <aside className="w-64 bg-[#0e121b] border-r border-white/5 flex flex-col shrink-0 select-none z-20">
-      {/* Server Selector Card & Discord Server Quota Strip in Sidebar */}
-      <div className="p-3.5 border-b border-white/5 space-y-2">
-        <div
+    <aside className="w-[244px] shrink-0 bg-[#0b0f16] border-r border-white/[0.06] flex flex-col select-none z-20">
+      {/* Workspace: active server + limits */}
+      <div className="px-3 pt-3 pb-2.5 space-y-2">
+        <button
+          type="button"
           onClick={handleCycleServer}
-          title="Click to cycle active server instance"
-          className="p-2.5 rounded-xl bg-surface-container/70 border border-white/5 hover:border-primary/40 transition-colors cursor-pointer group"
+          title="Switch active server"
+          className="w-full flex items-center gap-2.5 p-2 rounded-xl bg-white/[0.03] border border-white/[0.06] hover:border-white/[0.12] transition-colors cursor-pointer text-left"
         >
-          <div className="flex items-center gap-2.5">
-            <div className="size-9 rounded-lg bg-gradient-to-br from-amber-500/20 to-amber-900/30 border border-primary/30 flex items-center justify-center shrink-0">
-              <span className="text-lg">⛏️</span>
-            </div>
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center justify-between gap-1">
-                <h3 className="text-xs font-bold text-white truncate">{activeServer.name}</h3>
-                <div className="flex items-center gap-1 shrink-0">
-                  {activeServer.isOutdated && (
-                    <span className="px-1 py-0.5 rounded bg-amber-500/20 border border-amber-500/40 text-amber-300 text-[8px] font-mono font-bold uppercase">
-                      Outdated
-                    </span>
-                  )}
-                  <span
-                    className={`size-2 rounded-full ${
-                      activeServer.status === 'running' ? 'bg-secondary' : 'bg-error'
-                    }`}
-                  />
-                </div>
-              </div>
-              <p className="text-[11px] text-on-surface-variant/80 font-mono truncate">
-                {activeServer.engine} • {activeServer.javaVersion}
-              </p>
-            </div>
-          </div>
-        </div>
+          <span
+            className={`size-2 rounded-full shrink-0 ${
+              activeServer.status === 'running' ? 'bg-secondary' : 'bg-white/25'
+            }`}
+          />
+          <span className="min-w-0 flex-1">
+            <span className="block text-[12.5px] font-semibold text-white truncate">
+              {activeServer.name}
+            </span>
+            <span className="block text-[10.5px] font-mono text-[#7f8a9f] truncate">
+              {activeServer.engine} · :{activeServer.port}
+            </span>
+          </span>
+          <span className="material-symbols-outlined text-[16px] text-[#7f8a9f]">unfold_more</span>
+        </button>
 
-        {/* Live Server Creation Limit & Discord Bot Verification Strip */}
         {currentUser && (
-          <div className="p-2 rounded-lg bg-surface-lowest/90 border border-white/10 text-[10px] font-mono space-y-1.5">
-            <div className="flex items-center justify-between">
-              <span className="text-white/60">Server Limit:</span>
-              <span
-                className={`font-bold ${
-                  currentUser.isSuperAdmin || currentUser.role === 'Super Admin'
-                    ? 'text-primary'
-                    : currentUser.discordVerified
-                    ? 'text-secondary'
-                    : 'text-amber-300'
-                }`}
-              >
-                {servers.length} /{' '}
-                {currentUser.isSuperAdmin || currentUser.role === 'Super Admin'
-                  ? currentUser.maxServerLimit || 999
-                  : currentUser.discordVerified
-                  ? currentUser.maxServerLimit || 10
-                  : 2}{' '}
-                {currentUser.isSuperAdmin || currentUser.role === 'Super Admin'
-                  ? '(Super Admin)'
-                  : currentUser.discordVerified
-                  ? '(Bot Verified)'
-                  : '(Max 2)'}
+          <div className="flex items-center justify-between px-1 text-[10.5px] font-mono">
+            <span className="text-[#7f8a9f]">
+              Servers{' '}
+              <span className="text-[#c9d2e2]">
+                {servers.length}/{serverLimit}
               </span>
-            </div>
+            </span>
             {currentUser.discordVerified ? (
-              <div className="flex items-center gap-1">
-                <button
-                  type="button"
-                  onClick={() => onOpenDiscordBotGate && onOpenDiscordBotGate()}
-                  className="flex-1 py-1 px-2 rounded bg-secondary/15 hover:bg-secondary/25 text-secondary font-bold text-[10px] cursor-pointer truncate"
-                >
-                  ✓ Discord Verified
-                </button>
+              <span
+                className="flex items-center gap-1 text-secondary/90"
+                title="Discord bot verified"
+              >
+                <span className="material-symbols-outlined text-[13px]">verified</span>
                 {onLeaveDiscordServer && (
                   <button
                     type="button"
                     onClick={onLeaveDiscordServer}
-                    title="Leave Discord Server (Resets server creation limit to 2)"
-                    className="py-1 px-2 rounded bg-error/15 hover:bg-error/25 text-error font-bold text-[10px] cursor-pointer shrink-0"
+                    className="text-[10px] text-[#7f8a9f] hover:text-error cursor-pointer"
+                    title="Leave the Discord server (limit resets to 2)"
                   >
                     Leave
                   </button>
                 )}
-              </div>
+              </span>
             ) : (
               <button
                 type="button"
-                onClick={() => onOpenDiscordBotGate && onOpenDiscordBotGate()}
-                className="w-full py-1 px-2 rounded bg-[#5865F2]/25 hover:bg-[#5865F2]/40 border border-[#5865F2]/40 text-white font-bold text-[10px] flex items-center justify-center gap-1 cursor-pointer transition-colors"
+                onClick={() => onOpenDiscordBotGate?.()}
+                className="flex items-center gap-1 text-[10px] text-[#8ea1e1] hover:text-white cursor-pointer"
+                title="Verify the Discord bot to raise the server limit"
               >
-                <span className="material-symbols-outlined text-[12px] text-[#8ea1e1]">
-                  verified
-                </span>
-                <span>Verify Discord Bot (&gt;2 Servers)</span>
+                <span className="material-symbols-outlined text-[13px]">verified</span>
+                Verify
               </button>
             )}
           </div>
         )}
       </div>
 
-      {/* Navigation Scroll Area */}
-      <nav className="flex-1 overflow-y-auto px-2 py-3 space-y-4 text-xs">
-        {/* SERVER OPERATIONS */}
-        <div>
-          <p className="px-3 text-[10px] font-bold tracking-wider text-white/40 uppercase font-mono">
-            Server Operations
-          </p>
-          <div className="mt-1.5 space-y-0.5">
-            <button
-              type="button"
-              onClick={() => onSelectSection('overview')}
-              className={navItemClass('overview')}
-            >
-              <span className={iconClass('overview')}>space_dashboard</span>
-              <span className="whitespace-nowrap">Overview</span>
-              <span className="ml-auto text-[10px] font-mono px-1.5 py-0.5 rounded bg-secondary/10 text-secondary">
-                {runningServers.length}/{servers.length} Online
-              </span>
-            </button>
+      <div className="h-px bg-white/[0.05] mx-3" />
 
-            <button
-              type="button"
-              onClick={() => onSelectSection('setup_guide')}
-              className={navItemClass('setup_guide')}
-            >
-              <span className={iconClass('setup_guide')}>school</span>
-              <span className="whitespace-nowrap">Setup Panel Guide</span>
-              <span className="ml-auto text-[10px] font-mono px-1.5 py-0.5 rounded bg-primary/15 text-primary border border-primary/30 font-bold">
-                New User
-              </span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => onSelectSection('console')}
-              className={navItemClass('console')}
-            >
-              <span className={iconClass('console')}>terminal</span>
-              <span className="whitespace-nowrap">Console &amp; Telemetry</span>
-              {activeSection === 'console' && (
-                <span className="ml-auto size-1.5 rounded-full bg-primary animate-ping" />
-              )}
-            </button>
-
-            <button
-              type="button"
-              onClick={() => onSelectSection('files')}
-              className={navItemClass('files')}
-            >
-              <span className={iconClass('files')}>folder_open</span>
-              <span className="whitespace-nowrap">File Manager</span>
-              <span className="ml-auto text-[10px] font-mono text-white/40">NVMe</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => onSelectSection('plugins')}
-              className={navItemClass('plugins')}
-            >
-              <span className={iconClass('plugins')}>extension</span>
-              <span className="whitespace-nowrap">Modpacks &amp; Plugins</span>
-              <span className="ml-auto text-[10px] font-mono px-1.5 py-0.5 rounded bg-primary/10 text-primary">
-                Curse/Modr
-              </span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => onSelectSection('logs')}
-              className={navItemClass('logs')}
-            >
-              <span className={iconClass('logs')}>receipt_long</span>
-              <span className="whitespace-nowrap">Server Logs</span>
-              {activeSection === 'logs' && (
-                <span className="ml-auto size-1.5 rounded-full bg-primary animate-ping" />
-              )}
-            </button>
+      {/* Navigation */}
+      <nav className="flex-1 overflow-y-auto px-2 py-3 space-y-4">
+        {groups.map((group) => (
+          <div key={group.label}>
+            <p className="px-3 mb-1 text-[10px] font-semibold tracking-[0.09em] uppercase text-[#6c7689]">
+              {group.label}
+            </p>
+            <div className="space-y-0.5">
+              {group.items.map((item) => (
+                <NavItem key={item.key} item={item} />
+              ))}
+            </div>
           </div>
-        </div>
-
-        {/* INFRASTRUCTURE & AUTOMATION */}
-        <div>
-          <p className="px-3 text-[10px] font-bold tracking-wider text-white/40 uppercase font-mono">
-            Infrastructure &amp; Automation
-          </p>
-          <div className="mt-1.5 space-y-0.5">
-            <button
-              type="button"
-              onClick={() => onSelectSection('network')}
-              className={navItemClass('network')}
-            >
-              <span className={iconClass('network')}>hub</span>
-              <span className="whitespace-nowrap">Network &amp; Ports</span>
-              <span className="ml-auto text-[10px] font-mono text-secondary">UPnP On</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => onSelectSection('backups')}
-              className={navItemClass('backups')}
-            >
-              <span className={iconClass('backups')}>backup</span>
-              <span className="whitespace-nowrap">Backups &amp; Snapshots</span>
-              <span className="ml-auto text-[10px] font-mono text-white/40">{snapshotCount} Ready</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => onSelectSection('schedules')}
-              className={navItemClass('schedules')}
-            >
-              <span className={iconClass('schedules')}>schedule</span>
-              <span className="whitespace-nowrap">Schedules &amp; Crons</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => onSelectSection('databases')}
-              className={navItemClass('databases')}
-            >
-              <span className={iconClass('databases')}>database</span>
-              <span className="whitespace-nowrap">Databases</span>
-              <span className="ml-auto text-[10px] font-mono text-white/40">SQLite</span>
-            </button>
-          </div>
-        </div>
-
-        {/* CONFIGURATION */}
-        <div>
-          <p className="px-3 text-[10px] font-bold tracking-wider text-white/40 uppercase font-mono">
-            Configuration
-          </p>
-          <div className="mt-1.5 space-y-0.5">
-            <button
-              type="button"
-              onClick={() => onSelectSection('panel_control')}
-              className={navItemClass('panel_control')}
-            >
-              <span className={iconClass('panel_control')}>admin_panel_settings</span>
-              <span className="whitespace-nowrap">Panel Control &amp; Profile</span>
-              <span className="ml-auto text-[10px] font-mono px-1.5 py-0.5 rounded bg-primary/15 text-primary">
-                RAM / Kill
-              </span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => onSelectSection('jvm')}
-              className={navItemClass('jvm')}
-            >
-              <span className={iconClass('jvm')}>tune</span>
-              <span className="whitespace-nowrap">Startup &amp; JVM Flags</span>
-              <span className="ml-auto text-[10px] font-mono text-primary-gold">Aikar&apos;s GC</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => onSelectSection('settings')}
-              className={navItemClass('settings')}
-            >
-              <span className={iconClass('settings')}>settings</span>
-              <span className="whitespace-nowrap">Server Settings</span>
-            </button>
-          </div>
-        </div>
-
-        {/* LEGAL & COMPLIANCE */}
-        <div>
-          <p className="px-3 text-[10px] font-bold tracking-wider text-white/60 uppercase font-mono">
-            Legal &amp; Compliance
-          </p>
-          <div className="mt-1.5 space-y-0.5">
-            <button
-              type="button"
-              onClick={() => onSelectSection('privacy')}
-              className={navItemClass('privacy')}
-            >
-              <span className={iconClass('privacy')}>shield_lock</span>
-              <span className="whitespace-nowrap">Privacy Policy</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => onSelectSection('terms')}
-              className={navItemClass('terms')}
-            >
-              <span className={iconClass('terms')}>gavel</span>
-              <span className="whitespace-nowrap">Terms &amp; Conditions</span>
-            </button>
-          </div>
-        </div>
+        ))}
       </nav>
 
-      {/* FOOTER / LOCALHOST HOST SYSTEM TELEMETRY */}
-      <div className="p-3 border-t border-white/5 bg-[#0b0e16]/80 text-[11px] font-mono space-y-2">
-        <div className="flex items-center justify-between text-white/70">
-          <span className="text-[10px] text-white/40 uppercase font-bold">Host System Node</span>
-          <span className="inline-flex items-center gap-1 text-[10px] text-secondary">
-            <span className="size-1.5 rounded-full bg-secondary" />
-            Daemon v4.8
-          </span>
-        </div>
-        <div className="p-2 rounded-lg bg-surface-container/60 border border-white/5 space-y-1">
-          <div className="flex justify-between text-[10px]">
-            <span className="text-white/60">AMD Ryzen 9 / EPYC</span>
-            <span className="text-white font-semibold tabular-nums">{combinedCpu}% Total</span>
+      {/* Footer: host load + operator */}
+      <div className="border-t border-white/[0.06] px-3 py-3 space-y-3">
+        <div className="space-y-1.5">
+          <div className="flex items-center justify-between text-[10px] font-mono">
+            <span className="text-[#7f8a9f] truncate max-w-[140px]" title={hostCpuModel}>
+              {hostCpuModel || 'Host CPU'}
+            </span>
+            <span className="text-[#c9d2e2]">{combinedCpu}%</span>
           </div>
-          <div className="w-full bg-white/5 h-1 rounded-full overflow-hidden">
+          <div className="h-[3px] rounded-full bg-white/[0.06] overflow-hidden">
             <div
-              className="bg-primary h-full rounded-full transition-all duration-300"
+              className="h-full rounded-full bg-primary/75 transition-all duration-300"
               style={{ width: `${combinedCpu}%` }}
             />
           </div>
-          <div className="flex justify-between text-[10px] pt-1">
-            <span className="text-white/60">
-              Host RAM: {combinedRam} / {hostTotalRamGb} GB
+          <div className="flex items-center justify-between text-[10px] font-mono">
+            <span className="text-[#7f8a9f]">
+              RAM {combinedRam} / {hostTotalRamGb} GB
             </span>
-            <span className="text-secondary font-mono tabular-nums">{combinedRamPercent}%</span>
+            <span className="text-[#c9d2e2]">{combinedRamPercent}%</span>
           </div>
-          <div className="w-full bg-white/5 h-1 rounded-full overflow-hidden">
+          <div className="h-[3px] rounded-full bg-white/[0.06] overflow-hidden">
             <div
-              className="bg-secondary h-full rounded-full transition-all duration-300"
+              className="h-full rounded-full bg-secondary/70 transition-all duration-300"
               style={{ width: `${combinedRamPercent}%` }}
             />
           </div>
         </div>
 
-        {/* Authenticated Operator Card & Sign Out */}
         {currentUser && (
-          <div className="pt-2 border-t border-white/5 flex items-center justify-between gap-2">
-            <div
+          <div className="flex items-center gap-2 pt-2.5 border-t border-white/[0.06]">
+            <button
+              type="button"
               onClick={() => onSelectSection('panel_control')}
-              title="Open Panel Control, Global RAM Allocator & User Profile"
-              className="flex items-center gap-2 min-w-0 flex-1 cursor-pointer group"
+              className="flex items-center gap-2 min-w-0 flex-1 cursor-pointer text-left group"
+              title="Panel control, global RAM and profile"
             >
               <img
                 src={resolveUserAvatarUrl(currentUser.avatarUrl)}
@@ -401,24 +280,24 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   (e.currentTarget as HTMLImageElement).src = DEFAULT_PROFILE_ICON_URL;
                 }}
                 alt={currentUser.username}
-                className="w-7 h-7 rounded-lg border border-primary/40 object-cover shrink-0 bg-surface"
+                className="size-7 rounded-lg object-cover border border-white/[0.08] bg-surface shrink-0"
               />
-              <div className="min-w-0 flex-1">
-                <div className="text-[11px] font-bold text-white group-hover:text-primary transition-colors truncate">
+              <span className="min-w-0 flex-1">
+                <span className="block text-[11.5px] font-semibold text-white truncate group-hover:text-primary transition-colors">
                   {currentUser.displayName}
-                </div>
-                <div className="text-[9px] text-white/50 uppercase truncate">
-                  {currentUser.role} • {currentUser.provider}
-                </div>
-              </div>
-            </div>
+                </span>
+                <span className="block text-[10px] text-[#7f8a9f] truncate">
+                  {currentUser.role}
+                </span>
+              </span>
+            </button>
             <button
               type="button"
               onClick={onSignOut}
-              title="Sign Out"
-              className="p-1.5 rounded-lg bg-error/10 hover:bg-error/25 text-error border border-error/25 transition-colors cursor-pointer shrink-0"
+              title="Sign out"
+              className="p-1.5 rounded-lg text-[#8b95a9] hover:text-error hover:bg-error/10 transition-colors cursor-pointer shrink-0"
             >
-              <span className="material-symbols-outlined text-[15px]">logout</span>
+              <span className="material-symbols-outlined text-[16px]">logout</span>
             </button>
           </div>
         )}

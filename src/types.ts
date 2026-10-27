@@ -14,6 +14,7 @@ export type NavSection =
   | 'panel_control'
   | 'privacy'
   | 'terms'
+  | 'account'
   | 'not_found';
 
 export interface ServerInstance {
@@ -123,6 +124,8 @@ export interface FileItem {
   children?: FileItem[];
   content?: string;
   language?: 'yaml' | 'properties' | 'csv' | 'text';
+  modifiedAt?: string;
+  encoding?: string;
 }
 
 export interface PluginItem {
@@ -161,6 +164,7 @@ export interface PortRule {
   status: 'OPEN' | 'SSL SECURE' | 'NO WAN';
   statusNote?: string;
   category: 'game' | 'http' | 'internal';
+  serverId?: string;
 }
 
 export interface SnapshotItem {
@@ -179,6 +183,7 @@ export interface SnapshotItem {
   sha?: string;
   icon: string;
   iconColor: string;
+  serverId?: string;
 }
 
 export interface CronTask {
@@ -191,6 +196,7 @@ export interface CronTask {
   actionLabel: string;
   icon: string;
   iconColor: string;
+  serverId?: string;
 }
 
 export type AuthProviderType = 'local' | 'discord' | 'github' | 'google';

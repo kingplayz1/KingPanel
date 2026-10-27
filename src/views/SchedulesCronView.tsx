@@ -36,7 +36,7 @@ interface SchedulesCronViewProps {
     title: string,
     body?: string,
     type?: 'success' | 'info' | 'warning' | 'error',
-    icon?: string
+    icon?: string,
   ) => void;
 }
 
@@ -52,7 +52,7 @@ export const SchedulesCronView: React.FC<SchedulesCronViewProps> = ({
   const [title, setTitle] = useState('');
   const [cronExpr, setCronExpr] = useState('*/30 * * * *');
   const [commandPayload, setCommandPayload] = useState(
-    'say [KingScheduler] Saving chunks & optimizing memory...'
+    'say [KingScheduler] Saving chunks & optimizing memory...',
   );
   const [cpuCoreAffinity, setCpuCoreAffinity] = useState('Core 0-3 (Async I/O)');
   const [selectedPreset, setSelectedPreset] = useState('Every 30 Minutes');
@@ -95,8 +95,9 @@ export const SchedulesCronView: React.FC<SchedulesCronViewProps> = ({
   }, [server.id]);
 
   useEffect(() => {
+    setLiveSchedules([]);
     fetchRealtimeSchedulesAndCore();
-  }, [fetchRealtimeSchedulesAndCore]);
+  }, [server.id, fetchRealtimeSchedulesAndCore]);
 
   useEffect(() => {
     if (!livePollEnabled) return;
@@ -106,13 +107,19 @@ export const SchedulesCronView: React.FC<SchedulesCronViewProps> = ({
     return () => clearInterval(timer);
   }, [livePollEnabled, fetchRealtimeSchedulesAndCore]);
 
-  const activeJobsList: ExtendedScheduleItem[] =
-    liveSchedules.length > 0 ? liveSchedules : crons;
+  const activeJobsList: ExtendedScheduleItem[] = liveSchedules.filter(
+    (s) => !s.serverId || s.serverId === server.id,
+  );
 
   const handleCreateSchedule = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!title.trim()) {
-      onShowToast('Missing Task Title', 'Please enter a descriptive task title.', 'warning', 'warning');
+      onShowToast(
+        'Missing Task Title',
+        'Please enter a descriptive task title.',
+        'warning',
+        'warning',
+      );
       return;
     }
 
@@ -138,7 +145,7 @@ export const SchedulesCronView: React.FC<SchedulesCronViewProps> = ({
           'Schedule Registered & Pushed to MongoDB',
           `Registered "${data.schedule.title}" (${data.schedule.cron}) on ${cpuCoreAffinity}.`,
           'success',
-          'event_available'
+          'event_available',
         );
       }
     } catch {
@@ -163,7 +170,7 @@ export const SchedulesCronView: React.FC<SchedulesCronViewProps> = ({
         `Executed on ${job.cpuCoreAffinity || 'Core 0-3'}`,
         `Dispatched "${job.title}" to ${server.name} & logged to latest.log.`,
         'success',
-        'play_arrow'
+        'play_arrow',
       );
     } catch {
       // ignore
@@ -187,9 +194,12 @@ export const SchedulesCronView: React.FC<SchedulesCronViewProps> = ({
   const handleDeleteScheduleLive = async (id: string) => {
     onDeleteCron(id);
     try {
-      await fetch(`/api/schedules/${encodeURIComponent(id)}?serverId=${encodeURIComponent(server.id)}`, {
-        method: 'DELETE',
-      });
+      await fetch(
+        `/api/schedules/${encodeURIComponent(id)}?serverId=${encodeURIComponent(server.id)}`,
+        {
+          method: 'DELETE',
+        },
+      );
       await fetchRealtimeSchedulesAndCore();
     } catch {
       // ignore
@@ -199,45 +209,44 @@ export const SchedulesCronView: React.FC<SchedulesCronViewProps> = ({
   return (
     <main className="flex-1 flex flex-col bg-surface-dim overflow-hidden">
       {/* Top Contextual Header */}
-      <header className="h-16 px-6 bg-surface border-b border-outline-variant/15 flex items-center justify-between shrink-0">
-        <div className="flex items-center gap-4">
-          <div className="w-10 h-10 rounded-lg bg-tertiary/10 border border-tertiary/25 flex items-center justify-center text-tertiary">
-            <span className="material-symbols-outlined text-[22px]">schedule</span>
-          </div>
-          <div>
-            <div className="flex items-center gap-2.5">
-              <h1 className="text-base font-bold tracking-tight text-on-surface">
-                Real-Time Schedules &amp; Core CPU Thread Engine
-              </h1>
-              <span className="px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider bg-secondary/10 text-secondary rounded border border-secondary/20 flex items-center gap-1">
-                <span className="w-1.5 h-1.5 rounded-full bg-secondary animate-pulse" />
-                Quartz Daemon Active • Synced {lastSyncedTime}
-              </span>
-            </div>
-            <p className="text-xs text-outline font-mono mt-0.5">
-              Target Instance: {server.name} (PID: {server.pid}) • Host:{' '}
-              {coreTelemetry?.hostname || 'LocalPC'} • MongoDB Synced:{' '}
-              {coreTelemetry?.mongoSyncedCount ?? activeJobsList.length} pipelines
-            </p>
-          </div>
-        </div>
-
-        <div className="flex items-center gap-2.5">
-          <button
-            type="button"
-            onClick={() => setLivePollEnabled(!livePollEnabled)}
-            className={`px-3 py-2 rounded-lg text-xs font-mono font-bold border transition-all flex items-center gap-1.5 cursor-pointer ${
+      <header className="min-h-[54px] px-6 py-2 bg-surface border-b border-white/[0.06] flex flex-wrap items-center justify-between gap-x-4 gap-y-2 shrink-0">
+        <div className="flex items-center gap-2.5 min-w-0">
+          <span className="material-symbols-outlined text-[18px] text-primary">schedule</span>
+          <h1 className="text-[14.5px] font-semibold tracking-tight text-on-surface whitespace-nowrap">
+            Schedules
+          </h1>
+          <span className="w-px h-4 bg-white/10 shrink-0" />
+          <p className="text-[11.5px] text-outline font-mono truncate">
+            {activeJobsList.length} triggers · {server.name} · {coreTelemetry?.hostname || 'LocalPC'}
+          </p>
+          <span
+            className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md border font-mono text-[10.5px] shrink-0 ${
               livePollEnabled
-                ? 'bg-secondary/15 text-secondary border-secondary/30'
-                : 'bg-surface-container-high text-outline border-outline-variant/20'
+                ? 'border-secondary/25 bg-secondary/10 text-secondary'
+                : 'border-white/10 bg-white/[0.03] text-outline'
             }`}
           >
             <span
-              className={`size-2 rounded-full ${
-                livePollEnabled ? 'bg-secondary animate-ping' : 'bg-outline'
-              }`}
+              className={`size-1.5 rounded-full ${livePollEnabled ? 'bg-secondary' : 'bg-outline'}`}
             />
-            {livePollEnabled ? 'Real-Time Core Poll: 1.5s' : 'Polling Paused'}
+            {livePollEnabled ? `synced ${lastSyncedTime}` : 'polling paused'}
+          </span>
+        </div>
+
+        <div className="flex items-center gap-2 shrink-0">
+          <button
+            type="button"
+            onClick={() => setLivePollEnabled(!livePollEnabled)}
+            className={`inline-flex items-center gap-1.5 h-8 px-3 rounded-lg border font-mono text-[11px] transition-colors cursor-pointer ${
+              livePollEnabled
+                ? 'bg-secondary/10 text-secondary border-secondary/25'
+                : 'bg-white/[0.02] text-outline border-white/10 hover:text-white'
+            }`}
+          >
+            <span
+              className={`size-1.5 rounded-full ${livePollEnabled ? 'bg-secondary' : 'bg-outline'}`}
+            />
+            {livePollEnabled ? 'Polling 1.5s' : 'Poll paused'}
           </button>
 
           <button
@@ -248,20 +257,20 @@ export const SchedulesCronView: React.FC<SchedulesCronViewProps> = ({
                 'Schedules & Core Clock Synced',
                 `Synchronized ${activeJobsList.length} cron triggers and local PC CPU core metrics.`,
                 'info',
-                'sync'
+                'sync',
               );
             }}
-            className="px-3.5 py-2 rounded-lg bg-surface-container-high hover:bg-surface-bright text-xs font-medium text-on-surface border border-outline-variant/20 transition-all flex items-center gap-2 cursor-pointer"
+            className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg border border-white/10 bg-white/[0.02] hover:bg-white/[0.06] text-[11.5px] font-medium text-on-surface transition-colors cursor-pointer"
           >
             <span className="material-symbols-outlined text-[16px] text-primary">sync</span>
-            Sync Core &amp; NTP Clock
+            Sync clock
           </button>
         </div>
       </header>
 
       {/* REAL-TIME LOCAL PC CPU CORE & SCHEDULER THREAD TELEMETRY DECK */}
       <div className="px-6 pt-5">
-        <div className="bg-surface rounded-xl border border-outline-variant/15 p-4 shadow-lg space-y-3">
+        <div className="bg-surface rounded-xl border border-white/[0.06] p-4 space-y-3">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-2.5">
               <span className="material-symbols-outlined text-primary text-[20px]">memory</span>
@@ -277,17 +286,17 @@ export const SchedulesCronView: React.FC<SchedulesCronViewProps> = ({
             </div>
 
             <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono">
-              <span className="px-2.5 py-1 rounded bg-surface-lowest border border-white/10 text-on-surface">
+              <span className="px-2.5 py-1 rounded bg-surface-lowest border border-white/[0.08] text-on-surface">
                 Total CPU Load:{' '}
                 <strong className="text-primary">{coreTelemetry?.totalCpuPct ?? 12}%</strong>
               </span>
-              <span className="px-2.5 py-1 rounded bg-surface-lowest border border-white/10 text-on-surface">
+              <span className="px-2.5 py-1 rounded bg-surface-lowest border border-white/[0.08] text-on-surface">
                 Load Avg (1m/5m):{' '}
                 <strong className="text-secondary">
                   {coreTelemetry?.loadAvg1m ?? 0.42} / {coreTelemetry?.loadAvg5m ?? 0.38}
                 </strong>
               </span>
-              <span className="px-2.5 py-1 rounded bg-surface-lowest border border-white/10 text-on-surface">
+              <span className="px-2.5 py-1 rounded bg-surface-lowest border border-white/[0.08] text-on-surface">
                 Daemon PID:{' '}
                 <strong className="text-tertiary">{coreTelemetry?.daemonPid ?? 10484}</strong> (
                 {coreTelemetry?.daemonHeapMb ?? 64} MB Heap)
@@ -302,7 +311,7 @@ export const SchedulesCronView: React.FC<SchedulesCronViewProps> = ({
               .map((pct, idx) => (
                 <div
                   key={idx}
-                  className="p-2 rounded-lg bg-surface-lowest border border-white/5 flex flex-col gap-1"
+                  className="p-2 rounded-lg bg-surface-lowest border border-white/[0.06] flex flex-col gap-1"
                 >
                   <div className="flex items-center justify-between text-[10px] font-mono">
                     <span className="text-outline">CORE #{idx}</span>
@@ -346,96 +355,119 @@ export const SchedulesCronView: React.FC<SchedulesCronViewProps> = ({
           </div>
 
           <div className="space-y-3">
-            {activeJobsList.map((job) => (
-              <div
-                key={job.id}
-                className="bg-surface rounded-xl border border-outline-variant/15 p-4 hover:border-primary/30 transition-all shadow-lg"
-              >
-                <div className="flex items-start justify-between gap-4">
-                  <div className="flex items-start gap-3.5">
-                    <div
-                      className={`w-10 h-10 rounded-lg ${job.iconColor} border border-white/5 flex items-center justify-center shrink-0 mt-0.5`}
-                    >
-                      <span className="material-symbols-outlined text-[20px]">{job.icon}</span>
-                    </div>
-                    <div>
-                      <div className="flex items-center flex-wrap gap-2">
-                        <h3 className="text-sm font-bold text-on-surface">{job.title}</h3>
-                        <span className="px-2 py-0.5 rounded bg-surface-lowest border border-outline-variant/25 text-[11px] font-mono text-primary font-semibold">
-                          {job.cron}
-                        </span>
-                        <span
-                          onClick={() => handleToggleStatusLive(job.id)}
-                          className={`px-2 py-0.5 rounded text-[10px] font-mono uppercase cursor-pointer ${
-                            job.status === 'Active'
-                              ? 'bg-secondary/15 text-secondary border border-secondary/30'
-                              : job.status === 'Weekly'
-                              ? 'bg-primary-gold/15 text-primary-gold border border-primary-gold/30'
-                              : 'bg-surface-container-highest text-outline'
-                          }`}
-                        >
-                          {job.status}
-                        </span>
-                        {job.cpuCoreAffinity && (
-                          <span className="px-2 py-0.5 rounded bg-tertiary/10 border border-tertiary/25 text-tertiary text-[10px] font-mono">
-                            {job.cpuCoreAffinity}
-                          </span>
-                        )}
+            {activeJobsList.length === 0 ? (
+              <div className="bg-surface rounded-xl border border-white/[0.06] p-8 text-center space-y-2 ">
+                <span className="material-symbols-outlined text-3xl text-outline">
+                  event_repeat
+                </span>
+                <h3 className="text-sm font-bold text-on-surface">
+                  No User Schedules Created for {server.name}
+                </h3>
+                <p className="text-xs text-outline max-w-md mx-auto">
+                  Only schedules created by users for this specific game server are displayed here.
+                  Use the Visual Cron Builder on the right to create a schedule.
+                </p>
+              </div>
+            ) : (
+              activeJobsList.map((job) => (
+                <div
+                  key={job.id}
+                  className="bg-surface rounded-xl border border-white/[0.06] p-4 hover:border-primary/30 transition-all "
+                >
+                  <div className="flex items-start justify-between gap-4">
+                    <div className="flex items-start gap-3.5">
+                      <div
+                        className={`w-10 h-10 rounded-lg ${job.iconColor} border border-white/[0.06] flex items-center justify-center shrink-0 mt-0.5`}
+                      >
+                        <span className="material-symbols-outlined text-[20px]">{job.icon}</span>
                       </div>
-                      <p className="text-xs text-outline mt-1.5 leading-relaxed">
-                        {job.description}
-                      </p>
-                      <div className="flex flex-wrap items-center gap-4 mt-3 text-[11px] font-mono text-outline">
-                        <span className="flex items-center gap-1 text-on-surface font-semibold">
-                          <span className="material-symbols-outlined text-[14px] text-secondary">
-                            timer
+                      <div>
+                        <div className="flex items-center flex-wrap gap-2">
+                          <h3 className="text-sm font-bold text-on-surface">{job.title}</h3>
+                          <span className="px-2 py-0.5 rounded bg-surface-lowest border border-white/[0.06] text-[11px] font-mono text-primary font-semibold">
+                            {job.cron}
                           </span>
-                          {job.nextRun}
-                        </span>
-                        {job.lastRunAt && (
+                          <span
+                            onClick={() => handleToggleStatusLive(job.id)}
+                            className={`px-2 py-0.5 rounded text-[10px] font-mono uppercase cursor-pointer ${
+                              job.status === 'Active'
+                                ? 'bg-secondary/15 text-secondary border border-secondary/30'
+                                : job.status === 'Weekly'
+                                  ? 'bg-primary-gold/15 text-primary-gold border border-primary-gold/30'
+                                  : 'bg-surface-container-highest text-outline'
+                            }`}
+                          >
+                            {job.status}
+                          </span>
+                          {job.cpuCoreAffinity && (
+                            <span className="px-2 py-0.5 rounded bg-tertiary/10 border border-tertiary/25 text-tertiary text-[10px] font-mono">
+                              {job.cpuCoreAffinity}
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-xs text-outline mt-1.5 leading-relaxed">
+                          {job.description}
+                        </p>
+                        <p className="mt-1 text-[11px] font-mono text-outline truncate">
+                          Payload:{' '}
+                          <span className="text-primary">
+                            {job.commandPayload ? `/${job.commandPayload}` : 'none'}
+                          </span>
+                        </p>
+                        <div className="flex flex-wrap items-center gap-4 mt-3 text-[11px] font-mono text-outline">
+                          <span className="flex items-center gap-1 text-on-surface font-semibold">
+                            <span className="material-symbols-outlined text-[14px] text-secondary">
+                              timer
+                            </span>
+                            {job.nextRun}
+                          </span>
+                          {job.lastRunAt && (
+                            <span>
+                              Last Run:{' '}
+                              <strong className="text-on-surface/80">{job.lastRunAt}</strong>
+                            </span>
+                          )}
                           <span>
-                            Last Run: <strong className="text-on-surface/80">{job.lastRunAt}</strong>
+                            Executions:{' '}
+                            <strong className="text-primary">{job.runCount ?? 1}</strong>
                           </span>
-                        )}
-                        <span>
-                          Executions: <strong className="text-primary">{job.runCount ?? 1}</strong>
-                        </span>
-                        <span className="text-secondary">Exit code: {job.lastExitCode ?? 0} (OK)</span>
+                          <span className="text-secondary">
+                            Exit code: {job.lastExitCode ?? 0} (OK)
+                          </span>
+                        </div>
                       </div>
                     </div>
-                  </div>
 
-                  <div className="flex items-center gap-2 shrink-0">
-                    <button
-                      type="button"
-                      onClick={() => handleRunScheduleNow(job)}
-                      className="px-3 py-1.5 rounded-lg bg-primary/15 hover:bg-primary/25 text-primary border border-primary/30 text-xs font-semibold transition-all flex items-center gap-1.5 cursor-pointer"
-                    >
-                      <span className="material-symbols-outlined text-[15px]">play_arrow</span>
-                      {job.actionLabel || 'Run Now'}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleDeleteScheduleLive(job.id)}
-                      className="p-1.5 rounded-lg bg-surface-container-high hover:bg-error/20 text-outline hover:text-error border border-outline-variant/20 transition-all cursor-pointer"
-                      title="Delete Schedule"
-                    >
-                      <span className="material-symbols-outlined text-[16px]">delete</span>
-                    </button>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => handleRunScheduleNow(job)}
+                        className="px-3 py-1.5 rounded-lg bg-primary/15 hover:bg-primary/25 text-primary border border-primary/30 text-xs font-semibold transition-all flex items-center gap-1.5 cursor-pointer"
+                      >
+                        <span className="material-symbols-outlined text-[15px]">play_arrow</span>
+                        {job.actionLabel || 'Run Now'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteScheduleLive(job.id)}
+                        className="p-1.5 rounded-lg bg-surface-container-high hover:bg-error/20 text-outline hover:text-error border border-white/[0.06] transition-all cursor-pointer"
+                        title="Delete Schedule"
+                      >
+                        <span className="material-symbols-outlined text-[16px]">delete</span>
+                      </button>
+                    </div>
                   </div>
                 </div>
-              </div>
-            ))}
+              ))
+            )}
           </div>
         </div>
 
         {/* Right 5 Cols: Visual Cron & Core Pipeline Builder */}
-        <div className="col-span-12 lg:col-span-5 bg-surface rounded-xl border border-outline-variant/15 overflow-hidden shadow-xl">
-          <div className="px-5 py-3.5 bg-surface-container border-b border-outline-variant/15 flex items-center justify-between">
+        <div className="col-span-12 lg:col-span-5 bg-surface rounded-xl border border-white/[0.06] overflow-hidden ">
+          <div className="px-5 py-3.5 bg-surface-container border-b border-white/[0.06] flex items-center justify-between">
             <div className="flex items-center gap-2">
-              <span className="material-symbols-outlined text-primary text-[19px]">
-                add_task
-              </span>
+              <span className="material-symbols-outlined text-primary text-[19px]">add_task</span>
               <h2 className="text-xs font-bold uppercase tracking-wider text-on-surface">
                 Visual Cron &amp; Core Pipeline Builder
               </h2>
@@ -453,7 +485,7 @@ export const SchedulesCronView: React.FC<SchedulesCronViewProps> = ({
                 value={title}
                 onChange={(e) => setTitle(e.target.value)}
                 placeholder="e.g., Clear Ground Lag Entities Every 30m"
-                className="w-full bg-surface-lowest border border-outline-variant/25 focus:border-primary rounded-lg px-3 py-2 text-xs text-on-surface focus:outline-none"
+                className="w-full bg-surface-lowest border border-white/[0.06] focus:border-primary rounded-lg px-3 py-2 text-xs text-on-surface focus:outline-none"
               />
             </div>
 
@@ -464,7 +496,7 @@ export const SchedulesCronView: React.FC<SchedulesCronViewProps> = ({
               <select
                 value={cpuCoreAffinity}
                 onChange={(e) => setCpuCoreAffinity(e.target.value)}
-                className="w-full bg-surface-lowest border border-outline-variant/25 focus:border-primary rounded-lg px-3 py-2 text-xs font-mono text-on-surface focus:outline-none"
+                className="w-full bg-surface-lowest border border-white/[0.06] focus:border-primary rounded-lg px-3 py-2 text-xs font-mono text-on-surface focus:outline-none"
               >
                 {coreAffinityOptions.map((opt) => (
                   <option key={opt} value={opt}>
@@ -490,7 +522,7 @@ export const SchedulesCronView: React.FC<SchedulesCronViewProps> = ({
                     className={`px-2.5 py-1 rounded text-[11px] font-mono transition-all cursor-pointer ${
                       selectedPreset === p.label
                         ? 'bg-primary text-on-primary-container font-bold'
-                        : 'bg-surface-container-low text-outline hover:text-on-surface border border-outline-variant/20'
+                        : 'bg-surface-container-low text-outline hover:text-on-surface border border-white/[0.06]'
                     }`}
                   >
                     {p.label}
@@ -522,13 +554,13 @@ export const SchedulesCronView: React.FC<SchedulesCronViewProps> = ({
                 rows={3}
                 value={commandPayload}
                 onChange={(e) => setCommandPayload(e.target.value)}
-                className="w-full bg-surface-lowest border border-outline-variant/25 focus:border-primary rounded-lg p-3 text-xs font-mono text-on-surface focus:outline-none"
+                className="w-full bg-surface-lowest border border-white/[0.06] focus:border-primary rounded-lg p-3 text-xs font-mono text-on-surface focus:outline-none"
               />
             </div>
 
             <button
               type="submit"
-              className="w-full py-2.5 rounded-lg bg-gradient-to-r from-primary to-primary-container text-on-primary-container font-bold text-xs shadow-lg shadow-primary/15 hover:opacity-95 transition-all flex items-center justify-center gap-2 cursor-pointer"
+              className="w-full py-2.5 rounded-lg bg-gradient-to-r from-primary to-primary-container text-on-primary-container font-bold text-xs hover:opacity-95 transition-all flex items-center justify-center gap-2 cursor-pointer"
             >
               <span className="material-symbols-outlined text-[17px]">add_circle</span>
               Register Schedule &amp; Push to MongoDB

@@ -4,24 +4,26 @@
   --font-sans: "Plus Jakarta Sans", sans-serif;
   --font-mono: "JetBrains Mono", monospace;
 
-  --color-background: #0a0d14;
-  --color-on-background: #f5f7ff;
-  --color-surface: #0f131d;
-  --color-surface-dim: #0b0e17;
-  --color-surface-bright: #343b4d;
-  --color-surface-lowest: #06080f;
-  --color-surface-container-lowest: #06080f;
-  --color-surface-container-low: #131824;
-  --color-surface-container: #192030;
-  --color-surface-container-high: #242c3f;
-  --color-surface-container-highest: #2f384f;
-  --color-surface-variant: #2c3446;
-  --color-on-surface: #f5f7ff;
-  --color-on-surface-variant: #dce2f2;
-  --color-inverse-surface: #f5f7ff;
-  --color-inverse-on-surface: #131824;
-  --color-outline: #b8c2d9;
-  --color-outline-variant: #56617a;
+  /* Surface ladder: tight, neutral steps so cards sit on the page instead of
+     stacking as bright slabs. Only three tiers are ever visibly lighter. */
+  --color-background: #0a0c12;
+  --color-on-background: #eef1f8;
+  --color-surface: #0e1118;
+  --color-surface-dim: #0b0d13;
+  --color-surface-bright: #252c3a;
+  --color-surface-lowest: #080a0f;
+  --color-surface-container-lowest: #080a0f;
+  --color-surface-container-low: #121620;
+  --color-surface-container: #161b26;
+  --color-surface-container-high: #1b212d;
+  --color-surface-container-highest: #222936;
+  --color-surface-variant: #1e2431;
+  --color-on-surface: #eef1f8;
+  --color-on-surface-variant: #b4bdcd;
+  --color-inverse-surface: #eef1f8;
+  --color-inverse-on-surface: #121620;
+  --color-outline: #93a0b6;
+  --color-outline-variant: #3b4657;
   --color-surface-tint: #fbbf24;
 
   --color-primary: #fbbf24;
@@ -35,25 +37,25 @@
   --color-on-primary-fixed: #07090e;
   --color-on-primary-fixed-variant: #451a03;
 
-  --color-secondary: #34f59b;
+  --color-secondary: #4ed7a0;
   --color-on-secondary: #04170e;
   --color-secondary-container: #10b981;
   --color-on-secondary-container: #03140c;
   --color-secondary-fixed: #a7f3d0;
-  --color-secondary-fixed-dim: #34f59b;
+  --color-secondary-fixed-dim: #4ed7a0;
   --color-on-secondary-fixed: #02120a;
   --color-on-secondary-fixed-variant: #064e3b;
 
-  --color-tertiary: #5ce1ff;
+  --color-tertiary: #6fc2df;
   --color-on-tertiary: #031820;
   --color-tertiary-container: #06b6d4;
   --color-on-tertiary-container: #031820;
   --color-tertiary-fixed: #cffafe;
-  --color-tertiary-fixed-dim: #5ce1ff;
+  --color-tertiary-fixed-dim: #6fc2df;
   --color-on-tertiary-fixed: #021318;
   --color-on-tertiary-fixed-variant: #155e75;
 
-  --color-error: #ff7b7b;
+  --color-error: #e5767e;
   --color-on-error: #140202;
   --color-error-container: #b91c1c;
   --color-on-error-container: #fee2e2;
@@ -61,17 +63,17 @@
 
 /* High-Contrast WCAG AA/AAA Legibility Overrides */
 .text-white\/40 {
-  color: rgba(235, 240, 255, 0.72) !important;
+  color: rgba(228, 234, 246, 0.6) !important;
 }
 .text-white\/50 {
-  color: rgba(238, 242, 255, 0.78) !important;
+  color: rgba(230, 236, 248, 0.68) !important;
 }
 .text-white\/60 {
-  color: rgba(242, 245, 255, 0.84) !important;
+  color: rgba(234, 239, 250, 0.76) !important;
 }
 .text-outline\/60,
 .text-outline\/70 {
-  color: #aab5ce !important;
+  color: #97a2b8 !important;
 }
 
 .material-symbols-outlined {
@@ -163,3 +165,385 @@
   image-rendering: pixelated;
 }
 
+/* ─────────────────────────────────────────────────────────────────────────────
+   Advanced panel — quiet surface system
+   One hairline, one radius, one accent. Cards breathe instead of glowing.
+   ───────────────────────────────────────────────────────────────────────────── */
+:root {
+  --kp-hairline: rgba(255, 255, 255, 0.065);
+  --kp-hairline-strong: rgba(255, 255, 255, 0.1);
+  --kp-card: #11161f;
+  --kp-card-muted: #0d121a;
+  --kp-card-raised: #161c27;
+  --kp-accent: #fbbf24;
+  --kp-accent-soft: rgba(251, 191, 36, 0.12);
+  --kp-text-muted: #8b96aa;
+}
+
+.kp-card {
+  background: var(--kp-card);
+  border: 1px solid var(--kp-hairline);
+  border-radius: 14px;
+}
+
+.kp-card-muted {
+  background: var(--kp-card-muted);
+  border: 1px solid var(--kp-hairline);
+  border-radius: 14px;
+}
+
+.kp-card-raised {
+  background: var(--kp-card-raised);
+  border: 1px solid var(--kp-hairline);
+  border-radius: 14px;
+}
+
+.kp-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 13px 18px;
+  border-bottom: 1px solid var(--kp-hairline);
+}
+
+.kp-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: #f5f7ff;
+}
+
+.kp-sub {
+  font-size: 11.5px;
+  line-height: 17px;
+  color: var(--kp-text-muted);
+}
+
+.kp-eyebrow {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: #8b95ac;
+}
+
+.kp-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border-radius: 7px;
+  border: 1px solid var(--kp-hairline);
+  background: rgba(255, 255, 255, 0.03);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 15px;
+  color: #cbd3e4;
+  white-space: nowrap;
+}
+
+.kp-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 9px;
+  border: 1px solid var(--kp-hairline-strong);
+  background: rgba(255, 255, 255, 0.04);
+  color: #eef2fa;
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+
+.kp-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.16);
+}
+
+.kp-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.kp-btn-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 9px;
+  border: 1px solid rgba(251, 191, 36, 0.5);
+  background: var(--kp-accent);
+  color: #0a0d14;
+  font-size: 11.5px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: filter 0.15s ease;
+}
+
+.kp-btn-primary:hover {
+  filter: brightness(1.06);
+}
+
+.kp-divider {
+  height: 1px;
+  background: var(--kp-hairline);
+}
+
+.kp-stat-value {
+  font-family: var(--font-mono);
+  font-size: 21px;
+  font-weight: 600;
+  line-height: 26px;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  color: #eef1f8;
+}
+
+/* Page frame: every advanced view uses the same header rhythm */
+.kp-page {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 20px 24px 28px;
+  min-height: 100%;
+}
+
+.kp-page-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 38px;
+}
+
+.kp-h1 {
+  font-size: 17px;
+  font-weight: 650;
+  line-height: 24px;
+  letter-spacing: -0.02em;
+  color: #eef1f8;
+}
+
+.kp-label {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: #7f8a9e;
+}
+
+.kp-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 26px 20px;
+  text-align: center;
+  color: var(--kp-text-muted);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   Advanced shell — one visual language
+   Every card: 12px radius, 1px hairline, one of three surface tiers.
+   Every control: 9px radius, 12.5px label. Color is reserved for meaning.
+   ───────────────────────────────────────────────────────────────────────────── */
+.advanced-shell {
+  background: var(--color-surface-dim);
+}
+
+/* One card tone. Nested tiers used to differ by a few percent, which reads as
+   banding rather than hierarchy; hairlines carry the separation instead. */
+.advanced-shell .bg-surface,
+.advanced-shell .bg-surface-container-low,
+.advanced-shell .bg-surface-container {
+  background-color: var(--kp-card);
+}
+
+.advanced-shell .bg-surface-container-high,
+.advanced-shell .bg-surface-container-highest,
+.advanced-shell .bg-surface-bright,
+.advanced-shell .bg-surface-variant {
+  background-color: var(--kp-card-raised);
+}
+
+/* Wells (bars, inputs, empty states) sit below the card, not beside it. */
+.advanced-shell .bg-surface-lowest,
+.advanced-shell .bg-surface-container-lowest {
+  background-color: rgba(6, 8, 12, 0.55);
+}
+
+/* Gradients on chrome are noise; keep only real data fills. */
+.advanced-shell .bg-gradient-to-r.from-primary,
+.advanced-shell .bg-gradient-to-br.from-primary {
+  background-image: none;
+  background-color: var(--kp-accent);
+}
+
+/* Micro-caps eyebrows share one rhythm across every page */
+.advanced-shell .tracking-wider {
+  letter-spacing: 0.08em;
+}
+
+.advanced-shell .tracking-widest {
+  letter-spacing: 0.1em;
+}
+
+/* Section titles: same weight everywhere, sentence-case where already set */
+.advanced-shell h2,
+.advanced-shell h3 {
+  font-weight: 600;
+}
+
+/* Dense tables keep one row height */
+.advanced-shell tbody td {
+  vertical-align: middle;
+}
+
+/* Ghost controls: half the chrome, same hit area */
+.advanced-shell .kp-ghost {
+  border-color: transparent;
+  background: transparent;
+}
+
+.advanced-shell .kp-ghost:hover {
+  border-color: var(--kp-hairline-strong);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+/* Flat surfaces in the advanced shell: no glow, no double shadow */
+.advanced-shell .shadow-sm,
+.advanced-shell .shadow,
+.advanced-shell .shadow-md,
+.advanced-shell .shadow-lg,
+.advanced-shell .shadow-xl,
+.advanced-shell .shadow-2xl {
+  box-shadow: none;
+}
+
+/* Hairlines collapse into two tones: structural (6.5%) and control (10%) */
+.advanced-shell .border-white\/\[0\.04\],
+.advanced-shell .border-white\/5,
+.advanced-shell .border-white\/\[0\.06\],
+.advanced-shell .border-white\/\[0\.08\] {
+  border-color: var(--kp-hairline);
+}
+
+.advanced-shell .border-white\/10,
+.advanced-shell .border-white\/\[0\.12\],
+.advanced-shell .border-white\/15,
+.advanced-shell .border-white\/20 {
+  border-color: var(--kp-hairline-strong);
+}
+
+/* Radii: cards 12, nested panels 10, controls 9 */
+.advanced-shell .rounded,
+.advanced-shell .rounded-md {
+  border-radius: 8px;
+}
+
+.advanced-shell .rounded-lg {
+  border-radius: 10px;
+}
+
+.advanced-shell .rounded-xl {
+  border-radius: 12px;
+}
+
+.advanced-shell .rounded-2xl {
+  border-radius: 14px;
+}
+
+.advanced-shell .rounded-3xl {
+  border-radius: 16px;
+}
+
+/* Controls share one geometry, whatever utilities they carry */
+.advanced-shell button:not(.rounded-full),
+.advanced-shell input,
+.advanced-shell select,
+.advanced-shell textarea {
+  border-radius: 9px;
+}
+
+.advanced-shell input,
+.advanced-shell select,
+.advanced-shell textarea {
+  font-size: 12.5px;
+}
+
+.advanced-shell input::placeholder,
+.advanced-shell textarea::placeholder {
+  color: #6f7a8d;
+}
+
+/* Micro-labels: readable at a glance, never cramped */
+.advanced-shell .text-\[9\.5px\],
+.advanced-shell .text-\[10px\] {
+  font-size: 10.5px;
+}
+
+.advanced-shell .text-\[11px\] {
+  font-size: 11.5px;
+}
+
+/* Tables read as one grid instead of boxes inside boxes */
+.advanced-shell table {
+  border-collapse: collapse;
+}
+
+.advanced-shell thead tr {
+  background: transparent;
+}
+
+.advanced-shell thead th {
+  font-weight: 600;
+  color: var(--kp-text-muted);
+  border-bottom: 1px solid var(--kp-hairline);
+  border-radius: 0 !important;
+  padding-top: 4px;
+  padding-bottom: 8px;
+}
+
+.advanced-shell tbody tr {
+  border: 0;
+}
+
+.advanced-shell tbody tr + tr {
+  border-top: 1px solid var(--kp-hairline);
+}
+
+.advanced-shell tbody tr:hover {
+  background: rgba(255, 255, 255, 0.015) !important;
+}
+
+/* Focus ring that matches the accent instead of the browser default */
+.advanced-shell :focus-visible {
+  outline: 2px solid rgba(251, 191, 36, 0.55);
+  outline-offset: 1px;
+}
+
+/* Slightly calmer scrollbars inside content areas */
+.advanced-shell ::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.advanced-shell ::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+.advanced-shell ::-webkit-scrollbar-thumb:hover {
+  background: rgba(251, 191, 36, 0.35);
+  background-clip: padding-box;
+}

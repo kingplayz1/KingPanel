@@ -1,6 +1,10 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { AuthUser, NavSection, PaperMCServiceReport, ServerInstance } from '../types';
 import { DEFAULT_PROFILE_ICON_URL, resolveUserAvatarUrl } from '../utils/profileIcons';
+import { ServerInstallModal } from './ServerInstallModal';
+import { SimpleWindowControls } from './SimpleWindowControls';
+import { JobProgressBar } from './JobProgressBar';
+import { cancelJob, submitJob, type OperationJob } from '../lib/jobs';
 
 interface SimplePrePanelProps {
   currentUser: AuthUser;
@@ -12,12 +16,14 @@ interface SimplePrePanelProps {
   paperMcReport?: PaperMCServiceReport | null;
   onRunPaperMcCheckNow?: () => void;
   onUpgradeServerEngine?: (serverId: string | 'ALL') => void;
-  onEnterFullPanel: (targetSection?: NavSection, selectedServer?: ServerInstance) => void;
-  onSelectServer: (server: ServerInstance) => void;
-  onServerPowerAction: (
-    serverId: string,
-    action: 'start' | 'restart' | 'stop' | 'kill'
+  onUpdateServerInstallFolder?: (newRootDir: string) => void;
+  onEnterFullPanel: (
+    targetSection?: NavSection,
+    selectedServer?: ServerInstance,
+    mode?: 'simple' | 'advanced',
   ) => void;
+  onSelectServer: (server: ServerInstance) => void;
+  onServerPowerAction: (serverId: string, action: 'start' | 'restart' | 'stop' | 'kill') => void;
   onCreateServerInstance: (server: ServerInstance) => void;
   onDeleteServerInstance: (serverId: string) => void;
   onOpenDiscordBotGate: (attemptedServerName?: string) => void;
@@ -29,7 +35,7 @@ interface SimplePrePanelProps {
     title: string,
     body?: string,
     type?: 'success' | 'info' | 'warning' | 'error',
-    icon?: string
+    icon?: string,
   ) => void;
 }
 
@@ -38,11 +44,9 @@ export const SimplePrePanel: React.FC<SimplePrePanelProps> = ({
   servers,
   activeServer,
   serverInstallRootDir,
-  hostTotalRamGb,
-  globalRamCapGb,
   paperMcReport,
-  onRunPaperMcCheckNow,
   onUpgradeServerEngine,
+  onUpdateServerInstallFolder,
   onEnterFullPanel,
   onSelectServer,
   onServerPowerAction,
@@ -51,572 +55,268 @@ export const SimplePrePanel: React.FC<SimplePrePanelProps> = ({
   onOpenDiscordBotGate,
   onLeaveDiscordServer,
   onUserUpdated,
-  onOpenAuthModal,
   onSignOut,
   onShowToast,
 }) => {
-  const [newServerName, setNewServerName] = useState('');
-  const [newServerEngine, setNewServerEngine] = useState('PaperMC 1.21.4');
-  const [newServerPort, setNewServerPort] = useState<number>(() => {
-    const highest = servers.reduce((max, s) => Math.max(max, s.port), 25565);
-    return highest + 1;
-  });
-  const [newServerRamGb, setNewServerRamGb] = useState<number>(4);
-  const [isDeploying, setIsDeploying] = useState(false);
+  // Create Server Modal State — the dialog itself owns the install form
+  const [createModalOpen, setCreateModalOpen] = useState(false);
 
-  // Popup state for the "Verify Discord Bot" button giving the option to Join Discord
-  const [verifyBotPopupOpen, setVerifyBotPopupOpen] = useState(false);
-  const [discordInviteUrl, setDiscordInviteUrl] = useState(
-    currentUser.discordInviteUrl || 'https://discord.gg/iskingpanel'
-  );
-  const [discordUsernameInput, setDiscordUsernameInput] = useState(
-    currentUser.discordUsername || `${currentUser.username}#0001`
-  );
-  const [hasClickedJoinDiscord, setHasClickedJoinDiscord] = useState(
-    Boolean(currentUser.discordVerified)
-  );
-  const [isVerifyingInPopup, setIsVerifyingInPopup] = useState(false);
-  const [showQuickSetupGuide, setShowQuickSetupGuide] = useState(true);
+  // Container lifecycle per server folder (installer / installing / ready /
+  // running / error) so the list shows which servers still need setup.
+  const [containerByServer, setContainerByServer] = useState<
+    Record<string, { phase: string; hasJar: boolean; blockers: string[] }>
+  >({});
+  const [installingFor, setInstallingFor] = useState<string | null>(null);
+  const [setupJob, setSetupJob] = useState<OperationJob | null>(null);
+
+  const serverIdKey = servers.map((srv) => srv.id).join('|');
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      const next: Record<string, { phase: string; hasJar: boolean; blockers: string[] }> = {};
+      await Promise.all(
+        servers.map(async (srv) => {
+          try {
+            const res = await fetch(
+              `/api/server-runtime/container-state?serverId=${encodeURIComponent(
+                srv.id,
+              )}&serverName=${encodeURIComponent(srv.name)}`,
+            );
+            const data = await res.json();
+            if (data?.ok) {
+              next[srv.id] = {
+                phase: String(data.phase || 'installing'),
+                hasJar: Boolean(data.hasJar),
+                blockers: Array.isArray(data.blockers) ? data.blockers : [],
+              };
+            }
+          } catch {
+            // backend restarting — keep the last known phase
+          }
+        }),
+      );
+      if (!cancelled) setContainerByServer(next);
+    };
+    void load();
+    const timer = setInterval(() => void load(), 15000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [serverIdKey]);
+
+  const handleFinishSetup = async (srv: ServerInstance) => {
+    setInstallingFor(srv.id);
+    setSetupJob(null);
+    try {
+      const outcome = await submitJob<Record<string, any>>(
+        '/api/server-runtime/install-jar',
+        { serverId: srv.id, serverName: srv.name, engine: srv.engine },
+        { onProgress: setSetupJob },
+      );
+      const data = (outcome.result || {}) as Record<string, any>;
+      if (!outcome.ok) {
+        onShowToast(
+          'Setup failed',
+          outcome.error || 'Could not install server.jar',
+          'error',
+          'error',
+        );
+        return;
+      }
+      onShowToast(
+        'Container ready',
+        `${data.filename || 'server.jar'} installed (${Math.round((Number(data.bytes) || 0) / 1024 / 1024)} MB) for ${srv.name}`,
+        'success',
+        'deployed_code',
+      );
+      setContainerByServer((prev) => ({
+        ...prev,
+        [srv.id]: { phase: 'ready', hasJar: true, blockers: [] },
+      }));
+    } catch (err) {
+      onShowToast(
+        'Setup failed',
+        err instanceof Error ? err.message : 'Backend unreachable',
+        'error',
+        'error',
+      );
+    } finally {
+      setInstallingFor(null);
+    }
+  };
 
   const isSuperAdmin =
     currentUser.username.toLowerCase() === 'kingplayz' ||
     currentUser.role === 'Super Admin' ||
     Boolean(currentUser.isSuperAdmin);
   const isVerified = Boolean(currentUser.discordVerified) || isSuperAdmin;
-  const maxServerLimit = isSuperAdmin
-    ? 999
-    : isVerified
-    ? currentUser.maxServerLimit || 10
-    : 2;
+  const maxServerLimit = isSuperAdmin ? 999 : isVerified ? currentUser.maxServerLimit || 10 : 2;
   const isAtServerLimit = !isSuperAdmin && servers.length >= maxServerLimit;
 
   const latestPaperRelease = paperMcReport?.latestPaperRelease || '1.21.4';
-  const latestPaperBuild = paperMcReport?.latestPaperBuild || 'Build #222';
-  const outdatedServers = servers.filter((s) => {
-    if (s.isOutdated !== undefined) return s.isOutdated;
-    return !s.engine.includes(latestPaperRelease);
-  });
 
-  const cleanRoot = serverInstallRootDir.replace(/[\\/]+$/, '');
-  const sep = cleanRoot.includes('\\') ? '\\' : '/';
-  const previewSlug =
-    (newServerName.trim() || `Server_${servers.length + 1}`)
-      .replace(/[^a-zA-Z0-9_-]/g, '_')
-      .replace(/_+/g, '_') || 'Server_Node';
-  const previewPath = `${cleanRoot}${sep}${previewSlug}`;
+  // The modal performs the real install (jar download + EULA consent); the list
+  // only needs to receive the finished instance.
+  const handleServerInstalled = (installed: ServerInstance) => {
+    onCreateServerInstance(installed);
+  };
 
-  const handleQuickCreateServer = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const trimmedName = newServerName.trim() || `Minecraft Server #${servers.length + 1}`;
-
-    // Enforce 1 or 2 server limit for standard logged-in users
+  const handleOpenCreateServerModal = () => {
     if (servers.length >= maxServerLimit) {
-      setVerifyBotPopupOpen(true);
+      onOpenDiscordBotGate();
       onShowToast(
-        '2-Server Limit Reached — Verify Discord Bot',
+        '2-Server Limit Reached — Verify Discord',
         'Standard users can set up 1 or 2 servers only. Join our Discord server and verify with our bot to unlock up to 10 servers!',
         'warning',
-        'forum'
+        'forum',
       );
       return;
     }
-
-    setIsDeploying(true);
-    const parts = newServerEngine.split(' ');
-    const engineType = parts[0] || 'PaperMC';
-    const mcVersion = parts[1] || '1.21.4';
-
-    try {
-      const res = await fetch('/api/panel/install-server-instance', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          serverName: trimmedName,
-          engine: engineType,
-          version: mcVersion,
-          port: newServerPort,
-          ramMaxGb: newServerRamGb,
-          installRootDir: serverInstallRootDir,
-          currentServerCount: servers.length,
-          username: currentUser.username,
-        }),
-      });
-      const data = await res.json();
-
-      if (res.status === 403 || data?.requiresDiscordVerification) {
-        setVerifyBotPopupOpen(true);
-        setIsDeploying(false);
-        return;
-      }
-
-      const finalPath = data?.serverFolder || previewPath;
-      const newSrv: ServerInstance = {
-        id: `srv-${Date.now().toString(36)}`,
-        name: trimmedName,
-        engine: newServerEngine,
-        javaVersion: 'Java 21',
-        port: Number(newServerPort) || 25567,
-        pid: Math.floor(14000 + Math.random() * 9000),
-        status: 'running',
-        path: finalPath,
-        tps: 20.0,
-        tickMs: 2.1,
-        uptime: '0h 01m',
-        playersOnline: 0,
-        maxPlayers: 40,
-        cpuUsage: 14,
-        cpuTemp: 44.0,
-        ramUsedGb: Number((newServerRamGb * 0.35).toFixed(1)),
-        ramMaxGb: newServerRamGb,
-        build: '#Latest',
-      };
-
-      onCreateServerInstance(newSrv);
-      setNewServerName('');
-      setNewServerPort((prev) => prev + 1);
-    } catch {
-      const fallbackSrv: ServerInstance = {
-        id: `srv-${Date.now().toString(36)}`,
-        name: trimmedName,
-        engine: newServerEngine,
-        javaVersion: 'Java 21',
-        port: Number(newServerPort) || 25567,
-        pid: Math.floor(14000 + Math.random() * 9000),
-        status: 'running',
-        path: previewPath,
-        tps: 20.0,
-        tickMs: 2.1,
-        uptime: '0h 01m',
-        playersOnline: 0,
-        maxPlayers: 40,
-        cpuUsage: 14,
-        cpuTemp: 44.0,
-        ramUsedGb: Number((newServerRamGb * 0.35).toFixed(1)),
-        ramMaxGb: newServerRamGb,
-        build: '#Latest',
-      };
-      onCreateServerInstance(fallbackSrv);
-      setNewServerName('');
-      setNewServerPort((prev) => prev + 1);
-    } finally {
-      setIsDeploying(false);
-    }
+    setCreateModalOpen(true);
   };
 
-  const handlePopupVerifyDiscordBot = async () => {
-    setIsVerifyingInPopup(true);
-    try {
-      const res = await fetch('/api/auth/discord/verify-bot', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          username: currentUser.username,
-          discordUsername: discordUsernameInput.trim() || `${currentUser.username}#0001`,
-          discordUserId: currentUser.discordUserId || '849201938472019283',
-          verificationCode: `KING-BOT-VERIFY`,
-          guildInviteUrl: discordInviteUrl,
-        }),
-      });
-      const data = await res.json();
-      if (res.ok && data.ok && data.user) {
-        onUserUpdated(data.user);
-        setVerifyBotPopupOpen(false);
-        onShowToast(
-          'Discord Bot Verified! Limit Unlocked (10 Servers)',
-          `Connected to Discord & verified @${discordUsernameInput}. You can now set up up to 10 servers!`,
-          'success',
-          'verified'
-        );
-      } else {
-        onShowToast(
-          'Verification Failed',
-          data?.error || 'Please join our Discord server first.',
-          'error',
-          'error'
-        );
-      }
-    } catch {
-      onShowToast(
-        'Verification Error',
-        'Could not reach local Discord Bot verification endpoint.',
-        'error',
-        'error'
-      );
-    } finally {
-      setIsVerifyingInPopup(false);
-    }
-  };
+  const runningCount = servers.filter((s) => s.status === 'running').length;
+  const stoppedCount = servers.length - runningCount;
 
   return (
-    <div className="flex-1 overflow-y-auto bg-surface-dim p-6 lg:p-10">
-      <div className="max-w-6xl mx-auto space-y-6">
-        {/* Simple Panel Top Welcome & Action Header */}
-        <div className="rounded-2xl bg-surface-container border border-white/10 p-6 shadow-2xl flex flex-col lg:flex-row lg:items-center justify-between gap-5">
-          <div className="flex items-start sm:items-center gap-4">
-            <div className="w-14 h-14 rounded-2xl bg-primary/15 border border-primary/30 flex items-center justify-center shrink-0 shadow-lg">
-              <span className="material-symbols-outlined text-primary text-[30px]">
-                space_dashboard
-              </span>
+    <div className="min-h-screen w-full bg-surface-dim flex flex-col overflow-y-auto">
+      {/* Simple Top Bar */}
+      <header
+        className="w-full bg-surface border-b border-white/[0.08] px-6 py-4"
+        style={{ WebkitAppRegion: 'drag' } as React.CSSProperties}
+      >
+        <div className="max-w-5xl mx-auto flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          {/* Brand + User Info */}
+          <div className="flex items-center gap-3.5">
+            <div className="w-10 h-10 rounded-xl bg-primary/15 border border-primary/35 flex items-center justify-center text-primary shrink-0">
+              <span className="material-symbols-outlined text-[22px]">dns</span>
             </div>
             <div>
-              <div className="flex flex-wrap items-center gap-2.5">
-                <h1 className="text-xl sm:text-2xl font-bold text-white tracking-tight">
-                  Simple Server Panel
+              <div className="flex items-center gap-2.5">
+                <h1 className="text-base sm:text-lg font-bold text-white tracking-tight">
+                  Server List Panel
                 </h1>
                 <span className="text-xs font-mono text-outline">
-                  · Quick Launcher Before Full Panel
+                  · {servers.length} / {isSuperAdmin ? '∞' : maxServerLimit} Servers
                 </span>
               </div>
-              <p className="text-xs sm:text-sm text-outline mt-1">
-                Welcome, <strong className="text-white">{currentUser.displayName}</strong> (
-                <span className="font-mono text-primary">@{currentUser.username}</span>). Manage or create your servers quickly here, or continue to the Full Workstation Panel.
-              </p>
-              <div className="flex flex-wrap items-center gap-3 mt-2 text-xs font-mono">
-                <span className="text-on-surface-variant">
-                  Server Limit:{' '}
-                  <strong className={isAtServerLimit && !isVerified ? 'text-amber-300' : 'text-secondary'}>
-                    {servers.length} / {maxServerLimit} Servers
-                  </strong>
-                </span>
-                <span className="text-white/20">·</span>
-                <span className={isVerified ? 'text-secondary' : 'text-amber-300'}>
-                  {isVerified
-                    ? `Discord Bot Verified (@${currentUser.discordUsername || currentUser.username})`
-                    : 'Standard Login (1 or 2 Servers Max)'}
-                </span>
-                <span className="text-white/20">·</span>
-                <span className="text-outline">
-                  Host RAM: {globalRamCapGb} GB / {hostTotalRamGb} GB
-                </span>
+              <div className="flex items-center gap-2 text-xs text-outline mt-0.5">
+                <img
+                  src={resolveUserAvatarUrl(currentUser.avatarUrl)}
+                  onError={(e) => {
+                    (e.currentTarget as HTMLImageElement).src = DEFAULT_PROFILE_ICON_URL;
+                  }}
+                  alt={currentUser.username}
+                  className="w-4 h-4 rounded-full object-cover"
+                />
+                <span className="text-white font-medium">{currentUser.displayName}</span>
+                <span className="font-mono text-outline">(@{currentUser.username})</span>
               </div>
             </div>
           </div>
 
-          {/* Right Header Controls: Setup Guide + Verify Discord Bot Button + Enter Full Panel Button */}
-          <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+          {/* Right Actions */}
+          <div
+            className="flex flex-wrap items-center gap-2.5"
+            style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+          >
             <button
               type="button"
-              onClick={() => onEnterFullPanel('setup_guide')}
-              className="px-4 py-2.5 rounded-xl bg-secondary/15 hover:bg-secondary/25 border border-secondary/40 text-secondary text-xs font-bold flex items-center gap-2 cursor-pointer transition-all"
+              onClick={handleOpenCreateServerModal}
+              className="px-4 py-2 rounded-xl bg-primary hover:opacity-95 text-on-primary-container text-xs font-bold flex items-center gap-1.5 cursor-pointer transition-all"
             >
-              <span className="material-symbols-outlined text-[18px]">school</span>
-              New User Setup Guide
+              <span className="material-symbols-outlined text-[17px]">add</span>
+              Create Server
             </button>
 
-            {/* Verify Discord Bot Button (Opens Popup with option to Join Discord) */}
             <button
               type="button"
-              onClick={() => setVerifyBotPopupOpen(true)}
-              className={`px-4 py-2.5 rounded-xl text-xs font-bold flex items-center gap-2 cursor-pointer transition-all ${
+              onClick={() => onOpenDiscordBotGate()}
+              className={`px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 cursor-pointer transition-all ${
                 isVerified
-                  ? 'bg-secondary/15 hover:bg-secondary/25 text-secondary border border-secondary/40'
-                  : 'bg-[#5865F2] hover:bg-[#4752C4] text-white shadow-lg shadow-[#5865F2]/30'
+                  ? 'bg-secondary/15 hover:bg-secondary/25 text-secondary border border-secondary/35'
+                  : 'bg-[#5865F2]/20 hover:bg-[#5865F2]/30 text-white border border-[#5865F2]/40'
               }`}
             >
-              <span className="material-symbols-outlined text-[18px]">
+              <span className="material-symbols-outlined text-[16px]">
                 {isVerified ? 'verified' : 'forum'}
               </span>
-              {isVerified ? 'Discord Bot Verified (10 Max)' : 'Verify Discord Bot'}
+              {isVerified ? 'Discord Verified' : 'Verify Discord'}
             </button>
 
-            {isVerified && (
+            {isVerified && !isSuperAdmin && (
               <button
                 type="button"
                 onClick={onLeaveDiscordServer}
-                className="px-3.5 py-2.5 rounded-xl bg-error/15 hover:bg-error/25 border border-error/40 text-error text-xs font-bold flex items-center gap-1.5 cursor-pointer transition-all"
-                title="Leave Discord Server and reset server limit to 2"
+                className="px-3 py-2 rounded-xl bg-error/15 hover:bg-error/25 border border-error/30 text-error text-xs font-semibold cursor-pointer transition-all"
+                title="Leave Discord Server and reset limit to 2"
               >
-                <span className="material-symbols-outlined text-[16px]">link_off</span>
-                Leave Discord (Reset to 2)
+                Leave Discord
               </button>
             )}
 
             <button
               type="button"
-              onClick={() => onEnterFullPanel('overview')}
-              className="px-5 py-2.5 rounded-xl bg-primary hover:opacity-95 text-on-primary-container text-xs sm:text-sm font-bold flex items-center gap-2 shadow-lg shadow-primary/25 cursor-pointer transition-all"
+              onClick={onSignOut}
+              className="px-3.5 py-2 rounded-xl bg-white/5 hover:bg-error/20 border border-white/[0.08] hover:border-error/35 text-xs font-medium text-outline hover:text-error flex items-center gap-1.5 cursor-pointer transition-all"
             >
-              <span>Open Full Control Panel</span>
-              <span className="material-symbols-outlined text-[18px]">arrow_forward</span>
+              <span className="material-symbols-outlined text-[16px]">logout</span>
+              Logout
             </button>
+
+            <SimpleWindowControls className="ml-1 pl-2 border-l border-white/[0.08]" />
           </div>
         </div>
+      </header>
 
-        {/* New User Interactive 6-Step Setup Guide Card in Simple Pre-Panel */}
-        <div className="rounded-2xl bg-gradient-to-r from-primary/10 via-surface-container to-secondary/10 border border-primary/30 p-5 space-y-4">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-xl bg-primary/15 border border-primary/35 flex items-center justify-center text-primary shrink-0">
-                <span className="material-symbols-outlined text-[22px]">school</span>
-              </div>
-              <div>
-                <div className="flex flex-wrap items-center gap-2">
-                  <h2 className="text-sm sm:text-base font-bold text-white">
-                    New User Setup Panel Guide (6-Step Quick Walkthrough)
-                  </h2>
-                  <span className="px-2 py-0.5 rounded bg-primary text-on-primary-container text-[10px] font-mono font-bold uppercase">
-                    New User Guide
-                  </span>
-                </div>
-                <p className="text-xs text-outline">
-                  First time setting up IS King Panel on your PC? Follow these 6 steps or open the interactive Setup Wizard.
-                </p>
-              </div>
-            </div>
-
-            <div className="flex items-center gap-2 shrink-0">
-              <button
-                type="button"
-                onClick={() => setShowQuickSetupGuide((prev) => !prev)}
-                className="px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-xs font-mono text-outline hover:text-white cursor-pointer"
-              >
-                {showQuickSetupGuide ? 'Hide Steps' : 'Show 6 Steps'}
-              </button>
-              <button
-                type="button"
-                onClick={() => onEnterFullPanel('setup_guide')}
-                className="px-4 py-2 rounded-xl bg-primary hover:opacity-95 text-on-primary-container text-xs font-bold flex items-center gap-1.5 shadow-md cursor-pointer"
-              >
-                <span>Open Interactive Setup Wizard</span>
-                <span className="material-symbols-outlined text-[16px]">arrow_forward</span>
-              </button>
-            </div>
-          </div>
-
-          {showQuickSetupGuide && (
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-2.5 pt-2 border-t border-white/10 text-xs">
-              <div
-                onClick={() => onEnterFullPanel('setup_guide')}
-                className="p-3 rounded-xl bg-surface-lowest/90 border border-white/10 hover:border-primary/40 transition-colors cursor-pointer space-y-1"
-              >
-                <div className="text-[10px] font-mono text-primary font-bold">STEP 1 • IDENTITY</div>
-                <div className="font-bold text-white">Profile Icon &amp; Auth</div>
-                <p className="text-[11px] text-outline leading-snug">
-                  Default Operator Crest icon auto-assigned &amp; synced to MongoDB + SQLite3.
-                </p>
-              </div>
-
-              <div
-                onClick={() => onEnterFullPanel('setup_guide')}
-                className="p-3 rounded-xl bg-surface-lowest/90 border border-white/10 hover:border-primary/40 transition-colors cursor-pointer space-y-1"
-              >
-                <div className="text-[10px] font-mono text-primary font-bold">STEP 2 • FOLDER</div>
-                <div className="font-bold text-white">Server Root Folder</div>
-                <p className="text-[11px] text-outline leading-snug">
-                  Set install path ({serverInstallRootDir}) &amp; Host RAM cap ({globalRamCapGb} GB).
-                </p>
-              </div>
-
-              <div
-                onClick={() => onEnterFullPanel('setup_guide')}
-                className="p-3 rounded-xl bg-surface-lowest/90 border border-white/10 hover:border-primary/40 transition-colors cursor-pointer space-y-1"
-              >
-                <div className="text-[10px] font-mono text-secondary font-bold">STEP 3 • DATABASE</div>
-                <div className="font-bold text-white">SQLite / XAMPP / Mongo</div>
-                <p className="text-[11px] text-outline leading-snug">
-                  Built-in SQLite3 + MongoDB works immediately, or connect XAMPP/MariaDB 3306.
-                </p>
-              </div>
-
-              <div
-                onClick={() => onEnterFullPanel('setup_guide')}
-                className="p-3 rounded-xl bg-surface-lowest/90 border border-white/10 hover:border-primary/40 transition-colors cursor-pointer space-y-1"
-              >
-                <div className="text-[10px] font-mono text-amber-300 font-bold">STEP 4 • ENGINE</div>
-                <div className="font-bold text-white">Java 21 &amp; PaperMC</div>
-                <p className="text-[11px] text-outline leading-snug">
-                  Auto-checks PaperMC {latestPaperRelease} every 60s &amp; flags outdated servers.
-                </p>
-              </div>
-
-              <div
-                onClick={() => onEnterFullPanel('setup_guide')}
-                className="p-3 rounded-xl bg-surface-lowest/90 border border-white/10 hover:border-primary/40 transition-colors cursor-pointer space-y-1"
-              >
-                <div className="text-[10px] font-mono text-primary font-bold">STEP 5 • DEPLOY</div>
-                <div className="font-bold text-white">Create First Server</div>
-                <p className="text-[11px] text-outline leading-snug">
-                  Deploy in 1 click &amp; connect in Minecraft via <code>localhost:25565</code>.
-                </p>
-              </div>
-
-              <div
-                onClick={() => onEnterFullPanel('setup_guide')}
-                className="p-3 rounded-xl bg-surface-lowest/90 border border-white/10 hover:border-primary/40 transition-colors cursor-pointer space-y-1"
-              >
-                <div className="text-[10px] font-mono text-[#8ea1e1] font-bold">STEP 6 • UNLOCK</div>
-                <div className="font-bold text-white">Discord Bot &amp; .EXE</div>
-                <p className="text-[11px] text-outline leading-snug">
-                  Verify Discord Bot to unlock 10 servers (2 default) &amp; run Windows .EXE mode.
-                </p>
-              </div>
-            </div>
-          )}
-        </div>
-
-        {/* PaperMC Background Version Check Service + Super Admin / Windows App (.EXE) Banner */}
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
-          {/* Left 7 Cols: PaperMC API Background Service Status */}
-          <div className="lg:col-span-7 rounded-xl p-4 bg-surface-container border border-amber-400/30 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-            <div className="flex items-start gap-3">
-              <div className="w-10 h-10 rounded-xl bg-amber-400/15 border border-amber-400/35 flex items-center justify-center text-amber-300 shrink-0">
-                <span className="material-symbols-outlined text-[20px]">system_update_alt</span>
-              </div>
-              <div className="space-y-1 text-xs">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="font-bold text-white">
-                    PaperMC API Background Version Monitor
-                  </span>
-                  <span className="px-2 py-0.5 rounded bg-secondary/15 text-secondary text-[10px] font-mono font-bold">
-                    ● {paperMcReport?.serviceStatus || 'RUNNING'} (60s Poll)
-                  </span>
-                  {outdatedServers.length > 0 ? (
-                    <span className="px-2 py-0.5 rounded bg-error/20 text-error border border-error/40 text-[10px] font-mono font-bold">
-                      {outdatedServers.length} SERVER(S) OUTDATED
-                    </span>
-                  ) : (
-                    <span className="px-2 py-0.5 rounded bg-secondary/20 text-secondary text-[10px] font-mono font-bold">
-                      ALL SERVERS UP TO DATE
-                    </span>
-                  )}
-                </div>
-                <p className="text-outline font-mono text-[11px]">
-                  Latest PaperMC Release:{' '}
-                  <strong className="text-primary">
-                    PaperMC {latestPaperRelease} ({latestPaperBuild})
-                  </strong>{' '}
-                  • Source: <code className="text-white/80">api.papermc.io/v2/projects/paper</code>
-                </p>
-              </div>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-2 shrink-0">
-              {onRunPaperMcCheckNow && (
-                <button
-                  type="button"
-                  onClick={onRunPaperMcCheckNow}
-                  className="px-3 py-1.5 rounded-lg bg-surface-lowest hover:bg-white/10 border border-white/15 text-[11px] font-mono text-white flex items-center gap-1 cursor-pointer"
-                >
-                  <span className="material-symbols-outlined text-[15px] text-primary">sync</span>
-                  Check API
-                </button>
-              )}
-              {outdatedServers.length > 0 && onUpgradeServerEngine && (
-                <button
-                  type="button"
-                  onClick={() => onUpgradeServerEngine('ALL')}
-                  className="px-3 py-1.5 rounded-lg bg-amber-400 hover:bg-amber-300 text-black font-bold text-[11px] font-mono flex items-center gap-1 cursor-pointer"
-                >
-                  <span className="material-symbols-outlined text-[15px]">upgrade</span>
-                  Update Outdated ({outdatedServers.length})
-                </button>
-              )}
-            </div>
-          </div>
-
-          {/* Right 5 Cols: Super Admin (kingplayz) & Windows Desktop App (.EXE) Status */}
-          <div className="lg:col-span-5 rounded-xl p-4 bg-surface-container border border-secondary/30 flex items-center justify-between gap-3">
-            <div className="space-y-1 text-xs min-w-0">
-              <div className="flex items-center gap-2">
-                <span className="px-2 py-0.5 rounded bg-amber-400 text-black text-[10px] font-mono font-bold">
-                  SUPER ADMIN DB
-                </span>
-                <span className="px-2 py-0.5 rounded bg-tertiary/15 text-tertiary border border-tertiary/30 text-[10px] font-mono font-bold">
-                  WINDOWS .EXE APP
-                </span>
-              </div>
-              <div className="text-[11px] font-mono text-white truncate">
-                ID: <strong className="text-amber-300 select-all">kingplayz</strong> (
-                <span className="text-outline select-all">SA-KINGPLAYZ-001</span>) • Pass:{' '}
-                <strong className="text-secondary select-all">KingPlayz#2026</strong>
-              </div>
-              <div className="text-[10px] font-mono text-outline truncate">
-                SQLite3 WAL: <code>database/isking_panel.sqlite</code> •{' '}
-                <code>launch-windows-app.bat</code>
-              </div>
-            </div>
-            <button
-              type="button"
-              onClick={() => onEnterFullPanel('databases')}
-              className="px-3 py-2 rounded-lg bg-secondary/15 hover:bg-secondary/25 border border-secondary/35 text-secondary text-xs font-mono font-bold shrink-0 cursor-pointer"
-            >
-              Open DB →
-            </button>
-          </div>
-        </div>
-
-        {/* Quota Notice Banner */}
-        <div
-          className={`rounded-xl p-4 border flex flex-col sm:flex-row sm:items-center justify-between gap-4 ${
-            isVerified
-              ? 'bg-secondary/10 border-secondary/30'
-              : 'bg-[#5865F2]/10 border-[#5865F2]/35'
-          }`}
-        >
-          <div className="flex items-start gap-3">
-            <span
-              className={`material-symbols-outlined text-[22px] mt-0.5 ${
-                isVerified ? 'text-secondary' : 'text-[#8ea1e1]'
-              }`}
-            >
-              {isVerified ? 'verified_user' : 'info'}
-            </span>
-            <div className="text-xs space-y-1">
-              <div className="font-bold text-white">
-                {isVerified
-                  ? `Discord Server & Bot Verified — Up to ${maxServerLimit} Servers Unlocked`
-                  : 'Server Creation Rule: 1 or 2 Servers Default • Verify Discord Bot for 3+ Servers'}
-              </div>
-              <p className="text-outline leading-relaxed">
-                {isVerified ? (
-                  <>
-                    Your account is connected to{' '}
-                    <strong className="text-white">
-                      {currentUser.discordGuildName || 'IS King Official Discord'}
-                    </strong>
-                    . Note: If you leave the Discord server, your server limit automatically resets back to{' '}
-                    <strong className="text-white">2 servers</strong>.
-                  </>
-                ) : (
-                  <>
-                    Every logged-in user can set up <strong className="text-white">1 or 2 servers only</strong>. To set up more than 2 servers, click{' '}
-                    <strong className="text-white">Verify Discord Bot</strong> to join our Discord server and verify with our bot. Leaving the Discord server resets your limit to 2.
-                  </>
-                )}
+      {/* Main Content: Created Server List Display UI Only */}
+      <main className="flex-1 p-6 sm:p-10">
+        <div className="max-w-5xl mx-auto space-y-5">
+          {/* Server List Section Header */}
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-2 border-b border-white/[0.08]">
+            <div>
+              <h2 className="text-lg font-bold text-white">Created Server List</h2>
+              <p className="text-xs text-outline">
+                Select a server to start, stop, or open its control panel
               </p>
             </div>
+            <div className="flex items-center gap-3 text-xs font-mono text-outline">
+              <span>Total: {servers.length}</span>
+              <span>·</span>
+              <span className="text-secondary">Running: {runningCount}</span>
+              <span>·</span>
+              <span>Stopped: {stoppedCount}</span>
+            </div>
           </div>
 
-          <div className="flex items-center gap-2 shrink-0">
-            <button
-              type="button"
-              onClick={() => setVerifyBotPopupOpen(true)}
-              className="px-3.5 py-2 rounded-lg bg-[#5865F2] hover:bg-[#4752C4] text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer shrink-0"
-            >
-              <span className="material-symbols-outlined text-[16px]">group_add</span>
-              {isVerified ? 'Join Discord / Bot Options' : 'Join Discord & Verify Bot'}
-            </button>
-          </div>
-        </div>
-
-        {/* Main 2-Column Simple Panel Grid: Left = My Servers, Right = Quick Setup Server */}
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-          {/* Left 7 Columns: Simple Server List */}
-          <div className="lg:col-span-7 space-y-4">
-            <div className="flex items-center justify-between">
-              <div>
-                <h2 className="text-base font-bold text-white">
-                  Your Local Servers ({servers.length} / {maxServerLimit})
-                </h2>
-                <p className="text-xs text-outline">
-                  Start, stop, or open any server directly in the Full Panel
+          {/* Server List or Empty State */}
+          {servers.length === 0 ? (
+            <div className="rounded-xl p-10 bg-surface-container border border-white/[0.08] text-center space-y-4">
+              <div className="w-14 h-14 rounded-xl bg-primary/15 border border-primary/30 flex items-center justify-center text-primary mx-auto">
+                <span className="material-symbols-outlined text-[28px]">dns</span>
+              </div>
+              <div className="space-y-1.5 max-w-md mx-auto">
+                <h3 className="text-base font-bold text-white">No Created Servers Yet</h3>
+                <p className="text-xs text-outline leading-relaxed">
+                  Your server list is empty. Click the button below to create your first Minecraft
+                  server. Newly created servers remain stopped until you start them.
                 </p>
               </div>
-              <span className="text-xs font-mono text-outline">
-                Root: <strong className="text-primary">{serverInstallRootDir}</strong>
-              </span>
+              <div className="pt-1">
+                <button
+                  type="button"
+                  onClick={handleOpenCreateServerModal}
+                  className="px-5 py-2.5 rounded-xl bg-primary hover:opacity-95 text-on-primary-container text-xs font-bold inline-flex items-center gap-2 cursor-pointer transition-all"
+                >
+                  <span className="material-symbols-outlined text-[18px]">add_circle</span>
+                  Create Your First Server
+                </button>
+              </div>
             </div>
-
+          ) : (
             <div className="space-y-3">
               {servers.map((srv) => {
                 const isRunning = srv.status === 'running';
@@ -625,77 +325,106 @@ export const SimplePrePanel: React.FC<SimplePrePanelProps> = ({
                   srv.isOutdated !== undefined
                     ? srv.isOutdated
                     : !srv.engine.includes(latestPaperRelease);
+
                 return (
                   <div
                     key={srv.id}
                     onClick={() => onSelectServer(srv)}
-                    className={`rounded-xl p-4 border transition-all cursor-pointer ${
+                    className={`rounded-xl p-5 border transition-all cursor-pointer ${
                       isSelected
-                        ? 'bg-surface-container-high border-primary/40 shadow-lg'
-                        : 'bg-surface-container border-white/10 hover:border-white/20'
+                        ? 'bg-surface-container-high border-primary/40 '
+                        : 'bg-surface-container border-white/[0.08] hover:border-white/20'
                     }`}
                   >
-                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                      <div className="space-y-1">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <span
-                            className={`w-2.5 h-2.5 rounded-full ${
-                              isRunning ? 'bg-secondary animate-pulse' : 'bg-error'
-                            }`}
-                          />
-                          <span className="text-sm font-bold text-white">{srv.name}</span>
-                          <span className="text-xs font-mono text-outline">
-                            · {srv.engine} · :{srv.port}
-                          </span>
-                          {isSrvOutdated ? (
-                            <span
-                              className="px-2 py-0.5 rounded bg-error/20 text-error border border-error/40 text-[10px] font-mono font-bold flex items-center gap-1"
-                              title={`Flagged by PaperMC Background Service — Installed: ${
-                                srv.installedVersion || srv.engine
-                              } | Latest Release: ${srv.latestVersion || latestPaperRelease}`}
-                            >
-                              <span className="material-symbols-outlined text-[12px]">warning</span>
-                              OUTDATED (Latest: {srv.latestVersion || latestPaperRelease})
-                            </span>
-                          ) : (
-                            <span className="px-2 py-0.5 rounded bg-secondary/15 text-secondary border border-secondary/30 text-[10px] font-mono font-bold">
-                              LATEST ({latestPaperRelease})
-                            </span>
-                          )}
+                    <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                      {/* Left: Server Identity & Metadata */}
+                      <div className="flex items-start gap-3.5 min-w-0">
+                        <div
+                          className={`w-11 h-11 rounded-xl border flex items-center justify-center shrink-0 ${
+                            isRunning
+                              ? 'bg-secondary/15 border-secondary/35 text-secondary'
+                              : 'bg-surface-lowest border-white/[0.08] text-outline'
+                          }`}
+                        >
+                          <span className="material-symbols-outlined text-[22px]">dns</span>
                         </div>
-                        <div className="text-[11px] font-mono text-outline flex flex-wrap items-center gap-2 pl-5">
-                          <span>Folder: {srv.path}</span>
-                          <span>·</span>
-                          <span>
-                            RAM: {srv.ramUsedGb} / {srv.ramMaxGb} GB
-                          </span>
-                          <span>·</span>
-                          <span>CPU: {srv.cpuUsage}%</span>
+                        <div className="space-y-1 min-w-0">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span
+                              className={`w-2.5 h-2.5 rounded-full ${
+                                isRunning ? 'bg-secondary animate-pulse' : 'bg-error'
+                              }`}
+                            />
+                            <span className="text-base font-bold text-white truncate">
+                              {srv.name}
+                            </span>
+                            <span className="text-xs font-mono text-outline">· {srv.engine}</span>
+                            <span className="text-xs font-mono text-outline">
+                              · {isRunning ? 'RUNNING' : 'STOPPED'}
+                            </span>
+                            {containerByServer[srv.id] && !isRunning && (
+                              <span
+                                className={`text-[9.5px] font-bold px-1.5 py-0.5 rounded border font-mono ${
+                                  containerByServer[srv.id].phase === 'ready'
+                                    ? 'text-primary border-primary/40 bg-primary/10'
+                                    : containerByServer[srv.id].phase === 'error'
+                                      ? 'text-error border-error/40 bg-error/10'
+                                      : 'text-amber-300 border-amber-400/40 bg-amber-400/10'
+                                }`}
+                                title={
+                                  containerByServer[srv.id].blockers.join(' · ') ||
+                                  'Container ready'
+                                }
+                              >
+                                {containerByServer[srv.id].phase === 'ready'
+                                  ? 'READY'
+                                  : containerByServer[srv.id].phase === 'error'
+                                    ? 'ERROR'
+                                    : 'NEEDS SETUP'}
+                              </span>
+                            )}
+                            {isSrvOutdated && (
+                              <span className="text-xs font-mono text-amber-300">
+                                · Outdated (Latest: {srv.latestVersion || latestPaperRelease})
+                              </span>
+                            )}
+                          </div>
+
+                          <div className="text-xs font-mono text-outline flex flex-wrap items-center gap-2">
+                            <span>Address: localhost:{srv.port}</span>
+                            <span>·</span>
+                            <span>
+                              RAM: {srv.ramUsedGb} / {srv.ramMaxGb} GB
+                            </span>
+                            <span>·</span>
+                            <span className="truncate">Path: {srv.path}</span>
+                          </div>
                         </div>
                       </div>
 
+                      {/* Right: Direct Server Controls */}
                       <div
-                        className="flex flex-wrap items-center gap-1.5"
+                        className="flex flex-wrap items-center gap-2 shrink-0"
                         onClick={(e) => e.stopPropagation()}
                       >
                         {isSrvOutdated && onUpgradeServerEngine && (
                           <button
                             type="button"
                             onClick={() => onUpgradeServerEngine(srv.id)}
-                            className="px-2.5 py-1.5 rounded-lg bg-amber-400 hover:bg-amber-300 text-black text-xs font-mono font-bold flex items-center gap-1 cursor-pointer"
-                            title={`Upgrade ${srv.name} to latest release ${latestPaperRelease}`}
+                            className="px-3 py-2 rounded-xl bg-amber-400 hover:bg-amber-300 text-black text-xs font-bold flex items-center gap-1 cursor-pointer"
                           >
-                            <span className="material-symbols-outlined text-[14px]">upgrade</span>
-                            Update to {srv.latestVersion || latestPaperRelease}
+                            <span className="material-symbols-outlined text-[15px]">upgrade</span>
+                            Update
                           </button>
                         )}
+
                         {!isRunning ? (
                           <button
                             type="button"
                             onClick={() => onServerPowerAction(srv.id, 'start')}
-                            className="px-3 py-1.5 rounded-lg bg-secondary/20 hover:bg-secondary/30 text-secondary border border-secondary/30 text-xs font-bold flex items-center gap-1 cursor-pointer"
+                            className="px-3.5 py-2 rounded-xl bg-secondary/20 hover:bg-secondary/30 text-secondary border border-secondary/35 text-xs font-bold flex items-center gap-1.5 cursor-pointer"
                           >
-                            <span className="material-symbols-outlined text-[15px]">
+                            <span className="material-symbols-outlined text-[16px]">
                               play_arrow
                             </span>
                             Start
@@ -705,9 +434,9 @@ export const SimplePrePanel: React.FC<SimplePrePanelProps> = ({
                             <button
                               type="button"
                               onClick={() => onServerPowerAction(srv.id, 'restart')}
-                              className="px-2.5 py-1.5 rounded-lg bg-amber-400/15 hover:bg-amber-400/25 text-amber-300 border border-amber-400/30 text-xs font-semibold flex items-center gap-1 cursor-pointer"
+                              className="px-3 py-2 rounded-xl bg-amber-400/15 hover:bg-amber-400/25 text-amber-300 border border-amber-400/30 text-xs font-semibold flex items-center gap-1 cursor-pointer"
                             >
-                              <span className="material-symbols-outlined text-[14px]">
+                              <span className="material-symbols-outlined text-[15px]">
                                 restart_alt
                               </span>
                               Restart
@@ -715,371 +444,124 @@ export const SimplePrePanel: React.FC<SimplePrePanelProps> = ({
                             <button
                               type="button"
                               onClick={() => onServerPowerAction(srv.id, 'stop')}
-                              className="px-2.5 py-1.5 rounded-lg bg-white/10 hover:bg-white/15 text-white text-xs font-semibold flex items-center gap-1 cursor-pointer"
+                              className="px-3 py-2 rounded-xl bg-white/10 hover:bg-white/15 text-white text-xs font-semibold flex items-center gap-1 cursor-pointer"
                             >
-                              <span className="material-symbols-outlined text-[14px]">
-                                stop
-                              </span>
+                              <span className="material-symbols-outlined text-[15px]">stop</span>
                               Stop
                             </button>
                           </>
                         )}
 
+                        {!isRunning &&
+                          containerByServer[srv.id] &&
+                          !containerByServer[srv.id].hasJar && (
+                            <button
+                              type="button"
+                              onClick={() => void handleFinishSetup(srv)}
+                              disabled={installingFor === srv.id}
+                              className="px-3 py-2 rounded-xl bg-primary/20 hover:bg-primary/30 disabled:opacity-50 text-primary border border-primary/35 text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                              title="Download server.jar and finish the container setup"
+                            >
+                              <span className="material-symbols-outlined text-[15px]">
+                                download
+                              </span>
+                              {installingFor === srv.id ? 'Installing…' : 'Finish setup'}
+                            </button>
+                          )}
+
+                        {installingFor === srv.id && setupJob && (
+                          <div className="w-full mt-2">
+                            <JobProgressBar
+                              job={setupJob}
+                              compact
+                              onCancel={() => {
+                                void cancelJob(setupJob.id);
+                              }}
+                            />
+                          </div>
+                        )}
+
                         <button
                           type="button"
-                          onClick={() => onEnterFullPanel('console', srv)}
-                          className="px-3 py-1.5 rounded-lg bg-primary/15 hover:bg-primary/25 text-primary border border-primary/30 text-xs font-bold flex items-center gap-1 cursor-pointer"
+                          onClick={() => onEnterFullPanel('console', srv, 'simple')}
+                          className="px-3.5 py-2 rounded-xl bg-primary hover:opacity-95 text-on-primary-container text-xs font-bold flex items-center gap-1.5 cursor-pointer"
                         >
-                          <span>Open Panel</span>
-                          <span className="material-symbols-outlined text-[14px]">
-                            open_in_new
+                          <span className="material-symbols-outlined text-[15px]">
+                            space_dashboard
                           </span>
+                          <span>Simple Panel</span>
                         </button>
 
-                        {servers.length > 1 && (
-                          <button
-                            type="button"
-                            onClick={() => onDeleteServerInstance(srv.id)}
-                            className="p-1.5 rounded-lg bg-error/10 hover:bg-error/20 text-error cursor-pointer"
-                            title="Delete Server"
-                          >
-                            <span className="material-symbols-outlined text-[15px]">delete</span>
-                          </button>
-                        )}
+                        <button
+                          type="button"
+                          onClick={() => onEnterFullPanel('console', srv, 'advanced')}
+                          className="px-3 py-2 rounded-xl bg-white/10 hover:bg-white/15 border border-white/15 text-white text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
+                        >
+                          <span className="material-symbols-outlined text-[15px] text-primary">
+                            terminal
+                          </span>
+                          <span>Advanced Panel</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => onDeleteServerInstance(srv.id)}
+                          className="p-2 rounded-xl bg-error/10 hover:bg-error/20 text-error cursor-pointer"
+                          title="Delete Server"
+                        >
+                          <span className="material-symbols-outlined text-[16px]">delete</span>
+                        </button>
                       </div>
                     </div>
                   </div>
                 );
               })}
             </div>
-          </div>
+          )}
 
-          {/* Right 5 Columns: Quick Setup Server Card */}
-          <div className="lg:col-span-5 space-y-4">
-            <div className="rounded-2xl bg-surface-container border border-white/10 p-5 space-y-4">
-              <div className="flex items-center justify-between">
-                <div>
-                  <h2 className="text-base font-bold text-white">Quick Setup New Server</h2>
-                  <p className="text-xs text-outline">
-                    Create a server directly from the Simple Panel
-                  </p>
-                </div>
-                <span className="text-xs font-mono text-primary font-bold">
-                  {servers.length}/{maxServerLimit} Used
-                </span>
-              </div>
-
-              <form onSubmit={handleQuickCreateServer} className="space-y-3.5">
-                <div>
-                  <label className="text-[11px] font-mono text-outline uppercase block mb-1">
-                    Server Name
-                  </label>
-                  <input
-                    type="text"
-                    value={newServerName}
-                    onChange={(e) => setNewServerName(e.target.value)}
-                    placeholder={`Survival Server #${servers.length + 1}`}
-                    className="w-full bg-surface-lowest border border-white/15 focus:border-primary rounded-xl px-3.5 py-2 text-xs text-white focus:outline-none"
-                  />
-                </div>
-
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="text-[11px] font-mono text-outline uppercase block mb-1">
-                      Server Engine &amp; Version
-                    </label>
-                    <select
-                      value={newServerEngine}
-                      onChange={(e) => setNewServerEngine(e.target.value)}
-                      className="w-full bg-surface-lowest border border-white/15 focus:border-primary rounded-xl px-3 py-2 text-xs text-white focus:outline-none"
-                    >
-                      <option value="PaperMC 1.21.4">PaperMC 1.21.4</option>
-                      <option value="PaperMC 1.20.4">PaperMC 1.20.4</option>
-                      <option value="Purpur 1.21.4">Purpur 1.21.4</option>
-                      <option value="Fabric 1.21.1">Fabric 1.21.1</option>
-                      <option value="Forge 1.20.1">Forge 1.20.1</option>
-                      <option value="Vanilla 1.21.4">Vanilla 1.21.4</option>
-                    </select>
-                  </div>
-
-                  <div>
-                    <label className="text-[11px] font-mono text-outline uppercase block mb-1">
-                      Port &amp; RAM (GB)
-                    </label>
-                    <div className="flex gap-2">
-                      <input
-                        type="number"
-                        value={newServerPort}
-                        onChange={(e) => setNewServerPort(Number(e.target.value))}
-                        className="w-1/2 bg-surface-lowest border border-white/15 rounded-xl px-2.5 py-2 text-xs font-mono text-white focus:outline-none"
-                      />
-                      <select
-                        value={newServerRamGb}
-                        onChange={(e) => setNewServerRamGb(Number(e.target.value))}
-                        className="w-1/2 bg-surface-lowest border border-white/15 rounded-xl px-2 py-2 text-xs font-mono text-white focus:outline-none"
-                      >
-                        <option value={2}>2 GB</option>
-                        <option value={4}>4 GB</option>
-                        <option value={6}>6 GB</option>
-                        <option value={8}>8 GB</option>
-                        <option value={12}>12 GB</option>
-                      </select>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="p-2.5 rounded-lg bg-surface-lowest border border-white/5 text-[11px] font-mono text-outline truncate">
-                  Install Path: <span className="text-primary">{previewPath}</span>
-                </div>
-
-                {isAtServerLimit && !isVerified ? (
-                  <div className="space-y-2">
-                    <button
-                      type="button"
-                      onClick={() => setVerifyBotPopupOpen(true)}
-                      className="w-full py-2.5 px-4 rounded-xl bg-[#5865F2] hover:bg-[#4752C4] text-white text-xs font-bold flex items-center justify-center gap-2 shadow-lg shadow-[#5865F2]/30 cursor-pointer transition-all"
-                    >
-                      <span className="material-symbols-outlined text-[18px]">verified</span>
-                      Limit (2/2) Reached — Verify Discord Bot to Setup 3+ Servers
-                    </button>
-                  </div>
-                ) : (
-                  <button
-                    type="submit"
-                    disabled={isDeploying}
-                    className="w-full py-2.5 px-4 rounded-xl bg-primary hover:opacity-95 text-on-primary-container text-xs font-bold flex items-center justify-center gap-2 shadow-lg shadow-primary/20 cursor-pointer transition-all"
-                  >
-                    <span className="material-symbols-outlined text-[18px]">add_circle</span>
-                    {isDeploying ? 'Installing Server...' : '+ Setup Server Now'}
-                  </button>
-                )}
-              </form>
-            </div>
-
-            {/* Quick Account & Session Card */}
-            <div className="rounded-2xl bg-surface-container border border-white/10 p-4 flex items-center justify-between gap-3">
-              <div className="flex items-center gap-3 min-w-0">
-                <img
-                  src={resolveUserAvatarUrl(currentUser.avatarUrl)}
-                  onError={(e) => {
-                    (e.currentTarget as HTMLImageElement).src = DEFAULT_PROFILE_ICON_URL;
-                  }}
-                  alt={currentUser.username}
-                  className="w-10 h-10 rounded-xl object-cover border border-primary/40 shrink-0 bg-surface"
-                />
-                <div className="min-w-0">
-                  <div className="text-xs font-bold text-white truncate">
-                    {currentUser.displayName} (@{currentUser.username})
-                  </div>
-                  <div className="text-[11px] text-outline truncate">{currentUser.email}</div>
-                </div>
-              </div>
-              <div className="flex items-center gap-2 shrink-0">
-                <button
-                  type="button"
-                  onClick={() => onOpenAuthModal('signin')}
-                  className="px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-xs font-semibold text-white cursor-pointer"
-                >
-                  Switch User
-                </button>
-                <button
-                  type="button"
-                  onClick={onSignOut}
-                  className="px-3 py-1.5 rounded-lg bg-error/15 hover:bg-error/25 text-xs font-semibold text-error cursor-pointer"
-                >
-                  Sign Out
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {/* Bottom Quick Navigation Bar into Full Panel Sections */}
-        <div className="rounded-2xl bg-surface-container border border-white/10 p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-          <div>
-            <div className="text-sm font-bold text-white">
-              Need Advanced Controls? Enter the Full Workstation Panel
-            </div>
-            <p className="text-xs text-outline">
-              Access real-time JVM flags, Modrinth/Spigot plugins, port forwarding, and global RAM controls.
-            </p>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <button
-              type="button"
-              onClick={() => onEnterFullPanel('setup_guide')}
-              className="px-3.5 py-2 rounded-xl bg-secondary/15 hover:bg-secondary/25 border border-secondary/35 text-xs font-bold text-secondary flex items-center gap-1.5 cursor-pointer"
-            >
-              <span className="material-symbols-outlined text-[16px]">school</span>
-              Setup Panel Guide
-            </button>
-            <button
-              type="button"
-              onClick={() => onEnterFullPanel('console')}
-              className="px-3.5 py-2 rounded-xl bg-surface-lowest hover:bg-white/10 border border-white/10 text-xs font-semibold text-white flex items-center gap-1.5 cursor-pointer"
-            >
-              <span className="material-symbols-outlined text-[16px] text-primary">terminal</span>
-              Live Console
-            </button>
-            <button
-              type="button"
-              onClick={() => onEnterFullPanel('plugins')}
-              className="px-3.5 py-2 rounded-xl bg-surface-lowest hover:bg-white/10 border border-white/10 text-xs font-semibold text-white flex items-center gap-1.5 cursor-pointer"
-            >
-              <span className="material-symbols-outlined text-[16px] text-secondary">
-                extension
+          {/* Subtle Quota Footer Note */}
+          {isAtServerLimit && !isVerified && (
+            <div className="p-4 rounded-xl bg-[#5865F2]/10 border border-[#5865F2]/35 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+              <span className="text-outline">
+                You have reached the standard <strong className="text-white">2-server limit</strong>
+                . Connect and verify with our Discord Bot to create up to 10 servers.
               </span>
-              Mods &amp; Plugins
-            </button>
-            <button
-              type="button"
-              onClick={() => onEnterFullPanel('panel_control')}
-              className="px-3.5 py-2 rounded-xl bg-surface-lowest hover:bg-white/10 border border-white/10 text-xs font-semibold text-white flex items-center gap-1.5 cursor-pointer"
-            >
-              <span className="material-symbols-outlined text-[16px] text-primary-gold">
-                admin_panel_settings
-              </span>
-              RAM &amp; Profile Control
-            </button>
-            <button
-              type="button"
-              onClick={() => onEnterFullPanel('overview')}
-              className="px-4 py-2 rounded-xl bg-primary hover:opacity-95 text-on-primary-container text-xs font-bold flex items-center gap-1.5 cursor-pointer"
-            >
-              <span>Enter Full Panel</span>
-              <span className="material-symbols-outlined text-[16px]">arrow_forward</span>
-            </button>
-          </div>
-        </div>
-      </div>
-
-      {/* Popup on clicking "Verify Discord Bot" button giving option to Join Discord */}
-      {verifyBotPopupOpen && (
-        <div
-          className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4"
-          onClick={() => setVerifyBotPopupOpen(false)}
-        >
-          <div
-            className="w-full max-w-md rounded-2xl bg-[#111726] border border-[#5865F2]/50 shadow-2xl overflow-hidden animate-in fade-in zoom-in-95 duration-150"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="px-5 py-4 bg-gradient-to-r from-[#5865F2]/25 to-surface border-b border-white/10 flex items-center justify-between">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-xl bg-[#5865F2] flex items-center justify-center text-white shadow-lg shadow-[#5865F2]/30">
-                  <span className="material-symbols-outlined text-[22px]">forum</span>
-                </div>
-                <div>
-                  <h3 className="text-sm font-bold text-white">
-                    Verify Discord Bot &amp; Join Discord
-                  </h3>
-                  <p className="text-[11px] text-outline">
-                    Unlock up to 10 servers by joining our Discord server
-                  </p>
-                </div>
-              </div>
               <button
                 type="button"
-                onClick={() => setVerifyBotPopupOpen(false)}
-                className="p-1 rounded-lg bg-white/5 hover:bg-white/10 text-outline hover:text-white cursor-pointer"
+                onClick={() => onOpenDiscordBotGate()}
+                className="px-3.5 py-2 rounded-lg bg-[#5865F2] hover:bg-[#4752C4] text-white font-bold shrink-0 cursor-pointer"
               >
-                <span className="material-symbols-outlined text-[18px]">close</span>
+                Verify Discord
               </button>
             </div>
-
-            <div className="p-5 space-y-4">
-              {/* Step 1: Option to Join Discord Server */}
-              <div className="p-4 rounded-xl bg-[#5865F2]/10 border border-[#5865F2]/35 space-y-3">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-bold text-white">
-                    Step 1: Join Official Discord Server
-                  </span>
-                  <span className="text-[10px] font-mono text-secondary">● Online</span>
-                </div>
-                <p className="text-xs text-outline leading-relaxed">
-                  Click the button below to join{' '}
-                  <strong className="text-white">
-                    {currentUser.discordGuildName || 'IS King Official Discord'}
-                  </strong>{' '}
-                  so our Discord Bot (<code className="text-primary">ISKingBot#4821</code>) can verify you.
-                </p>
-                <div className="flex items-center gap-2">
-                  <input
-                    type="text"
-                    value={discordInviteUrl}
-                    onChange={(e) => setDiscordInviteUrl(e.target.value)}
-                    className="flex-1 bg-surface-lowest border border-white/15 rounded-lg px-3 py-1.5 text-xs font-mono text-[#8ea1e1] focus:outline-none"
-                  />
-                </div>
-                <a
-                  href={discordInviteUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  onClick={() => {
-                    setHasClickedJoinDiscord(true);
-                    onShowToast(
-                      'Discord Invite Opened',
-                      `Joined ${discordInviteUrl}. Now click "Verify with Discord Bot" below!`,
-                      'info',
-                      'forum'
-                    );
-                  }}
-                  className="w-full py-2.5 px-4 rounded-xl bg-[#5865F2] hover:bg-[#4752C4] text-white text-xs font-bold flex items-center justify-center gap-2 shadow-lg shadow-[#5865F2]/30 cursor-pointer transition-all"
-                >
-                  <span className="material-symbols-outlined text-[18px]">group_add</span>
-                  {hasClickedJoinDiscord
-                    ? 'Joined Discord Server (Open Invite Again)'
-                    : 'Join Discord Server Now'}
-                </a>
-              </div>
-
-              {/* Step 2: Verify with Discord Bot */}
-              <div className="p-4 rounded-xl bg-surface-lowest border border-white/10 space-y-3">
-                <label className="text-xs font-bold text-white block">
-                  Step 2: Enter Discord Username &amp; Verify Bot
-                </label>
-                <input
-                  type="text"
-                  value={discordUsernameInput}
-                  onChange={(e) => setDiscordUsernameInput(e.target.value)}
-                  placeholder="Your Discord Tag (e.g. Mio_Sakura#0001)"
-                  className="w-full bg-surface border border-white/15 focus:border-primary rounded-lg px-3 py-2 text-xs font-mono text-white focus:outline-none"
-                />
-                <button
-                  type="button"
-                  disabled={isVerifyingInPopup}
-                  onClick={handlePopupVerifyDiscordBot}
-                  className="w-full py-2.5 px-4 rounded-xl bg-secondary hover:opacity-95 text-on-secondary-container text-xs font-bold flex items-center justify-center gap-2 shadow-lg shadow-secondary/20 cursor-pointer transition-all"
-                >
-                  <span className="material-symbols-outlined text-[18px]">verified</span>
-                  {isVerifyingInPopup
-                    ? 'Verifying with Discord Bot...'
-                    : 'Verify with Discord Bot (Unlock 10 Servers)'}
-                </button>
-              </div>
-
-              <div className="flex items-center justify-between pt-1">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setVerifyBotPopupOpen(false);
-                    onOpenDiscordBotGate();
-                  }}
-                  className="text-xs font-mono text-primary hover:underline cursor-pointer"
-                >
-                  Open Advanced Bot Console →
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setVerifyBotPopupOpen(false)}
-                  className="px-4 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-xs text-outline hover:text-white cursor-pointer"
-                >
-                  Close
-                </button>
-              </div>
-            </div>
-          </div>
+          )}
         </div>
-      )}
+      </main>
+
+      {/* Enhanced install dialog: live engine → version → build, EULA, PC folder picker */}
+      <ServerInstallModal
+        isOpen={createModalOpen}
+        defaultRoot={serverInstallRootDir}
+        serverCount={servers.length}
+        maxLimit={maxServerLimit}
+        isSuperAdmin={isSuperAdmin}
+        discordVerified={isVerified}
+        username={currentUser.username}
+        onClose={() => setCreateModalOpen(false)}
+        onInstalled={handleServerInstalled}
+        onLimitReached={(attemptedName) => {
+          setCreateModalOpen(false);
+          onOpenDiscordBotGate(attemptedName);
+          onShowToast(
+            '2-Server Limit Reached — Verify Discord',
+            `Could not install ${attemptedName || 'the server'}. Standard users can set up 1 or 2 servers only.`,
+            'warning',
+            'forum',
+          );
+        }}
+        onShowToast={onShowToast}
+      />
+
     </div>
   );
 };

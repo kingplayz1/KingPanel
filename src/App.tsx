@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   NavSection,
   ServerInstance,
@@ -12,7 +12,6 @@ import {
   ConnectedPlayer,
   FileItem,
   PluginItem,
-  PortRule,
   SnapshotItem,
   CronTask,
   AuthUser,
@@ -20,11 +19,11 @@ import {
 } from './types';
 import {
   INITIAL_SERVERS,
+  EMPTY_SERVER_PLACEHOLDER,
   INITIAL_CONSOLE_LOGS,
   INITIAL_PLAYERS,
   INITIAL_FILES,
   INITIAL_PLUGINS,
-  INITIAL_PORTS,
   INITIAL_SNAPSHOTS,
   INITIAL_CRONS,
 } from './data/initialData';
@@ -48,8 +47,15 @@ import { NotFound404View } from './views/NotFound404View';
 import { PanelControlView } from './views/PanelControlView';
 import { PanelErrorBoundary } from './components/PanelErrorBoundary';
 import { DiscordBotGateModal } from './components/DiscordBotGateModal';
+import { usePanelAccess } from './hooks/usePanelAccess';
 import { SimplePrePanel } from './components/SimplePrePanel';
+import { SimpleServerPanel } from './components/SimpleServerPanel';
+import ProviderConnectionsPanel from './components/ProviderConnectionsPanel';
 import { SetupPanelGuideView } from './views/SetupPanelGuideView';
+import AccountSecurityPanel from './components/AccountSecurityPanel';
+import SessionManagementPanel from './components/SessionManagementPanel';
+import { DesktopCloseModal } from './components/DesktopCloseModal';
+import { submitJob } from './lib/jobs';
 
 export default function App() {
   const [activeSection, setActiveSection] = useState<NavSection>(() => {
@@ -67,16 +73,18 @@ export default function App() {
   const [globalRamCapGb, setGlobalRamCapGb] = useState<number>(28);
   const [serverInstallRootDir, setServerInstallRootDir] = useState<string>('C:\\KingServers');
   const [servers, setServers] = useState<ServerInstance[]>(INITIAL_SERVERS);
-  const [activeServerId, setActiveServerId] = useState<string>(INITIAL_SERVERS[0].id);
+  const [activeServerId, setActiveServerId] = useState<string>(
+    INITIAL_SERVERS[0]?.id ?? EMPTY_SERVER_PLACEHOLDER.id
+  );
   const [logs, setLogs] = useState<ConsoleLogLine[]>(INITIAL_CONSOLE_LOGS);
   const [players, setPlayers] = useState<ConnectedPlayer[]>(INITIAL_PLAYERS);
   const [files, setFiles] = useState<FileItem[]>(INITIAL_FILES);
   const [plugins, setPlugins] = useState<PluginItem[]>(INITIAL_PLUGINS);
-  const [ports, setPorts] = useState<PortRule[]>(INITIAL_PORTS);
   const [snapshots, setSnapshots] = useState<SnapshotItem[]>(INITIAL_SNAPSHOTS);
   const [crons, setCrons] = useState<CronTask[]>(INITIAL_CRONS);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [isMinimized, setIsMinimized] = useState(false);
+  const [isMaximized, setIsMaximized] = useState(false);
   const [selectedFileId, setSelectedFileId] = useState<string | null>(null);
   const [pluginSearchQuery, setPluginSearchQuery] = useState<string>('');
   const [currentUser, setCurrentUser] = useState<AuthUser | null>(() => {
@@ -90,13 +98,29 @@ export default function App() {
   const [authModalOpen, setAuthModalOpen] = useState(false);
   const [authModalMode, setAuthModalMode] = useState<'signin' | 'signup'>('signin');
   const [hasEnteredFullPanel, setHasEnteredFullPanel] = useState<boolean>(false);
+  // 'simple' renders the clean per-server page (no desktop title bar);
+  // 'advanced' opens the full workstation shell with sidebar + views.
+  const [panelMode, setPanelMode] = useState<'simple' | 'advanced'>('simple');
   const [discordBotGateOpen, setDiscordBotGateOpen] = useState<boolean>(false);
+  const [discordGatePurpose, setDiscordGatePurpose] = useState<'limit' | 'advanced'>('limit');
+  const [exitConfirmOpen, setExitConfirmOpen] = useState(false);
   const [discordBotAttemptedServerName, setDiscordBotAttemptedServerName] = useState<
     string | undefined
   >(undefined);
   const [paperMcReport, setPaperMcReport] = useState<PaperMCServiceReport | null>(null);
+  // Delete confirmation dialog state
+  const [deleteTarget, setDeleteTarget] = useState<ServerInstance | null>(null);
+  const [deleteServerFiles, setDeleteServerFiles] = useState(true);
+  const [deletingServer, setDeletingServer] = useState(false);
 
-  const activeServer = servers.find((s) => s.id === activeServerId) || servers[0];
+  const activeServer =
+    servers.find((s) => s.id === activeServerId) || servers[0] || EMPTY_SERVER_PLACEHOLDER;
+
+  // Every section opens at the top of its own workspace, not where the last one was left.
+  const workspaceScrollRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    workspaceScrollRef.current?.scrollTo({ top: 0, behavior: 'auto' });
+  }, [activeSection, activeServer.id]);
 
   const showToast = useCallback(
     (
@@ -113,6 +137,121 @@ export default function App() {
     },
     []
   );
+
+  // The backend is the authority for panel access; this only mirrors it.
+  const {
+    access: panelAccess,
+    loading: panelAccessLoading,
+    error: panelAccessError,
+    sessionExpired,
+    refresh: refreshPanelAccess,
+  } = usePanelAccess(currentUser?.id);
+  const advancedPanelAllowed = panelAccess?.panels.advanced.allowed === true;
+
+  // A session cookie that is gone (or expired) invalidates the cached profile,
+  // so drop back to the login gate instead of showing a half-working panel.
+  useEffect(() => {
+    if (!sessionExpired || !currentUser) return;
+    setCurrentUser(null);
+    setHasEnteredFullPanel(false);
+    setPanelMode('simple');
+    try {
+      localStorage.removeItem('king_panel_auth_user');
+    } catch {
+      // ignore storage errors
+    }
+    showToast(
+      'Session Expired',
+      'Sign in again to keep managing your servers.',
+      'warning',
+      'lock_clock'
+    );
+  }, [sessionExpired, currentUser, showToast]);
+
+  // Keep the profile badge and server limit in step with the authoritative
+  // access payload (for example after an app restart or a Discord role change).
+  useEffect(() => {
+    if (!panelAccess || !currentUser) return;
+    const verified =
+      panelAccess.discord.guildMember && panelAccess.discord.requiredRolePresent;
+    if (
+      Boolean(currentUser.discordVerified) === verified &&
+      currentUser.maxServerLimit === panelAccess.user.maxServerLimit
+    ) {
+      return;
+    }
+    const merged: AuthUser = {
+      ...currentUser,
+      discordVerified: verified,
+      discordMemberStatus: verified
+        ? 'verified_in_guild'
+        : panelAccess.discord.linked
+          ? 'left_guild'
+          : 'not_connected',
+      discordUserId: panelAccess.discord.discordUserId || currentUser.discordUserId,
+      discordUsername: panelAccess.discord.username || currentUser.discordUsername,
+      maxServerLimit: panelAccess.user.maxServerLimit,
+    };
+    setCurrentUser(merged);
+    try {
+      localStorage.setItem('king_panel_auth_user', JSON.stringify(merged));
+    } catch {
+      // ignore storage errors
+    }
+  }, [panelAccess, currentUser]);
+
+  // Losing the Discord entitlement while the Advanced Panel is open moves the
+  // operator back to the Simple Panel without hiding their servers.
+  useEffect(() => {
+    if (!currentUser || !panelAccess) return;
+    if (panelMode === 'advanced' && !advancedPanelAllowed) {
+      setPanelMode('simple');
+      showToast(
+        'Advanced Panel Locked',
+        panelAccess.panels.advanced.message,
+        'warning',
+        'lock'
+      );
+    }
+  }, [currentUser, panelAccess, advancedPanelAllowed, panelMode, showToast]);
+
+  /**
+   * Single entry point for switching views. Advanced mode is refused here and
+   * re-checked by Express on every advanced operation.
+   */
+  const handleEnterPanel = (
+    targetSection: Parameters<typeof setActiveSection>[0] = 'overview',
+    selectedServer?: ServerInstance,
+    mode: 'simple' | 'advanced' = 'advanced'
+  ) => {
+    if (mode === 'advanced' && !advancedPanelAllowed) {
+      setDiscordBotAttemptedServerName(undefined);
+      setDiscordGatePurpose('advanced');
+      setDiscordBotGateOpen(true);
+      showToast(
+        'Advanced Panel Requires Discord Verification',
+        panelAccess?.panels.advanced.message ||
+          'Link Discord, join the official server and complete verification first.',
+        'warning',
+        'lock'
+      );
+      return;
+    }
+    if (selectedServer) {
+      setActiveServerId(selectedServer.id);
+    }
+    setActiveSection(targetSection);
+    setPanelMode(mode);
+    setHasEnteredFullPanel(true);
+    showToast(
+      mode === 'simple' ? 'Simple Panel Opened' : 'Entered Full Workstation Panel',
+      mode === 'simple'
+        ? `Live status, power controls and console for ${(selectedServer || activeServer).name}.`
+        : `Loaded ${(selectedServer || activeServer).name} in full control workspace.`,
+      'info',
+      mode === 'simple' ? 'terminal' : 'dashboard'
+    );
+  };
 
   const getNowTime = () => {
     const now = new Date();
@@ -189,14 +328,17 @@ export default function App() {
     [servers, showToast]
   );
 
+  // Signed-out clients must not poll: every backend endpoint requires a session,
+  // so an interval started before sign-in only produces 401s.
   useEffect(() => {
+    if (!currentUser) return;
     syncPaperMcBackgroundCheck(false);
     const interval = setInterval(() => {
       syncPaperMcBackgroundCheck(false);
     }, 45_000);
     return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [currentUser]);
 
   const handleUpgradeServerEngine = async (serverId: string | 'ALL') => {
     try {
@@ -285,29 +427,43 @@ export default function App() {
       });
   }, []);
 
-  // Subtle live hardware telemetry micro-fluctuation while running
-  useEffect(() => {
-    const interval = setInterval(() => {
-      setServers((prev) =>
-        prev.map((srv) => {
-          if (srv.status !== 'running') return srv;
-          const cpuDelta = Math.floor(Math.random() * 5) - 2;
-          const nextCpu = Math.max(4, Math.min(92, srv.cpuUsage + cpuDelta));
-          const tempDelta = Number(((Math.random() - 0.48) * 0.4).toFixed(1));
-          const nextTemp = Number(Math.max(38, Math.min(76, srv.cpuTemp + tempDelta)).toFixed(1));
-          const tickDelta = Number(((Math.random() - 0.5) * 0.3).toFixed(1));
-          const nextTick = Number(Math.max(1.2, Math.min(14.5, srv.tickMs + tickDelta)).toFixed(1));
-          return {
-            ...srv,
-            cpuUsage: nextCpu,
-            cpuTemp: nextTemp,
-            tickMs: nextTick,
-          };
-        })
+  // Snapshots shown in the advanced views are the archives on disk. Reload them
+  // from the backend instead of keeping a local copy that drifts from reality.
+  const loadSnapshots = useCallback(async (srv: ServerInstance) => {
+    try {
+      const res = await fetch(
+        `/api/backups/realtime?serverId=${encodeURIComponent(srv.id)}&serverName=${encodeURIComponent(srv.name)}`
       );
-    }, 3200);
-    return () => clearInterval(interval);
+      const data = await res.json();
+      if (!data?.ok) return;
+      const mapped: SnapshotItem[] = (data.snapshots || []).map((rec: Record<string, unknown>) => ({
+        id: String(rec.id),
+        title: String(rec.title),
+        badge: String(rec.badge),
+        badgeType: (rec.badgeType as SnapshotItem['badgeType']) || 'neutral',
+        verified: Boolean(rec.verified),
+        pinned: Boolean(rec.pinned),
+        timestamp: rec.timestamp ? new Date(String(rec.timestamp)).toLocaleString() : '',
+        size: String(rec.size || ''),
+        note: rec.note ? String(rec.note) : undefined,
+        scopes: Array.isArray(rec.scopes) ? (rec.scopes as string[]) : [],
+        destination: String(rec.filePath || ''),
+        sha: rec.sha256 ? String(rec.sha256) : undefined,
+        icon: String(rec.icon || 'archive'),
+        iconColor: String(rec.iconColor || 'bg-primary/15 text-primary'),
+        serverId: rec.serverId ? String(rec.serverId) : undefined,
+      }));
+      setSnapshots(mapped);
+    } catch {
+      // backend restarting — keep the last known list
+    }
   }, []);
+
+  // Keep the advanced Backups view pointed at the real archives folder.
+  useEffect(() => {
+    void loadSnapshots(activeServer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeServer.id, loadSnapshots]);
 
   const handleSelectServer = (srv: ServerInstance) => {
     setActiveServerId(srv.id);
@@ -319,226 +475,373 @@ export default function App() {
     );
   };
 
+  // Poll the real supervisor until the process reaches a terminal state after a
+  // power action. Status, logs and toasts reflect REAL backend outcomes — no
+  // locally simulated results.
+  const awaitServerSettled = async (
+    srv: ServerInstance,
+    action: 'restart' | 'stop' | 'kill' | 'start'
+  ) => {
+    const limitMs = action === 'start' || action === 'restart' ? 300_000 : 60_000;
+    const startedAt = Date.now();
+    const applyStatus = (
+      status: 'running' | 'restarting' | 'stopped',
+      extra: Partial<ServerInstance> = {}
+    ) =>
+      setServers((prev) => prev.map((s) => (s.id === srv.id ? { ...s, ...extra, status } : s)));
+
+    while (Date.now() - startedAt < limitMs) {
+      await new Promise((r) => setTimeout(r, 1200));
+      try {
+        const res = await fetch(
+          `/api/server-runtime/live-state?serverId=${encodeURIComponent(srv.id)}&serverName=${encodeURIComponent(
+            srv.name
+          )}&engine=${encodeURIComponent(srv.engine)}&port=${srv.port}&ramMaxGb=${srv.ramMaxGb}`
+        );
+        const data = await res.json();
+        if (!res.ok || !data?.ok) continue;
+
+        if (data.status === 'running') {
+          applyStatus('running', {
+            pid: data.pid ?? srv.pid,
+            uptime: data.uptimeFormatted ?? srv.uptime,
+            cpuUsage: Math.round(data.cpuUsagePct ?? 0),
+            ramUsedGb: data.ramUsedGb ?? srv.ramUsedGb,
+          });
+          addLog({
+            level: 'INFO',
+            text: `Server is ONLINE — PID ${data.pid ?? 'n/a'}, uptime ${data.uptimeFormatted}${
+              data.adopted ? ' (reattached after app restart)' : ''
+            }.`,
+          });
+          showToast(
+            'Server Online',
+            `${srv.name} is running (PID ${data.pid ?? 'n/a'}).`,
+            'success',
+            'check_circle'
+          );
+          return;
+        }
+        if (data.status === 'restarting') continue; // transitional — keep polling
+
+        // Terminal: the process is not running
+        applyStatus('stopped', { cpuUsage: 0, tps: 0 });
+        if (data.crashed) {
+          addLog({
+            level: 'ERROR',
+            text: `[KingDaemon] Server process exited unexpectedly (code ${
+              data.lastExitCode ?? 'unknown'
+            })${data.lastExitReason ? ` — ${data.lastExitReason}` : ''}.`,
+            highlightBox: 'error',
+          });
+          showToast(
+            'Server Crashed',
+            `${srv.name} exited (code ${data.lastExitCode ?? 'unknown'}). Check the console/logs.`,
+            'error',
+            'error'
+          );
+        } else if (action === 'start') {
+          addLog({
+            level: 'ERROR',
+            text: `[KingDaemon] Server failed to start${data.lastExitReason ? `: ${data.lastExitReason}` : ''}.`,
+            highlightBox: 'error',
+          });
+          showToast(
+            'Server Did Not Start',
+            data.lastExitReason || 'The process exited before it was ready.',
+            'error',
+            'error'
+          );
+        } else {
+          addLog({ level: 'INFO', text: `[KingDaemon] Process exited — ${srv.name} is stopped.` });
+          showToast('Server Stopped', `${srv.name} has been stopped.`, 'info', 'stop_circle');
+        }
+        return;
+      } catch {
+        // transient polling error — retry until the deadline
+      }
+    }
+    addLog({
+      level: 'WARN',
+      text: `[KingDaemon] No terminal state after ${Math.round(limitMs / 1000)}s — check the console tab for progress.`,
+      highlightBox: 'warn',
+    });
+    showToast('Still Waiting', `${srv.name} has not reached a final state yet.`, 'warning', 'hourglass_empty');
+  };
+
   const handleServerAction = (action: 'restart' | 'stop' | 'kill' | 'start') => {
-    if (action === 'restart') {
-      setServers((prev) =>
-        prev.map((s) => (s.id === activeServer.id ? { ...s, status: 'restarting' } : s))
-      );
-      addLog({
-        level: 'WARN',
-        text: '[KingDaemon] Saving chunks (/save-all flush) & initiating graceful JVM restart...',
-        highlightBox: 'warn',
-      });
-      showToast(
-        'Graceful Restart Initiated',
-        `Flushing region chunks for ${activeServer.name}...`,
-        'warning',
-        'restart_alt'
-      );
-      setTimeout(() => {
-        setServers((prev) =>
-          prev.map((s) =>
-            s.id === activeServer.id ? { ...s, status: 'running', uptime: '0h 01m' } : s
-          )
-        );
-        addLog({
-          level: 'INFO',
-          text: `Done (1.842s)! PaperMC ${activeServer.build} listening on 0.0.0.0:${activeServer.port}`,
+    const srv = activeServer;
+    if (!srv || srv.id === 'no-server') {
+      showToast('No Server Selected', 'Create or import a server first.', 'warning', 'add_circle');
+      return;
+    }
+    const previousStatus = srv.status;
+    const requestLines: Record<string, string> = {
+      start: '[KingDaemon] Start requested — spawning the real server process...',
+      stop: '[KingDaemon] Graceful stop requested (stdin: stop) — waiting for process exit...',
+      kill: '[KingDaemon] Force-kill requested — terminating the process tree...',
+      restart: '[KingDaemon] Restart requested — graceful stop, then start...',
+    };
+    setServers((prev) => prev.map((s) => (s.id === srv.id ? { ...s, status: 'restarting' } : s)));
+    addLog({ level: 'INFO', text: requestLines[action] });
+
+    (async () => {
+      try {
+        const res = await fetch('/api/server-runtime/power', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            serverId: srv.id,
+            serverName: srv.name,
+            engine: srv.engine,
+            port: srv.port,
+            ramMaxGb: srv.ramMaxGb,
+            action,
+          }),
         });
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data?.ok) {
+          const message = data?.error || `Backend refused '${action}'`;
+          setServers((prev) =>
+            prev.map((s) => (s.id === srv.id ? { ...s, status: previousStatus } : s))
+          );
+          addLog({ level: 'ERROR', text: `[KingDaemon] ${action} failed: ${message}`, highlightBox: 'error' });
+          showToast('Action Failed', message, 'error', 'error');
+          return;
+        }
+        await awaitServerSettled(srv, action);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Could not reach the local backend';
+        setServers((prev) => prev.map((s) => (s.id === srv.id ? { ...s, status: previousStatus } : s)));
+        addLog({ level: 'ERROR', text: `[KingDaemon] ${action} failed: ${message}`, highlightBox: 'error' });
+        showToast('Action Failed', message, 'error', 'error');
+      }
+    })();
+  };
+
+  const handleCreateSnapshot = async (tag: string, pinned: boolean, scopes: string[]) => {
+    const target = activeServer;
+    if (!target) return;
+    try {
+      const outcome = await submitJob<Record<string, any>>('/api/backups/create', {
+        serverId: target.id,
+        serverName: target.name,
+        title: tag || 'manual-checkpoint',
+        scopes,
+      });
+      const data = (outcome.result || {}) as Record<string, any>;
+      if (!outcome.ok) {
         showToast(
-          'Server Back Online',
-          `${activeServer.name} restarted cleanly at 20.0 TPS.`,
-          'success',
-          'check_circle'
+          'Backup failed',
+          outcome.error || 'Could not write the archive',
+          'error',
+          'error'
         );
-      }, 1800);
-    } else if (action === 'stop') {
-      setServers((prev) =>
-        prev.map((s) =>
-          s.id === activeServer.id ? { ...s, status: 'stopped', cpuUsage: 0, tps: 0 } : s
-        )
-      );
-      addLog({
-        level: 'WARN',
-        text: '[Server] Stopping server... Saving players and region files.',
-        highlightBox: 'warn',
-      });
-      showToast('Server Stopped', `${activeServer.name} has been gracefully stopped.`, 'info', 'stop_circle');
-    } else if (action === 'kill') {
-      setServers((prev) =>
-        prev.map((s) =>
-          s.id === activeServer.id ? { ...s, status: 'stopped', cpuUsage: 0, tps: 0 } : s
-        )
-      );
-      addLog({
-        level: 'ERROR',
-        text: `[SIGKILL] Process PID ${activeServer.pid} terminated immediately by Operator.`,
-        highlightBox: 'error',
-      });
-      showToast(
-        'Process Force Killed (SIGKILL)',
-        `Terminated PID ${activeServer.pid} immediately.`,
-        'error',
-        'bolt'
-      );
-    } else if (action === 'start') {
-      setServers((prev) =>
-        prev.map((s) =>
-          s.id === activeServer.id
-            ? { ...s, status: 'running', tps: 20.0, cpuUsage: 22 }
-            : s
-        )
-      );
+        return;
+      }
+      if (pinned && data.snapshot?.id) {
+        await fetch('/api/backups/pin', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ serverId: target.id, serverName: target.name, id: data.snapshot.id }),
+        });
+      }
       addLog({
         level: 'INFO',
-        text: `Starting ${activeServer.engine} on port ${activeServer.port} (Aikar's G1GC Flags)...`,
+        text: `[Backup] Created archive ${data.archive?.name} (${Math.round(
+          (Number(data.archive?.sizeBytes) || 0) / 1024 / 1024
+        )} MB) for ${target.name}.`,
       });
       showToast(
-        'Server Started',
-        `${activeServer.name} is now online and accepting connections.`,
+        'Backup created',
+        `${data.archive?.name || 'archive'} written to ${target.name}/backups`,
         'success',
-        'play_arrow'
+        'archive'
       );
+      await loadSnapshots(target);
+    } catch (err) {
+      showToast('Backup failed', err instanceof Error ? err.message : 'Backend unreachable', 'error', 'error');
     }
   };
 
-  const handleCreateSnapshot = (tag: string, pinned: boolean, scopes: string[]) => {
-    const newSnap: SnapshotItem = {
-      id: `snap-${Date.now()}`,
-      title: tag || 'Manual Hot-Snapshot Checkpoint',
-      badge: pinned ? 'Pinned Long-Term' : 'Latest Point',
-      badgeType: pinned ? 'gold' : 'primary',
-      verified: true,
-      pinned,
-      timestamp: 'Just now (0m ago)',
-      size: '2.12 GB',
-      note: '(zstd compressed at 420 MB/s)',
-      scopes: scopes.length > 0 ? scopes : ['World', 'Nether', 'End', 'Plugins'],
-      destination: 'NVMe FastPipe + S3',
-      sha: 'SHA: 4c8e...f91a',
-      icon: pinned ? 'keep' : 'bolt',
-      iconColor: pinned ? 'bg-primary-gold/10 text-primary-gold' : 'bg-primary/10 text-primary',
-    };
-    setSnapshots((prev) => [newSnap, ...prev]);
-    addLog({
-      level: 'INFO',
-      text: `[ZSTD-Backup] Created hot-snapshot "${newSnap.title}" (2.12 GB) in 4.1s.`,
-    });
-    showToast(
-      'Zero-Downtime Snapshot Created',
-      `Archived "${newSnap.title}" (2.12 GB ZSTD).`,
-      'success',
-      'cloud_done'
-    );
-  };
-
-  const handleTogglePinSnapshot = (id: string) => {
-    setSnapshots((prev) =>
-      prev.map((snap) => {
-        if (snap.id !== id) return snap;
-        const nextPin = !snap.pinned;
-        showToast(
-          nextPin ? 'Snapshot Pinned' : 'Snapshot Unpinned',
-          `${snap.title} ${nextPin ? 'exempt from auto-prune' : 'returned to standard rotation'}.`,
-          'info',
-          'keep'
-        );
-        return {
-          ...snap,
-          pinned: nextPin,
-          badge: nextPin ? 'Pinned Long-Term' : 'Checkpoint',
-          badgeType: nextPin ? 'gold' : 'neutral',
-        };
-      })
-    );
-  };
-
-  const handleSaveFileContent = (fileId: string, content: string) => {
-    const updateTree = (items: FileItem[]): FileItem[] =>
-      items.map((item) => {
-        if (item.id === fileId) {
-          return { ...item, content };
-        }
-        if (item.children) {
-          return { ...item, children: updateTree(item.children) };
-        }
-        return item;
+  const handleTogglePinSnapshot = async (id: string) => {
+    const target = activeServer;
+    if (!target) return;
+    try {
+      const res = await fetch('/api/backups/pin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ serverId: target.id, serverName: target.name, id }),
       });
-    setFiles((prev) => updateTree(prev));
+      const data = await res.json();
+      if (!data?.ok) {
+        showToast('Pin failed', data?.error, 'error', 'keep');
+        return;
+      }
+      await loadSnapshots(target);
+      showToast('Snapshot pin updated', 'Pinned archives are kept out of rotation.', 'info', 'keep');
+    } catch (err) {
+      showToast('Pin failed', err instanceof Error ? err.message : 'Backend unreachable', 'error', 'keep');
+    }
   };
 
-  const handleCreateFile = (name: string, content: string) => {
-    const newFile: FileItem = {
-      id: `f-${Date.now()}`,
-      name,
-      path: `${activeServer.path}\\${name}`,
-      type: 'file',
-      size: '0.4 KB',
-      permissions: 'rw-r--r--',
-      icon: 'description',
-      iconColor: 'text-primary',
-      language: name.endsWith('.yml') ? 'yaml' : 'text',
-      content,
-    };
-    setFiles((prev) => [...prev, newFile]);
+  // The palette searches real filenames from the instance folder.
+  const refreshFileIndex = useCallback(async () => {
+    try {
+      const res = await fetch(
+        `/api/server-runtime/files?serverId=${encodeURIComponent(
+          activeServer.id
+        )}&serverName=${encodeURIComponent(activeServer.name)}&path=.`
+      );
+      const data = await res.json();
+      if (!data?.ok || !Array.isArray(data.entries)) return;
+      const mapped: FileItem[] = data.entries.map(
+        (e: { name: string; isDir: boolean; sizeBytes: number; modifiedAt: string }) => ({
+          id: e.name,
+          name: e.name,
+          path: `${activeServer.path}/${e.name}`,
+          type: e.isDir ? 'folder' : 'file',
+          size: e.isDir
+            ? undefined
+            : e.sizeBytes < 1024
+              ? `${e.sizeBytes} B`
+              : e.sizeBytes < 1048576
+                ? `${(e.sizeBytes / 1024).toFixed(1)} KB`
+                : `${(e.sizeBytes / 1048576).toFixed(1)} MB`,
+          icon: e.isDir ? 'folder' : 'description',
+          iconColor: e.isDir ? 'text-primary' : 'text-on-surface-variant',
+          modifiedAt: e.modifiedAt,
+        })
+      );
+      setFiles(mapped);
+    } catch {
+      // backend restarting — keep the last known listing
+    }
+  }, [activeServer.id, activeServer.name, activeServer.path]);
+
+  useEffect(() => {
+    void refreshFileIndex();
+  }, [refreshFileIndex]);
+
+  // Registry packages are installed for real: the backend downloads the jar into
+  // the instance's plugins/ or mods/ folder and reports the bytes written.
+  const installRegistryPackage = async (
+    plugin: PluginItem
+  ): Promise<{ ok: boolean; versionNumber?: string; filename?: string; error?: string }> => {
+    const slug = plugin.id.startsWith('live-') ? plugin.id.slice(5) : '';
+    if (!slug) {
+      return {
+        ok: false,
+        error: `${plugin.name} has no Modrinth project id — only registry packages can be downloaded.`,
+      };
+    }
+    try {
+      const res = await fetch('/api/marketplace/install', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          serverId: activeServer.id,
+          serverName: activeServer.name,
+          slug,
+          projectType: plugin.category.toLowerCase().includes('plugin') ? 'plugin' : 'mod',
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data?.ok) {
+        return { ok: false, error: String(data?.error || 'Backend refused the download') };
+      }
+      await refreshFileIndex();
+      return {
+        ok: true,
+        versionNumber: String(data.versionNumber || ''),
+        filename: String(data.filename || ''),
+      };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : 'Backend unreachable' };
+    }
   };
 
-  const handleUpdatePlugin = (pluginId: string) => {
-    setPlugins((prev) =>
-      prev.map((p) => {
-        if (p.id !== pluginId) return p;
-        const updatedVer = p.targetVersion || p.version;
-        showToast(
-          `Updated ${p.name}`,
-          `Hot-swapped JAR to ${updatedVer} via FastPipe loader.`,
-          'success',
-          'published_with_changes'
-        );
-        return {
-          ...p,
-          version: `${updatedVer} Installed`,
-          status: 'installed',
-        };
-      })
-    );
-  };
-
-  const handleUpdateAllPlugins = () => {
+  const handleUpdatePlugin = async (pluginId: string) => {
+    const plugin = plugins.find((p) => p.id === pluginId);
+    if (!plugin) return;
+    const result = await installRegistryPackage(plugin);
+    if (!result.ok) {
+      showToast('Update failed', result.error || 'Download failed', 'error', 'error');
+      return;
+    }
     setPlugins((prev) =>
       prev.map((p) =>
-        p.status === 'update_ready'
-          ? {
-              ...p,
-              version: `${p.targetVersion || p.version} Installed`,
-              status: 'installed',
-            }
+        p.id === pluginId
+          ? { ...p, version: `${result.versionNumber} Installed`, status: 'installed' }
+          : p
+      )
+    );
+    addLog({
+      level: 'INFO',
+      text: `[Marketplace] Updated ${plugin.name} to ${result.versionNumber} (${result.filename}) in ${activeServer.name}`,
+    });
+    showToast(
+      `Updated ${plugin.name}`,
+      `${result.filename} written to the server folder. Restart to load it.`,
+      'success',
+      'published_with_changes'
+    );
+  };
+
+  const handleUpdateAllPlugins = async () => {
+    const targets = plugins.filter((p) => p.status === 'update_ready');
+    if (!targets.length) {
+      showToast('Nothing to update', 'No registry package is flagged as outdated.', 'info', 'info');
+      return;
+    }
+    const updated: Record<string, string> = {};
+    for (const plugin of targets) {
+      const result = await installRegistryPackage(plugin);
+      if (result.ok) {
+        updated[plugin.id] = result.versionNumber || '';
+      } else {
+        addLog({
+          level: 'ERROR',
+          text: `[Marketplace] ${plugin.name}: ${result.error || 'download failed'}`,
+        });
+      }
+    }
+    const count = Object.keys(updated).length;
+    setPlugins((prev) =>
+      prev.map((p) =>
+        updated[p.id] !== undefined ? { ...p, version: `${updated[p.id]} Installed`, status: 'installed' } : p
+      )
+    );
+    showToast(
+      count ? `Updated ${count} package(s)` : 'Update failed',
+      count
+        ? 'Downloaded into the server folder. Restart the server to load them.'
+        : 'Every download failed — see the console log for the backend error.',
+      count ? 'success' : 'error',
+      count ? 'done_all' : 'error'
+    );
+  };
+
+  const handleInstallPlugin = async (pluginId: string) => {
+    const plugin = plugins.find((p) => p.id === pluginId);
+    if (!plugin) return;
+    const result = await installRegistryPackage(plugin);
+    if (!result.ok) {
+      showToast('Install failed', result.error || 'Download failed', 'error', 'error');
+      return;
+    }
+    setPlugins((prev) =>
+      prev.map((p) =>
+        p.id === pluginId
+          ? { ...p, status: 'installed', version: `${result.versionNumber} Installed` }
           : p
       )
     );
     showToast(
-      'All Plugins Updated',
-      'Patched all pending plugin JARs with SHA-256 verification.',
+      `Installed ${plugin.name}`,
+      `${result.filename} written to the server folder. Restart to load it.`,
       'success',
-      'done_all'
-    );
-  };
-
-  const handleInstallPlugin = (pluginId: string) => {
-    setPlugins((prev) =>
-      prev.map((p) => {
-        if (p.id !== pluginId) return p;
-        showToast(
-          `Installed ${p.name}`,
-          `Downloaded ${p.version} into /plugins/ directory.`,
-          'success',
-          'download_done'
-        );
-        return {
-          ...p,
-          status: 'installed',
-          version: `${p.version} Installed`,
-        };
-      })
+      'download_done'
     );
   };
 
@@ -551,189 +854,315 @@ export default function App() {
     });
     addLog({
       level: 'INFO',
-      text: `[FastPipe] Hot-loaded live artifact ${newPlugin.footerLeft} (${newPlugin.name}) into server classpath.`,
+      text: `[Marketplace] ${newPlugin.name} ${newPlugin.version} is installed in ${activeServer.name}`,
     });
   };
 
-  const handleUpdateServerEngine = (
+  // Real engine swap: the backend downloads the requested server jar straight
+  // into the instance folder and reports the bytes it wrote.
+  const handleUpdateServerEngine = async (
     engineLabel: string,
     buildLabel: string,
-    jarFilename: string
+    jarFilename: string,
+    build?: { downloadUrl: string; filename: string; build: string | number }
   ) => {
-    setServers((prev) =>
-      prev.map((s) =>
-        s.id === activeServer.id
-          ? {
-              ...s,
-              engine: engineLabel,
-              build: buildLabel,
-            }
-          : s
-      )
-    );
-    handleCreateFile(
-      jarFilename,
-      `# Official Server Runtime Binary Artifact\n# Engine: ${engineLabel} (${buildLabel})\n# Verified SHA-256`
-    );
-    addLog({
-      level: 'INFO',
-      text: `[EngineManager] Fetched and mounted ${jarFilename} (${engineLabel} ${buildLabel}) as primary server.jar.`,
-    });
-  };
-
-  const handleAddPort = (rule: PortRule) => {
-    setPorts((prev) => [...prev, rule]);
-    addLog({
-      level: 'UPnP',
-      text: `Mapped external ${rule.proto} port ${rule.port} -> internal ${rule.port} (${rule.serviceName})`,
-    });
-  };
-
-  const handleDeletePort = (portNum: number) => {
-    setPorts((prev) => prev.filter((p) => p.port !== portNum));
-    showToast(
-      `Port :${portNum} Unmapped`,
-      `Removed UPnP IGDv2 lease and Windows Defender Firewall rule.`,
-      'warning',
-      'link_off'
-    );
-  };
-
-  const handleKickPlayer = (id: string) => {
-    const target = players.find((p) => p.id === id);
-    if (!target) return;
-    setPlayers((prev) => prev.filter((p) => p.id !== id));
-    addLog({
-      level: 'WARN',
-      text: `[Admin] Kicked player ${target.username} from the server.`,
-      highlightBox: 'warn',
-    });
-    showToast('Player Disconnected', `Kicked ${target.username} from ${activeServer.name}.`, 'warning', 'person_remove');
-  };
-
-  const handleServerPowerById = (
-    serverId: string,
-    action: 'start' | 'restart' | 'stop' | 'kill'
-  ) => {
-    const targetSrv = servers.find((s) => s.id === serverId);
-    if (!targetSrv) return;
-
-    if (action === 'start') {
-      setServers((prev) =>
-        prev.map((s) =>
-          s.id === serverId
-            ? {
-                ...s,
-                status: 'running',
-                pid: s.pid > 0 ? s.pid : Math.floor(11000 + Math.random() * 15000),
-                tps: 20.0,
-                tickMs: 3.4,
-                uptime: '0h 01m',
-                cpuUsage: 18,
-                cpuTemp: 46.5,
-                ramUsedGb: Number((s.ramMaxGb * 0.45).toFixed(1)),
-              }
-            : s
-        )
-      );
-      showToast(
-        `Started ${targetSrv.name}`,
-        `Instance online on port :${targetSrv.port} (20.0 TPS).`,
-        'success',
-        'play_arrow'
-      );
-    } else if (action === 'restart') {
-      setServers((prev) =>
-        prev.map((s) => (s.id === serverId ? { ...s, status: 'restarting' } : s))
-      );
-      showToast(
-        `Restarting ${targetSrv.name}`,
-        'Flushing world chunks and reloading JVM heap...',
-        'warning',
-        'restart_alt'
-      );
-      setTimeout(() => {
-        setServers((prev) =>
-          prev.map((s) =>
-            s.id === serverId
-              ? { ...s, status: 'running', tps: 20.0, uptime: '0h 01m' }
-              : s
-          )
-        );
+    const [engineToken, versionToken] = engineLabel.trim().split(/\s+/);
+    try {
+      const outcome = await submitJob<Record<string, any>>('/api/server-runtime/install-jar', {
+        serverId: activeServer.id,
+        serverName: activeServer.name,
+        engine: (engineToken || '').toLowerCase(),
+        version: versionToken || '',
+        downloadUrl: build?.downloadUrl || '',
+        filename: build?.filename || jarFilename,
+        build: build ? String(build.build) : '',
+      });
+      const data = (outcome.result || {}) as Record<string, any>;
+      if (!outcome.ok) {
         showToast(
-          `${targetSrv.name} Back Online`,
-          `Graceful restart completed on port :${targetSrv.port}.`,
-          'success',
-          'check_circle'
+          'JAR install failed',
+          String(outcome.error || `No downloadable ${jarFilename} for ${engineLabel}`),
+          'error',
+          'error'
         );
-      }, 1500);
-    } else {
+        return;
+      }
       setServers((prev) =>
         prev.map((s) =>
-          s.id === serverId
+          s.id === activeServer.id
             ? {
                 ...s,
-                status: 'stopped',
-                pid: 0,
-                tps: 0.0,
-                tickMs: 0.0,
-                uptime: 'Offline',
-                playersOnline: 0,
-                cpuUsage: 0,
-                ramUsedGb: 0.0,
+                engine: `${data.engine} ${data.version}`.trim(),
+                build: data.build ? `Build #${data.build}` : buildLabel,
               }
             : s
         )
       );
+      addLog({
+        level: 'INFO',
+        text: `[EngineManager] Installed ${data.filename || jarFilename} (${data.engine} ${
+          data.version
+        }) into ${activeServer.path}`,
+      });
+      await refreshFileIndex();
       showToast(
-        `Stopped ${targetSrv.name}`,
-        `Saved chunks and released ${targetSrv.ramUsedGb} GB JVM heap.`,
-        'info',
-        'stop_circle'
+        'Server JAR installed',
+        `${data.filename || jarFilename} written to ${activeServer.path} (${(
+          (Number(data.bytes) || 0) /
+          1048576
+        ).toFixed(1)} MB).`,
+        'success',
+        'download_done'
+      );
+    } catch (err) {
+      showToast(
+        'JAR install failed',
+        err instanceof Error ? err.message : 'Backend unreachable',
+        'error',
+        'error'
       );
     }
   };
+
+  const handleKickPlayer = async (id: string) => {
+    const target = players.find((p) => p.id === id);
+    if (!target) return;
+    try {
+      const res = await fetch('/api/server-runtime/command', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          serverId: activeServer.id,
+          serverName: activeServer.name,
+          command: `kick ${target.username}`,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data?.ok) {
+        showToast('Kick failed', String(data?.error || 'Server is not accepting commands'), 'error', 'error');
+        return;
+      }
+      setPlayers((prev) => prev.filter((p) => p.id !== id));
+      showToast(
+        `kick ${target.username} queued`,
+        `Command delivered to ${activeServer.name}. Check the console for the result.`,
+        'warning',
+        'person_remove'
+      );
+    } catch (err) {
+      showToast(
+        'Kick failed',
+        err instanceof Error ? err.message : 'Backend unreachable',
+        'error',
+        'error'
+      );
+    }
+  };
+
+  const prettyEngineLabel = useCallback((engine: string, version?: string): string => {
+    const names: Record<string, string> = {
+      paper: 'PaperMC',
+      folia: 'Folia',
+      velocity: 'Velocity',
+      waterfall: 'Waterfall',
+      purpur: 'Purpur',
+      fabric: 'Fabric',
+      vanilla: 'Vanilla',
+      spigot: 'Spigot',
+      forge: 'Forge',
+      neoforge: 'NeoForge',
+    };
+    const key = String(engine || '').toLowerCase();
+    const label = names[key] || (key ? key.charAt(0).toUpperCase() + key.slice(1) : 'PaperMC');
+    return version ? `${label} ${version}` : label;
+  }, []);
+
+  // The server list is the real set of folders in the install root, not demo data.
+  const syncServersFromDisk = useCallback(async (): Promise<ServerInstance[] | undefined> => {
+    try {
+      const res = await fetch('/api/servers');
+      const data = await res.json();
+      if (!res.ok || !data?.ok || !Array.isArray(data.servers)) return undefined;
+      const list: ServerInstance[] = data.servers.map(
+        (srv: Record<string, unknown>): ServerInstance => {
+          const runtime = (srv.runtime || {}) as { state?: string; pid?: number | null };
+          const state = String(runtime.state || 'stopped');
+          const status: ServerInstance['status'] =
+            state === 'online'
+              ? 'running'
+              : state === 'starting' || state === 'stopping'
+              ? 'restarting'
+              : 'stopped';
+          return {
+            id: String(srv.id || ''),
+            name: String(srv.name || srv.id || 'Server'),
+            engine:
+              String(srv.engineLabel || '') ||
+              prettyEngineLabel(String(srv.engine || 'paper'), String(srv.version || '')),
+            javaVersion: 'Java 21',
+            port: Number(srv.port) || 25565,
+            pid: Number(runtime.pid) || 0,
+            status,
+            path: String(srv.displayPath || srv.diskPath || ''),
+            build: '#Latest',
+            tps: 0,
+            tickMs: 0,
+            uptime: status === 'running' ? 'Online' : 'Stopped (Ready to Start)',
+            playersOnline: 0,
+            maxPlayers: 40,
+            cpuUsage: 0,
+            cpuTemp: 0,
+            ramUsedGb: 0,
+            ramMaxGb: Number(srv.ramMaxGb) || 4,
+          };
+        }
+      );
+      setServers(list);
+      setActiveServerId((prev) =>
+        list.some((srv) => srv.id === prev) ? prev : list[0]?.id ?? prev
+      );
+      if (typeof data.installRoot === 'string' && data.installRoot) {
+        setServerInstallRootDir(data.installRoot);
+      }
+      return list;
+    } catch {
+      // backend still starting — keep whatever we have
+      return undefined;
+    }
+  }, [prettyEngineLabel]);
+
+  useEffect(() => {
+    if (!currentUser) return;
+    void syncServersFromDisk();
+    const interval = setInterval(() => void syncServersFromDisk(), 5000);
+    return () => clearInterval(interval);
+  }, [currentUser, syncServersFromDisk]);
+
+  const handleServerPowerById = useCallback(
+    async (serverId: string, action: 'start' | 'restart' | 'stop' | 'kill') => {
+      const targetSrv = servers.find((s) => s.id === serverId);
+      if (!targetSrv) return;
+
+      setServers((prev) =>
+        prev.map((s) =>
+          s.id === serverId
+            ? { ...s, status: action === 'stop' || action === 'kill' ? 'restarting' : s.status }
+            : s
+        )
+      );
+
+      try {
+        const res = await fetch('/api/server-runtime/power', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            serverId: targetSrv.id,
+            serverName: targetSrv.name,
+            engine: targetSrv.engine,
+            port: targetSrv.port,
+            ramMaxGb: targetSrv.ramMaxGb,
+            action,
+          }),
+        });
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data?.ok) {
+          const message = data?.error || `Backend refused “${action}”`;
+          showToast('Action Failed', message, 'error', 'error');
+          void syncServersFromDisk();
+          return;
+        }
+        showToast(
+          action === 'start'
+            ? `Starting ${targetSrv.name}`
+            : `${targetSrv.name}: ${action} requested`,
+          action === 'start'
+            ? `Spawning the server JVM on port :${targetSrv.port}.`
+            : 'Waiting for the process to reach a terminal state.',
+          'info',
+          action === 'start' ? 'play_arrow' : 'sync'
+        );
+        // Give the JVM a moment, then read the real state back from the backend.
+        setTimeout(() => void syncServersFromDisk(), 2500);
+      } catch (err) {
+        showToast(
+          'Action Failed',
+          err instanceof Error ? err.message : 'Could not reach the local backend',
+          'error',
+          'error'
+        );
+        void syncServersFromDisk();
+      }
+    },
+    [servers, showToast, syncServersFromDisk]
+  );
 
   const handleBulkServerAction = (
     action: 'start_all' | 'restart_running' | 'stop_all' | 'snapshot_all'
   ) => {
-    if (action === 'start_all') {
-      setServers((prev) =>
-        prev.map((s) =>
-          s.status === 'stopped'
-            ? {
-                ...s,
-                status: 'running',
-                pid: Math.floor(12000 + Math.random() * 14000),
-                tps: 20.0,
-                tickMs: 3.1,
-                uptime: '0h 01m',
-                cpuUsage: 16,
-                ramUsedGb: Number((s.ramMaxGb * 0.45).toFixed(1)),
-              }
-            : s
-        )
-      );
+    void (async () => {
+      const targets =
+        action === 'start_all'
+          ? servers.filter((s) => s.status === 'stopped')
+          : action === 'restart_running'
+            ? servers.filter((s) => s.status === 'running')
+            : [];
+      const powerAction =
+        action === 'start_all' ? 'start' : action === 'restart_running' ? 'restart' : 'stop';
+
+      if (action === 'snapshot_all') {
+        // One real archive per server, sequentially, through the job queue so a
+        // server that is mid-restore or mid-install is reported instead of raced.
+        let archived = 0;
+        for (const srv of servers) {
+          const outcome = await submitJob(
+            '/api/backups/create',
+            { serverId: srv.id, serverName: srv.name, title: 'fleet-checkpoint' },
+          ).catch(() => null);
+          if (outcome?.ok) archived += 1;
+        }
+        await loadSnapshots(activeServer);
+        showToast(
+          archived === servers.length ? 'Fleet backup finished' : 'Fleet backup partly finished',
+          `Archived ${archived} of ${servers.length} server(s) to their backups/ folders.`,
+          archived === servers.length ? 'success' : 'warning',
+          'archive'
+        );
+        return;
+      }
+
+      let ok = 0;
+      for (const srv of targets) {
+        try {
+          const res = await fetch('/api/server-runtime/power', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              serverId: srv.id,
+              serverName: srv.name,
+              engine: srv.engine,
+              port: srv.port,
+              ramMaxGb: srv.ramMaxGb,
+              action: powerAction,
+            }),
+          });
+          const data = await res.json();
+          if (data?.ok) ok += 1;
+          else addLog({ level: 'ERROR', text: `[Fleet] ${powerAction} failed for ${srv.name}: ${data?.error || 'unknown error'}` });
+        } catch (err) {
+          addLog({
+            level: 'ERROR',
+            text: `[Fleet] ${powerAction} failed for ${srv.name}: ${err instanceof Error ? err.message : 'backend unreachable'}`,
+          });
+        }
+      }
+      await syncServersFromDisk();
       showToast(
-        'All Standby Servers Started',
-        'All localhost instances are now online and synced.',
-        'success',
-        'play_arrow'
+        `${powerAction === 'start' ? 'Fleet start' : powerAction === 'restart' ? 'Fleet restart' : 'Fleet stop'}`,
+        `${ok}/${targets.length} server(s) accepted the ${powerAction} request.`,
+        ok === targets.length ? 'success' : 'warning',
+        powerAction === 'start' ? 'play_arrow' : 'sync'
       );
-    } else if (action === 'restart_running') {
-      showToast(
-        'Rolling Cluster Restart Initiated',
-        'Gracefully restarting all running instances with zero packet drop.',
-        'warning',
-        'restart_alt'
-      );
-    } else if (action === 'snapshot_all') {
-      handleCreateSnapshot('Global Cluster Fleet Checkpoint', true, [
-        'All Running Instances',
-        'Worlds',
-        'SQLite DBs',
-      ]);
-    }
+    })();
   };
 
   const handleUpdateGlobalRamConfig = (hostTotalGb: number, globalCapGb: number) => {
@@ -799,46 +1228,102 @@ export default function App() {
   };
 
   const handleKillAllServers = () => {
-    setServers((prev) =>
-      prev.map((s) => ({
-        ...s,
-        status: 'stopped',
-        pid: 0,
-        tps: 0.0,
-        tickMs: 0.0,
-        uptime: 'Offline (SIGKILL)',
-        playersOnline: 0,
-        cpuUsage: 0,
-        ramUsedGb: 0.0,
-      }))
-    );
-    addLog({
-      level: 'ERROR',
-      text: '[GLOBAL SIGKILL -9] Operator terminated all active localhost JVM server processes.',
-      highlightBox: 'error',
-    });
-    showToast(
-      'All Running Servers Force-Killed (SIGKILL)',
-      'Terminated all active JVM processes and freed host DDR5 memory.',
-      'error',
-      'dangerous'
-    );
+    void (async () => {
+      const running = servers.filter((s) => s.status !== 'stopped');
+      let killed = 0;
+      for (const srv of running) {
+        try {
+          const res = await fetch('/api/server-runtime/power', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ serverId: srv.id, serverName: srv.name, action: 'kill' }),
+          });
+          const data = await res.json();
+          if (data?.ok) killed += 1;
+        } catch {
+          // reported below via the sync + toast counts
+        }
+      }
+      await syncServersFromDisk();
+      addLog({
+        level: 'ERROR',
+        text: `[Fleet] Force-killed ${killed}/${running.length} running server process(es).`,
+        highlightBox: 'error',
+      });
+      showToast(
+        'Servers force-killed',
+        `${killed}/${running.length} running process(es) terminated.`,
+        killed === running.length ? 'success' : 'warning',
+        'dangerous'
+      );
+    })();
   };
 
+  // Deleting a server is irreversible for its world data, so it always goes
+  // through an explicit confirmation dialog before the backend removes it.
   const handleDeleteServerInstance = (serverId: string) => {
     const target = servers.find((s) => s.id === serverId);
-    if (!target || servers.length <= 1) return;
-    const remaining = servers.filter((s) => s.id !== serverId);
-    setServers(remaining);
-    if (activeServerId === serverId) {
-      setActiveServerId(remaining[0].id);
+    if (!target) return;
+    setDeleteTarget(target);
+    setDeleteServerFiles(true);
+  };
+
+  const confirmDeleteServer = async () => {
+    if (!deleteTarget) return;
+    setDeletingServer(true);
+    try {
+      const res = await fetch('/api/server-runtime/server', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          serverId: deleteTarget.id,
+          serverName: deleteTarget.name,
+          deleteFiles: deleteServerFiles,
+        }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.ok) {
+        showToast(
+          'Could not delete server',
+          String(data?.error || `Backend refused the delete (HTTP ${res.status})`),
+          'error',
+          'error'
+        );
+        return;
+      }
+
+      const remaining = servers.filter((s) => s.id !== deleteTarget.id);
+      setServers(remaining);
+      if (activeServerId === deleteTarget.id) {
+        setActiveServerId(remaining[0]?.id ?? EMPTY_SERVER_PLACEHOLDER.id);
+      }
+      addLog({
+        level: 'WARN',
+        text: `[Fleet] Deleted server "${deleteTarget.name}"${
+          deleteServerFiles ? ' and removed its folder from disk' : ' (folder kept on disk)'
+        }.`,
+        highlightBox: 'warn',
+      });
+      showToast(
+        `Deleted ${deleteTarget.name}`,
+        deleteServerFiles
+          ? `Folder ${deleteTarget.path} was removed from this PC.`
+          : 'The server was unregistered; its folder is still on disk.',
+        'success',
+        'delete'
+      );
+      setDeleteTarget(null);
+      void syncServersFromDisk();
+    } catch (err) {
+      showToast(
+        'Could not delete server',
+        err instanceof Error ? err.message : 'Backend unreachable',
+        'error',
+        'error'
+      );
+    } finally {
+      setDeletingServer(false);
     }
-    showToast(
-      `Removed ${target.name}`,
-      `Unregistered server instance from panel fleet.`,
-      'warning',
-      'delete'
-    );
   };
 
   const handleUpdateUserProfile = (updatedUser: AuthUser) => {
@@ -852,6 +1337,7 @@ export default function App() {
 
   const handleOpenDiscordBotGate = (attemptedServerName?: string) => {
     setDiscordBotAttemptedServerName(attemptedServerName);
+    setDiscordGatePurpose('limit');
     setDiscordBotGateOpen(true);
   };
 
@@ -916,6 +1402,7 @@ export default function App() {
     setCurrentUser(user);
     setAuthModalOpen(false);
     setHasEnteredFullPanel(false);
+    setPanelMode('simple');
     if (isNewSignup) {
       setActiveSection('setup_guide');
     }
@@ -945,7 +1432,14 @@ export default function App() {
     setHasEnteredFullPanel(false);
     try {
       localStorage.removeItem('king_panel_auth_user');
-      await fetch('/api/auth/logout', { method: 'POST' });
+      await fetch('/api/auth/logout', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        credentials: 'include',
+        body: JSON.stringify({ logoutCurrentOnly: true }),
+      });
     } catch {
       // ignore
     }
@@ -960,6 +1454,9 @@ export default function App() {
   return (
     <div className="bg-surface-dim text-on-surface font-sans antialiased h-screen w-screen overflow-hidden flex flex-col select-none">
       {/* Top Native Windows 11 Obsidian Title Bar */}
+      {/* Custom titlebar is hidden on login pages (unauthenticated gate) —
+          the frameless Electron window then relies on Alt+F4/taskbar there. */}
+      {currentUser && hasEnteredFullPanel && panelMode === 'advanced' && (
       <TitleBar
         servers={servers}
         activeServer={activeServer}
@@ -1009,10 +1506,15 @@ export default function App() {
         onShowToast={showToast}
         isMinimized={isMinimized}
         onToggleMinimize={() => setIsMinimized(!isMinimized)}
+        onMinimize={() => setIsMinimized(true)}
+        isMaximized={isMaximized}
+        onToggleMaximize={() => setIsMaximized(!isMaximized)}
         isSimplePanelMode={!hasEnteredFullPanel}
         onToggleSimplePanel={() => setHasEnteredFullPanel((prev) => !prev)}
         onOpenDiscordBotGate={() => handleOpenDiscordBotGate()}
+        onRequestClose={() => setExitConfirmOpen(true)}
       />
+      )}
 
       {/* If Not Authenticated, Render Full-Screen Obsidian Sovereign Login / Sign Up Gate */}
       {!currentUser ? (
@@ -1033,19 +1535,9 @@ export default function App() {
           paperMcReport={paperMcReport}
           onRunPaperMcCheckNow={() => syncPaperMcBackgroundCheck(true)}
           onUpgradeServerEngine={handleUpgradeServerEngine}
-          onEnterFullPanel={(targetSection = 'overview', selectedServer) => {
-            if (selectedServer) {
-              setActiveServerId(selectedServer.id);
-            }
-            setActiveSection(targetSection);
-            setHasEnteredFullPanel(true);
-            showToast(
-              'Entered Full Workstation Panel',
-              `Loaded ${ (selectedServer || activeServer).name } in full control workspace.`,
-              'info',
-              'dashboard'
-            );
-          }}
+          onEnterFullPanel={(targetSection = 'overview', selectedServer, mode = 'advanced') =>
+            handleEnterPanel(targetSection, selectedServer, mode)
+          }
           onSelectServer={handleSelectServer}
           onServerPowerAction={handleServerPowerById}
           onCreateServerInstance={(newSrv) => {
@@ -1088,9 +1580,24 @@ export default function App() {
           onSignOut={handleSignOut}
           onShowToast={showToast}
         />
+      ) : panelMode === 'simple' ? (
+        /* Step 2 After Login: Clean per-server simple panel (no desktop title bar) */
+        <SimpleServerPanel
+          server={activeServer}
+          advancedAllowed={advancedPanelAllowed}
+          onRequestAdvancedAccess={() => handleEnterPanel('overview', undefined, 'advanced')}
+          onBackToServerList={() => setHasEnteredFullPanel(false)}
+          onOpenAdvancedPanel={() => handleEnterPanel('overview', undefined, 'advanced')}
+          onServerUpdated={(patch) => {
+            setServers((prev) =>
+              prev.map((srv) => (srv.id === activeServer.id ? { ...srv, ...patch } : srv))
+            );
+          }}
+          onShowToast={showToast}
+        />
       ) : (
         /* Main Desktop Application Shell */
-        <div className="flex flex-1 overflow-hidden">
+        <div className="advanced-shell flex flex-1 overflow-hidden">
           {/* Left Navigation Sidebar */}
           <Sidebar
             activeSection={activeSection}
@@ -1110,6 +1617,11 @@ export default function App() {
             onSignOut={handleSignOut}
           />
 
+          {/* Workspace scroll shell: keeps every view inside the window chrome */}
+          <div
+            ref={workspaceScrollRef}
+            className="flex-1 min-w-0 flex flex-col overflow-y-auto overflow-x-hidden"
+          >
           {/* Dynamic Workspace View Wrapped in Error Boundary (Shows 404 Page on Panel Error) */}
           <PanelErrorBoundary
             server={activeServer}
@@ -1251,11 +1763,9 @@ export default function App() {
         {activeSection === 'files' && (
           <FileManagerView
             server={activeServer}
-            files={files}
-            selectedFileId={selectedFileId}
-            onSaveFileContent={handleSaveFileContent}
-            onCreateFile={handleCreateFile}
+            selectedFilePath={selectedFileId}
             onShowToast={showToast}
+            onFilesChanged={() => void refreshFileIndex()}
           />
         )}
 
@@ -1283,13 +1793,7 @@ export default function App() {
         )}
 
         {activeSection === 'network' && (
-          <NetworkPortsView
-            server={activeServer}
-            ports={ports}
-            onAddPort={handleAddPort}
-            onDeletePort={handleDeletePort}
-            onShowToast={showToast}
-          />
+          <NetworkPortsView server={activeServer} onShowToast={showToast} />
         )}
 
         {activeSection === 'backups' && (
@@ -1415,6 +1919,49 @@ export default function App() {
           />
         )}
 
+        {activeSection === 'account' && (
+          <>
+            <header className="min-h-[54px] px-6 py-2 bg-surface border-b border-white/[0.06] flex flex-wrap items-center justify-between gap-x-4 gap-y-2 shrink-0">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <span className="material-symbols-outlined text-[18px] text-primary">security</span>
+                <h1 className="text-[14.5px] font-semibold tracking-tight text-on-surface whitespace-nowrap">
+                  Sessions
+                </h1>
+                <span className="w-px h-4 bg-white/10 shrink-0" />
+                <p className="text-[11.5px] text-outline font-mono truncate">
+                  Active sessions · provider connections · account security
+                </p>
+              </div>
+              {currentUser && (
+                <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md border border-white/10 bg-white/[0.03] font-mono text-[10.5px] text-[#c9d2e2] shrink-0">
+                  <span className="material-symbols-outlined text-[13px] text-secondary">
+                    account_circle
+                  </span>
+                  {currentUser.username}
+                </span>
+              )}
+            </header>
+
+            <div className="p-6 pt-5 space-y-4 max-w-3xl w-full">
+              <SessionManagementPanel
+                currentUser={currentUser}
+                onShowToast={showToast}
+                onSignOut={handleSignOut}
+              />
+              <ProviderConnectionsPanel
+                currentUser={currentUser}
+                onShowToast={showToast}
+                onSignOut={handleSignOut}
+              />
+              <AccountSecurityPanel
+                currentUser={currentUser}
+                onShowToast={showToast}
+                onSignOut={handleSignOut}
+              />
+            </div>
+          </>
+        )}
+
         {activeSection === 'not_found' && (
           <NotFound404View
             server={activeServer}
@@ -1429,6 +1976,7 @@ export default function App() {
           />
         )}
           </PanelErrorBoundary>
+          </div>
         </div>
       )}
 
@@ -1443,6 +1991,14 @@ export default function App() {
         />
       )}
 
+      {/* Exit Confirmation — hide to tray (keeps running) or quit the desktop app */}
+      <DesktopCloseModal
+        isOpen={exitConfirmOpen}
+        onClose={() => setExitConfirmOpen(false)}
+        serverRunning={servers.some((s) => s.status === 'running')}
+        serverName={activeServer?.name}
+      />
+
       {/* Discord Server & Bot Verification Gate Modal (Triggered on >2 Servers or Verify Discord Bot Button) */}
       {currentUser && (
         <DiscordBotGateModal
@@ -1454,6 +2010,11 @@ export default function App() {
           currentUser={currentUser}
           currentServerCount={servers.length}
           attemptedServerName={discordBotAttemptedServerName}
+          access={panelAccess}
+          accessLoading={panelAccessLoading}
+          accessError={panelAccessError}
+          purpose={discordGatePurpose}
+          onRefreshAccess={refreshPanelAccess}
           onUserUpdated={handleUpdateUserProfile}
           onEnforceTwoServerReset={handleEnforceTwoServerReset}
           onVerificationSuccessProceed={() => {
@@ -1462,6 +2023,67 @@ export default function App() {
           }}
           onShowToast={showToast}
         />
+      )}
+
+      {/* Delete Server Confirmation */}
+      {deleteTarget && (
+        <div className="fixed inset-0 z-[70] bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
+          <div className="w-full max-w-md rounded-xl bg-surface border border-error/35 overflow-hidden">
+            <div className="px-5 py-4 border-b border-white/[0.08] bg-surface-container flex items-start gap-3">
+              <div className="size-9 rounded-lg bg-error/15 border border-error/35 flex items-center justify-center text-error shrink-0">
+                <span className="material-symbols-outlined text-[20px]">delete_forever</span>
+              </div>
+              <div className="min-w-0">
+                <h3 className="text-sm font-bold text-white">Delete “{deleteTarget.name}”?</h3>
+                <p className="text-[11px] text-outline font-mono truncate">{deleteTarget.path}</p>
+              </div>
+            </div>
+
+            <div className="p-5 space-y-3">
+              <p className="text-xs text-outline leading-relaxed">
+                The server is stopped and removed from the panel. This cannot be undone.
+                {deleteServerFiles
+                  ? ' Its world, plugins, mods, logs and jar will be deleted from this PC.'
+                  : ' The folder stays on disk so you can re-register it later.'}
+              </p>
+
+              <label className="flex items-start gap-2.5 cursor-pointer select-none rounded-lg border border-white/[0.08] bg-surface-lowest px-3 py-2.5">
+                <input
+                  type="checkbox"
+                  checked={deleteServerFiles}
+                  onChange={(e) => setDeleteServerFiles(e.target.checked)}
+                  disabled={deletingServer}
+                  className="mt-0.5 size-3.5 accent-[color:var(--color-error,#ff6b6b)] cursor-pointer"
+                />
+                <span className="text-xs text-on-surface">
+                  Also delete the server folder and all of its files
+                </span>
+              </label>
+            </div>
+
+            <div className="px-5 py-3.5 bg-surface-container border-t border-white/[0.08] flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setDeleteTarget(null)}
+                disabled={deletingServer}
+                className="px-4 h-9 rounded-lg bg-white/5 hover:bg-white/10 text-xs font-medium text-outline hover:text-white cursor-pointer disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void confirmDeleteServer()}
+                disabled={deletingServer}
+                className="px-4 h-9 rounded-lg bg-error hover:opacity-95 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+              >
+                <span className="material-symbols-outlined text-[16px]">
+                  {deletingServer ? 'progress_activity' : 'delete'}
+                </span>
+                {deletingServer ? 'Deleting…' : 'Delete server'}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Windows 11 Obsidian Toast Notification Stack */}

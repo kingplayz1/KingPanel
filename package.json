@@ -1,83 +1,117 @@
 {
   "name": "react-example",
-  "description": "IS King Panel - Minecraft Server Management Dashboard",
-  "author": "IS King Panel Team",
   "private": true,
-  "version": "0.0.0",
-  "type": "module",
+  "version": "1.0.2",
+  "description": "IS King Panel - Windows Desktop Application for Minecraft Server Management",
+  "author": "kingplayz",
   "main": "electron-main.cjs",
+  "scripts": {
+    "dev": "tsx server.ts",
+    "start": "tsx server.ts",
+    "build": "vite build",
+    "build:backend": "node scripts/build-backend.mjs",
+    "preview": "vite preview",
+    "clean": "rm -rf dist server.js",
+    "lint": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.mjs",
+    "electron": "electron electron-main.cjs",
+    "verify:upgrade": "node scripts/verify-installed-upgrade.mjs",
+    "electron:build": "node scripts/build-release.mjs"
+  },
   "build": {
-    "appId": "com.iskingpanel.app",
+    "appId": "com.kingplayz.iskingpanel",
     "productName": "IS King Panel",
-    "copyright": "Copyright © 2026 IS King Panel",
     "directories": {
       "output": "dist_electron"
     },
     "files": [
       "dist/**/*",
-      "server.js",
+      "server.cjs",
       "electron-main.cjs",
+      "electron-preload.cjs",
       "package.json",
-      "node_modules/**/*",
       "database/**/*",
+      "node_modules/**/*",
       "src/**/*",
-      ".env*"
+      "!**.env",
+      "!**.env.*",
+      "!**.sqlite",
+      "!**.sqlite-*",
+      "!**.db",
+      "!**/secrets/**",
+      "!**/logs/**",
+      "!**/test/**",
+      "!**/tests/**",
+      "!**/*.map"
+    ],
+    "asar": true,
+    "asarUnpack": [
+      "server.cjs",
+      "dist/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "database",
+        "to": "database",
+        "filter": [
+          "**/*"
+        ]
+      }
     ],
     "win": {
       "target": "nsis",
-      "arch": [
-        "x64"
-      ],
-      "sign": false
+      "asar": true,
+      "artifactName": "IS-King-Panel-Setup-${version}.${ext}"
     },
-    "publish": [
-      {
-        "provider": "github",
-        "owner": "kingplayz1",
-        "repo": "KingPanel-"
-      }
-    ]
-  },
-  "scripts": {
-    "dev": "tsx server.ts",
-    "start": "tsx server.ts",
-    "build": "vite build",
-    "preview": "vite preview",
-    "clean": "rm -rf dist server.js",
-    "lint": "tsc --noEmit",
-    "electron": "electron electron-main.cjs",
-    "electron:build": "electron-builder",
-    "electron:build:win": "electron-builder --win --x64",
-    "electron:build:win:dir": "electron-builder --win --x64 --dir",
-    "electron:pack": "electron-packager . ISKingPanel --platform=win32 --arch=x64 --icon=src/assets/icon.ico --out=dist_electron --overwrite"
+    "nsis": {
+      "include": "build/installer.nsh",
+      "oneClick": false,
+      "perMachine": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "IS King Panel"
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "kingplayz1",
+      "repo": "KingPanel"
+    }
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
     "@tailwindcss/vite": "^4.3.3",
     "@vitejs/plugin-react": "^6.1.1",
+    "better-sqlite3": "^13.0.3",
     "dotenv": "^17.2.3",
+    "electron-log": "^5.4.4",
+    "electron-updater": "^6.8.9",
     "express": "^4.21.2",
     "lucide-react": "^0.546.0",
     "mongodb": "^7.7.0",
     "motion": "^12.23.24",
     "mysql2": "^3.24.5",
+    "node-fetch": "^3.3.2",
     "react": "^19.0.1",
     "react-dom": "^19.0.1",
     "react-is": "^19.3.0",
     "recharts": "^3.10.1",
+    "sql.js": "^1.14.2",
+    "sqlite": "^5.1.1",
     "vite": "^8.3.0"
   },
   "devDependencies": {
+    "@types/cors": "^2.8.19",
     "@types/express": "^4.17.21",
     "@types/node": "^22.14.0",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
+    "@types/socket.io": "^3.0.1",
+    "@tailwindcss/vite": "^4.3.3",
     "autoprefixer": "^10.4.21",
     "electron": "^31.7.7",
-    "electron-builder": "^24.9.1",
-    "electron-log": "^5.4.4",
+    "electron-builder": "^26.15.3",
     "electron-packager": "^17.1.2",
-    "electron-updater": "^6.8.9",
     "esbuild": "^0.25.0",
     "tailwindcss": "^4.3.3",
     "tsx": "^4.21.0",

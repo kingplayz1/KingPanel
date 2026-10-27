@@ -1,4 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import { cancelJob, submitJob, type OperationJob } from '../lib/jobs';
+import { JobProgressBar } from '../components/JobProgressBar';
+import { DiscordAccessSettings } from '../components/DiscordAccessSettings';
 import {
   ResponsiveContainer,
   AreaChart,
@@ -21,16 +24,13 @@ interface PanelControlViewProps {
   serverInstallRootDir: string;
   onUpdateServerInstallFolder: (
     newRootDir: string,
-    updatedServerPaths?: Record<string, string>
+    updatedServerPaths?: Record<string, string>,
   ) => void;
   onCreateServerInstance: (newServer: ServerInstance) => void;
   onUpdateGlobalRamConfig: (hostTotalGb: number, globalCapGb: number) => void;
   onUpdateServerRam: (serverId: string, newMaxGb: number) => void;
   onBatchUpdateServerRam: (allocations: Record<string, number>) => void;
-  onServerPowerAction: (
-    serverId: string,
-    action: 'start' | 'restart' | 'stop' | 'kill'
-  ) => void;
+  onServerPowerAction: (serverId: string, action: 'start' | 'restart' | 'stop' | 'kill') => void;
   onKillAllServers: () => void;
   onDeleteServerInstance: (serverId: string) => void;
   onSelectServer: (server: ServerInstance) => void;
@@ -44,7 +44,7 @@ interface PanelControlViewProps {
     title: string,
     body?: string,
     type?: 'success' | 'info' | 'warning' | 'error',
-    icon?: string
+    icon?: string,
   ) => void;
 }
 
@@ -209,10 +209,13 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
 
   // Quick New Server Installer (into the configured folder)
   const [quickSrvName, setQuickSrvName] = useState<string>('Survival_Kingdom_S5');
-  const [quickSrvEngine, setQuickSrvEngine] = useState<string>('PaperMC 1.21.4');
+  const [quickSrvEngine, setQuickSrvEngine] = useState<string>('PaperMC');
+  const [quickSrvVersion, setQuickSrvVersion] = useState<string>('1.21.4');
   const [quickSrvPort, setQuickSrvPort] = useState<number>(25575);
   const [quickSrvRamGb, setQuickSrvRamGb] = useState<number>(6);
+  const [availableVersions, setAvailableVersions] = useState<string[]>(['1.21.4']);
   const [installingServer, setInstallingServer] = useState<boolean>(false);
+  const [installJob, setInstallJob] = useState<OperationJob | null>(null);
 
   // Real-Time User Profile State (with Live Sync to Local PC Disk)
   const [username, setUsername] = useState(currentUser.username);
@@ -220,7 +223,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
   const [email, setEmail] = useState(currentUser.email);
   const [role, setRole] = useState<AuthUser['role']>(currentUser.role);
   const [mcUuid, setMcUuid] = useState(
-    currentUser.mcUuid || '069a79f4-44e9-4726-a5be-fca90e38aaf5'
+    currentUser.mcUuid || '069a79f4-44e9-4726-a5be-fca90e38aaf5',
   );
   const [avatarUrl, setAvatarUrl] = useState(currentUser.avatarUrl);
   const [newPassword, setNewPassword] = useState('');
@@ -237,20 +240,18 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
 
   // Global RAM Calculations
   const osReservedGb = Number(Math.max(1, hostTotalRamGb - globalRamCapGb).toFixed(1));
-  const totalAllocatedGb = Number(
-    servers.reduce((acc, s) => acc + s.ramMaxGb, 0).toFixed(1)
-  );
+  const totalAllocatedGb = Number(servers.reduce((acc, s) => acc + s.ramMaxGb, 0).toFixed(1));
   const totalActiveUsedGb = Number(
     servers
       .filter((s) => s.status === 'running' || s.status === 'restarting')
       .reduce((acc, s) => acc + s.ramUsedGb, 0)
-      .toFixed(1)
+      .toFixed(1),
   );
   const freePoolGb = Number(Math.max(0, globalRamCapGb - totalAllocatedGb).toFixed(1));
   const isOverCommitted = totalAllocatedGb > globalRamCapGb;
 
   const runningServersCount = servers.filter(
-    (s) => s.status === 'running' || s.status === 'restarting'
+    (s) => s.status === 'running' || s.status === 'restarting',
   ).length;
 
   // Real-Time Memory Telemetry Stream for Recharts
@@ -290,7 +291,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
           const detectedTotal = Math.max(4, Math.round(liveHost.osTotalGb));
           const detectedCap = Math.max(
             2,
-            Number((detectedTotal - Math.max(1, Math.round(detectedTotal * 0.12))).toFixed(1))
+            Number((detectedTotal - Math.max(1, Math.round(detectedTotal * 0.12))).toFixed(1)),
           );
           onUpdateGlobalRamConfig(detectedTotal, detectedCap);
         }
@@ -381,6 +382,30 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
     onUpdateUserProfile,
   ]);
 
+  // Fetch available versions when engine changes
+  const fetchAvailableVersions = useCallback(async (engine: string) => {
+    try {
+      const r = await fetch(`/api/jars/engines/${engine}`);
+      const data = await r.json();
+      if (data.ok && data.versions) {
+        setAvailableVersions(data.versions);
+        // Set version to the first (latest) one by default
+        if (data.versions.length > 0) {
+          setQuickSrvVersion(data.versions[0]);
+        }
+      }
+    } catch (err) {
+      console.error('Failed to fetch versions:', err);
+      // Keep existing versions if fetch fails
+    }
+  }, []);
+
+  // Initial load of versions for default engine
+  useEffect(() => {
+    const defaultEngine = quickSrvEngine.split(' ')[0].toLowerCase();
+    fetchAvailableVersions(defaultEngine);
+  }, [quickSrvEngine, fetchAvailableVersions]);
+
   // Apply Global Server Installation Folder & Provision All Server Subfolders Inside It
   const handleApplyInstallFolder = async (customRoot?: string) => {
     const targetRoot = (customRoot ?? installRootInput).trim();
@@ -423,14 +448,14 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
         'Global Server Install Folder Applied',
         `All servers are now installed inside "${targetRoot}" (${servers.length} subfolders provisioned on local PC disk).`,
         'success',
-        'create_new_folder'
+        'create_new_folder',
       );
     } catch (err) {
       onShowToast(
         'Install Folder Error',
         err instanceof Error ? err.message : 'Failed to update installation folder',
         'error',
-        'error'
+        'error',
       );
     } finally {
       setSavingInstallFolder(false);
@@ -447,10 +472,10 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
         onOpenDiscordBotGate(quickSrvName.trim() || `Server #${servers.length + 1}`);
       } else {
         onShowToast(
-          '2-Server Limit Reached — Discord Bot Verification Required',
-          'Standard logged-in users can only set up 1 or 2 servers. Connect to our Discord Server and verify with the Discord Bot to create more than 2 servers!',
+          '2-Server Limit Reached — Discord Verification Required',
+          'Standard logged-in users can only set up 1 or 2 servers. Connect Discord, join the official server and hold the verified role to create more than 2 servers.',
           'warning',
-          'lock'
+          'lock',
         );
       }
       return;
@@ -460,30 +485,31 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
       return;
     }
     setInstallingServer(true);
+    setInstallJob(null);
     try {
-      const r = await fetch('/api/panel/install-server-instance', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      // Queued install: the backend owns the download, this view follows the job.
+      const outcome = await submitJob<Record<string, any>>(
+        '/api/panel/install-server-instance',
+        {
           serverName: quickSrvName.trim(),
           engine: quickSrvEngine,
+          version: quickSrvVersion,
           port: quickSrvPort,
           ramMaxGb: quickSrvRamGb,
-          actor: currentUser.displayName,
-          currentServerCount: servers.length,
-          discordVerified: isDiscordVerified,
-        }),
-      });
-      const data = await r.json();
-      if (r.status === 403 && data?.code === 'DISCORD_VERIFICATION_REQUIRED') {
+          installRootDir: installConfig?.installRootDir || '',
+        },
+        { onProgress: setInstallJob },
+      );
+      const data = (outcome.result || {}) as Record<string, any>;
+      if (outcome.status === 403 && data?.code === 'DISCORD_VERIFICATION_REQUIRED') {
         if (onOpenDiscordBotGate) {
           onOpenDiscordBotGate(quickSrvName.trim());
         }
         setInstallingServer(false);
         return;
       }
-      if (!r.ok || !data.ok) {
-        throw new Error(data.error || 'Failed to install server into folder');
+      if (!outcome.ok) {
+        throw new Error(outcome.error || data?.error || 'Failed to install server into folder');
       }
       if (data.installConfig) {
         setInstallConfig(data.installConfig);
@@ -498,19 +524,23 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
         engine: quickSrvEngine,
         javaVersion: 'Java 21',
         port: quickSrvPort,
-        pid: Math.floor(12000 + Math.random() * 18000),
-        status: 'running',
+        pid: 0,
+        status: 'stopped',
         path: data.displayPath,
         build: 'Latest Verified Build',
-        tps: 20.0,
-        tickMs: 2.2,
-        uptime: '0h 01m',
+        tps: 0.0,
+        tickMs: 0.0,
+        uptime: 'Stopped (Ready to Start)',
         playersOnline: 0,
         maxPlayers: 60,
-        cpuUsage: 9,
-        cpuTemp: 44.0,
-        ramUsedGb: Number((quickSrvRamGb * 0.35).toFixed(1)),
+        cpuUsage: 0,
+        cpuTemp: 0,
+        ramUsedGb: 0.0,
         ramMaxGb: quickSrvRamGb,
+        // Version tracking fields
+        installedVersion: quickSrvVersion,
+        latestVersion: quickSrvVersion,
+        isOutdated: false,
       };
       onCreateServerInstance(newSrv);
       setQuickSrvName(`Server_Node_${servers.length + 1}`);
@@ -519,14 +549,14 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
         `Installed ${newSrv.name} in Folder`,
         `Provisioned "${data.displayPath}" with eula.txt, server.properties, plugins/, mods/, and world/.`,
         'success',
-        'folder_managed'
+        'folder_managed',
       );
     } catch (err) {
       onShowToast(
         'Server Installation Failed',
         err instanceof Error ? err.message : 'Could not install server in folder',
         'error',
-        'error'
+        'error',
       );
     } finally {
       setInstallingServer(false);
@@ -545,7 +575,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
       `Synced to Real Local PC RAM (${realTotalGb} GB)`,
       `Detected ${hostTelemetry.osTotalMb} MB physical memory on ${hostTelemetry.hostname}. Pool cap set to ${realCapGb} GB.`,
       'success',
-      'memory'
+      'memory',
     );
   };
 
@@ -577,7 +607,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
   // Real-Time Backend Sync helper for Server Kill / Power Actions
   const handleLiveServerAction = async (
     srv: ServerInstance,
-    action: 'start' | 'restart' | 'stop' | 'kill'
+    action: 'start' | 'restart' | 'stop' | 'kill',
   ) => {
     onServerPowerAction(srv.id, action);
     try {
@@ -643,14 +673,14 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
         `Spawned Real Local PC Process (PID ${data.pid})`,
         `Process "${data.name}" is now running on your local OS kernel. You can SIGKILL it below.`,
         'success',
-        'terminal'
+        'terminal',
       );
     } catch (err) {
       onShowToast(
         'Local Process Spawn Error',
         err instanceof Error ? err.message : 'Failed to spawn process',
         'error',
-        'error'
+        'error',
       );
     } finally {
       setSpawningWorker(false);
@@ -664,7 +694,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
         `Protected Local PC Daemon (PID ${proc.pid})`,
         `PID ${proc.pid} (${proc.command}) is the active panel root daemon or OS init and is protected.`,
         'warning',
-        'shield'
+        'shield',
       );
       return;
     }
@@ -688,14 +718,14 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
         `Killed Local PC Process PID ${proc.pid}`,
         `Dispatched OS SIGKILL (-9) to "${proc.command}" (${proc.rssMb} MB RSS freed).`,
         'error',
-        'bolt'
+        'bolt',
       );
     } catch (err) {
       onShowToast(
         `Cannot Kill PID ${proc.pid}`,
         err instanceof Error ? err.message : 'OS kernel rejected SIGKILL',
         'warning',
-        'lock'
+        'lock',
       );
     }
   };
@@ -705,7 +735,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
     if (!localPcUser) return;
     const osHandle = `${localPcUser.username}_${localPcUser.hostname}`.replace(
       /[^a-zA-Z0-9_-]/g,
-      '_'
+      '_',
     );
     const osDisplay = `${localPcUser.username}@${localPcUser.hostname} (Local PC Root)`;
     const osEmail = `${localPcUser.username}@${localPcUser.hostname}.local`;
@@ -717,7 +747,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
       `Imported Local PC OS Account`,
       `Synced profile with ${localPcUser.username}@${localPcUser.hostname} (UID ${localPcUser.uid} • ${localPcUser.primaryIp}).`,
       'success',
-      'computer'
+      'computer',
     );
   };
 
@@ -742,14 +772,14 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
         `Mojang Identity Synced: ${data.ign}`,
         `UUID: ${data.uuid} • Live 3D head avatar applied.`,
         'success',
-        'verified'
+        'verified',
       );
     } catch (err) {
       onShowToast(
         'Mojang Lookup Notice',
         err instanceof Error ? err.message : 'Could not resolve Minecraft username',
         'warning',
-        'person_search'
+        'person_search',
       );
     } finally {
       setMojangLoading(false);
@@ -760,7 +790,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
   const handleAutoBalanceEqual = () => {
     const perServer = Math.max(
       1,
-      Math.floor((globalRamCapGb / Math.max(1, servers.length)) * 2) / 2
+      Math.floor((globalRamCapGb / Math.max(1, servers.length)) * 2) / 2,
     );
     const map: Record<string, number> = {};
     servers.forEach((s) => {
@@ -777,7 +807,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
       'Balanced Fleet RAM Pool',
       `Assigned ${perServer} GB (-Xmx) equally across all ${servers.length} instances.`,
       'success',
-      'memory'
+      'memory',
     );
   };
 
@@ -797,7 +827,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
       'Online Priority RAM Applied',
       `Allocated ${onlineShare} GB to each running server and 1.5 GB standby cap to offline nodes.`,
       'success',
-      'bolt'
+      'bolt',
     );
   };
 
@@ -815,7 +845,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
       'Eco Host Memory Profile Active',
       'Capped standard servers at 2.5 GB and proxies at 1 GB to free Local PC memory.',
       'info',
-      'eco'
+      'eco',
     );
   };
 
@@ -854,7 +884,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
         localPcUser?.profileFilePath || '.local-operator-profile.json'
       }.`,
       'success',
-      'manage_accounts'
+      'manage_accounts',
     );
   };
 
@@ -865,7 +895,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
         'Primary Auth Required',
         'At least one authentication provider must remain linked.',
         'warning',
-        'lock'
+        'lock',
       );
       return;
     }
@@ -900,7 +930,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
         ? `Removed ${provider} OAuth token binding from local profile.`
         : `Connected ${provider} OAuth account to local operator profile.`,
       exists ? 'info' : 'success',
-      'verified_user'
+      'verified_user',
     );
   };
 
@@ -925,75 +955,78 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
   return (
     <div className="flex-1 overflow-y-auto p-6 space-y-6">
       {/* ================= 1. TOP REAL-TIME LOCAL PC HARDWARE, KERNEL, DISK & OS USER TELEMETRY BAR ================= */}
-      <div className="p-5 rounded-xl bg-surface-container-low border border-white/10 shadow-lg space-y-4">
-        <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-4">
-          <div className="space-y-1.5">
-            <div className="flex items-center gap-2 flex-wrap">
-              <span className="font-label-caps text-label-caps uppercase text-primary tracking-widest">
-                Local PC Kernel &amp; Workstation Control
-              </span>
-              <span className="text-on-surface-variant/40 text-xs">/</span>
-              <span className="font-headline-sm text-headline-sm text-white font-bold">
-                Real-Time Local PC Telemetry, Install Folder, Global RAM &amp; Profile
-              </span>
-              <span className="px-2.5 py-0.5 rounded-full bg-secondary/15 text-secondary border border-secondary/30 font-code-sm text-code-sm font-bold flex items-center gap-1.5">
-                <span
-                  className={`size-2 rounded-full ${
-                    livePollEnabled ? 'bg-secondary animate-ping' : 'bg-outline'
-                  }`}
-                />
-                {livePollEnabled ? `LOCAL PC LIVE (${lastHeartbeat})` : 'POLLING PAUSED'}
-              </span>
-            </div>
-            <p className="font-body-sm text-body-sm text-on-surface-variant">
-              Configure your Global Server Installation Folder, allocate Local PC RAM, manage live
-              OS processes (`ps -eo`), and sync your operator profile to local disk in real time.
+      <div className="rounded-xl bg-surface border border-white/[0.06] p-4 space-y-4">
+        <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-3">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <span className="material-symbols-outlined text-[18px] text-primary">
+              admin_panel_settings
+            </span>
+            <h1 className="text-[14.5px] font-semibold tracking-tight text-on-surface whitespace-nowrap">
+              Panel Control
+            </h1>
+            <span className="w-px h-4 bg-white/10 shrink-0" />
+            <p className="text-[11.5px] text-outline font-mono truncate">
+              Local PC kernel · install folder · global RAM · operator profile
             </p>
+            <span
+              className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md border font-mono text-[10.5px] shrink-0 ${
+                livePollEnabled
+                  ? 'border-secondary/25 bg-secondary/10 text-secondary'
+                  : 'border-white/10 bg-white/[0.03] text-outline'
+              }`}
+            >
+              <span
+                className={`size-1.5 rounded-full ${livePollEnabled ? 'bg-secondary' : 'bg-outline'}`}
+              />
+              {livePollEnabled ? `live ${lastHeartbeat}` : 'polling paused'}
+            </span>
           </div>
 
           {/* Section Filter Tabs + Live Stream Toggle */}
-          <div className="flex flex-wrap items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
             <button
               type="button"
               onClick={() => fetchPanelTelemetry()}
-              className="px-3 py-1.5 rounded-lg bg-surface-container-high hover:bg-surface-bright text-white font-code-sm text-code-sm font-bold flex items-center gap-1.5 border border-white/10 cursor-pointer"
+              className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg border border-white/10 bg-white/[0.02] hover:bg-white/[0.06] text-[11.5px] font-medium text-on-surface transition-colors cursor-pointer"
             >
-              <span className="material-symbols-outlined text-sm text-primary">refresh</span>
-              <span>Poll Local PC</span>
+              <span className="material-symbols-outlined text-[16px] text-primary">refresh</span>
+              <span>Poll host</span>
             </button>
 
             <button
               type="button"
               onClick={() => setLivePollEnabled(!livePollEnabled)}
-              className={`px-3 py-1.5 rounded-lg font-code-sm text-code-sm font-bold flex items-center gap-1.5 border cursor-pointer ${
+              className={`inline-flex items-center gap-1.5 h-8 px-3 rounded-lg border font-mono text-[11px] transition-colors cursor-pointer ${
                 livePollEnabled
-                  ? 'bg-secondary/15 text-secondary border-secondary/30'
-                  : 'bg-surface-container-high text-outline border-white/10'
+                  ? 'bg-secondary/10 text-secondary border-secondary/25'
+                  : 'bg-white/[0.02] text-outline border-white/10 hover:text-white'
               }`}
             >
-              <span className="material-symbols-outlined text-sm">sensors</span>
-              <span>{livePollEnabled ? '2s Stream: ON' : 'Stream: PAUSED'}</span>
+              <span
+                className={`size-1.5 rounded-full ${livePollEnabled ? 'bg-secondary' : 'bg-outline'}`}
+              />
+              <span>{livePollEnabled ? 'Polling 2s' : 'Poll paused'}</span>
             </button>
 
-            <div className="flex flex-wrap items-center gap-1 bg-surface-container-lowest p-1 rounded-xl border border-white/10">
+            <div className="flex flex-wrap items-center gap-0.5 p-0.5 rounded-lg border border-white/[0.06] bg-white/[0.02]">
               {[
-                { id: 'all', label: 'All Controls', icon: 'tune' },
-                { id: 'install_folder', label: 'Server Install Folder', icon: 'create_new_folder' },
+                { id: 'all', label: 'All', icon: 'tune' },
+                { id: 'install_folder', label: 'Install folder', icon: 'create_new_folder' },
                 { id: 'ram', label: 'Global RAM', icon: 'memory' },
-                { id: 'servers', label: 'Servers & PIDs', icon: 'terminal' },
+                { id: 'servers', label: 'Servers', icon: 'terminal' },
                 { id: 'profile', label: 'Profile', icon: 'manage_accounts' },
               ].map((t) => (
                 <button
                   key={t.id}
                   type="button"
                   onClick={() => setActiveTab(t.id as typeof activeTab)}
-                  className={`px-3 py-1.5 rounded-lg font-code-sm text-code-sm flex items-center gap-1.5 transition-all cursor-pointer ${
+                  className={`inline-flex items-center gap-1.5 h-7 px-2.5 rounded-md text-[11.5px] transition-colors cursor-pointer ${
                     activeTab === t.id
-                      ? 'bg-primary text-on-primary font-bold shadow-sm'
-                      : 'text-on-surface-variant hover:text-white'
+                      ? 'bg-white/[0.07] text-white font-medium'
+                      : 'text-outline hover:text-white'
                   }`}
                 >
-                  <span className="material-symbols-outlined text-sm">{t.icon}</span>
+                  <span className="material-symbols-outlined text-[15px]">{t.icon}</span>
                   <span>{t.label}</span>
                 </button>
               ))}
@@ -1003,9 +1036,9 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
 
         {/* Live Local PC Hardware, Kernel, Disk, NIC & OS User Telemetry Strip */}
         {hostTelemetry && (
-          <div className="pt-3 border-t border-white/10 space-y-3">
+          <div className="pt-3 border-t border-white/[0.06] space-y-3">
             <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-6 gap-2.5 font-mono text-xs">
-              <div className="p-2.5 rounded-lg bg-surface-container border border-white/5">
+              <div className="p-2.5 rounded-lg bg-white/[0.02] border border-white/[0.06]">
                 <span className="text-[10px] text-outline uppercase block">
                   Local PC Hostname &amp; OS
                 </span>
@@ -1017,7 +1050,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                 </span>
               </div>
 
-              <div className="p-2.5 rounded-lg bg-surface-container border border-white/5">
+              <div className="p-2.5 rounded-lg bg-white/[0.02] border border-white/[0.06]">
                 <span className="text-[10px] text-outline uppercase block">
                   Local PC CPU ({hostTelemetry.cpuCores} Cores)
                 </span>
@@ -1032,7 +1065,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                 </span>
               </div>
 
-              <div className="p-2.5 rounded-lg bg-surface-container border border-white/5">
+              <div className="p-2.5 rounded-lg bg-white/[0.02] border border-white/[0.06]">
                 <span className="text-[10px] text-outline uppercase block">
                   Local PC RAM (/proc/meminfo)
                 </span>
@@ -1044,7 +1077,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                 </span>
               </div>
 
-              <div className="p-2.5 rounded-lg bg-surface-container border border-white/5">
+              <div className="p-2.5 rounded-lg bg-white/[0.02] border border-white/[0.06]">
                 <span className="text-[10px] text-outline uppercase block">
                   Local PC Root Disk (df -k /)
                 </span>
@@ -1057,7 +1090,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                 </span>
               </div>
 
-              <div className="p-2.5 rounded-lg bg-surface-container border border-white/5">
+              <div className="p-2.5 rounded-lg bg-white/[0.02] border border-white/[0.06]">
                 <span className="text-[10px] text-outline uppercase block">
                   Server Install Folder
                 </span>
@@ -1072,7 +1105,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                 </span>
               </div>
 
-              <div className="p-2.5 rounded-lg bg-surface-container border border-white/5">
+              <div className="p-2.5 rounded-lg bg-white/[0.02] border border-white/[0.06]">
                 <span className="text-[10px] text-outline uppercase block">
                   Local PC OS User (os.userInfo)
                 </span>
@@ -1090,8 +1123,8 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
 
       {/* ================= 1B. GLOBAL SERVER INSTALLATION FOLDER & SUBFOLDER PROVISIONER ================= */}
       {(activeTab === 'all' || activeTab === 'install_folder') && (
-        <section className="p-6 rounded-xl bg-surface-container-low border border-primary/30 shadow-lg space-y-5">
-          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 pb-3 border-b border-white/10">
+        <section className="p-6 rounded-xl bg-surface-container-low border border-primary/30 space-y-5">
+          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 pb-3 border-b border-white/[0.08]">
             <div className="flex items-start gap-3">
               <div className="p-2.5 rounded-xl bg-primary/15 text-primary border border-primary/30">
                 <span className="material-symbols-outlined text-2xl">create_new_folder</span>
@@ -1100,7 +1133,8 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                 <h2 className="font-headline-sm text-headline-sm text-white font-bold flex items-center gap-2 flex-wrap">
                   Global Server Installation Root Folder &amp; Subfolder Manager
                   <span className="px-2 py-0.5 rounded bg-secondary/15 text-secondary border border-secondary/30 font-code-sm text-code-sm">
-                    {installConfig?.installedFolders.length || servers.length} INSTALLED SUBFOLDERS ON LOCAL PC
+                    {installConfig?.installedFolders.length || servers.length} INSTALLED SUBFOLDERS
+                    ON LOCAL PC
                   </span>
                 </h2>
                 <p className="font-body-sm text-body-sm text-on-surface-variant">
@@ -1137,7 +1171,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                   className={`px-2.5 py-1.5 rounded-lg font-mono text-xs font-bold border transition-all cursor-pointer ${
                     installRootInput === preset.path
                       ? 'bg-primary text-on-primary border-primary'
-                      : 'bg-surface-container-high hover:bg-surface-bright text-on-surface border-white/10'
+                      : 'bg-surface-container-high hover:bg-surface-bright text-on-surface border-white/[0.08]'
                   }`}
                 >
                   {preset.label}
@@ -1149,7 +1183,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
           {/* Left: Set Global Install Folder Form | Right: Quick Install New Server into Folder */}
           <div className="grid grid-cols-1 xl:grid-cols-12 gap-5">
             {/* Configure Global Server Install Folder (7 cols) */}
-            <div className="xl:col-span-7 p-4 rounded-xl bg-surface-container border border-white/10 space-y-4 flex flex-col justify-between">
+            <div className="xl:col-span-7 p-4 rounded-xl bg-surface-container border border-white/[0.08] space-y-4 flex flex-col justify-between">
               <div className="space-y-3">
                 <div className="flex items-center justify-between">
                   <label className="font-label-caps text-label-caps uppercase text-primary flex items-center gap-1.5">
@@ -1173,7 +1207,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                     type="button"
                     disabled={savingInstallFolder}
                     onClick={() => handleApplyInstallFolder()}
-                    className="px-4 py-2.5 rounded-lg bg-primary hover:bg-primary-fixed text-on-primary font-mono text-xs font-bold flex items-center justify-center gap-1.5 shadow-lg shadow-primary/20 cursor-pointer shrink-0"
+                    className="px-4 py-2.5 rounded-lg bg-primary hover:bg-primary-fixed text-on-primary font-mono text-xs font-bold flex items-center justify-center gap-1.5 cursor-pointer shrink-0"
                   >
                     <span className="material-symbols-outlined text-sm">save</span>
                     <span>
@@ -1185,7 +1219,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                 </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-1">
-                  <label className="p-2.5 rounded-lg bg-surface-container-lowest border border-white/5 flex items-center gap-2.5 cursor-pointer">
+                  <label className="p-2.5 rounded-lg bg-surface-container-lowest border border-white/[0.06] flex items-center gap-2.5 cursor-pointer">
                     <input
                       type="checkbox"
                       checked={autoCreateSubfolders}
@@ -1203,7 +1237,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                     </div>
                   </label>
 
-                  <label className="p-2.5 rounded-lg bg-surface-container-lowest border border-white/5 flex items-center gap-2.5 cursor-pointer">
+                  <label className="p-2.5 rounded-lg bg-surface-container-lowest border border-white/[0.06] flex items-center gap-2.5 cursor-pointer">
                     <input
                       type="checkbox"
                       checked={autoAcceptEula}
@@ -1222,7 +1256,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                 </div>
               </div>
 
-              <div className="p-3 rounded-lg bg-surface-container-lowest border border-white/5 font-mono text-xs flex flex-wrap items-center justify-between gap-2">
+              <div className="p-3 rounded-lg bg-surface-container-lowest border border-white/[0.06] font-mono text-xs flex flex-wrap items-center justify-between gap-2">
                 <div>
                   <span className="text-outline uppercase text-[10px] block">
                     Active Global Installation Directory Structure
@@ -1242,7 +1276,9 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                   onClick={() => onNavigate('files')}
                   className="px-2.5 py-1 rounded bg-surface-container-high hover:bg-surface-bright text-white text-[11px] flex items-center gap-1 cursor-pointer"
                 >
-                  <span className="material-symbols-outlined text-xs text-primary">folder_open</span>
+                  <span className="material-symbols-outlined text-xs text-primary">
+                    folder_open
+                  </span>
                   <span>Open File Manager</span>
                 </button>
               </div>
@@ -1274,7 +1310,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                       value={quickSrvName}
                       onChange={(e) => setQuickSrvName(e.target.value)}
                       placeholder="e.g. Skyblock_Season_1"
-                      className="w-full px-3 py-2 rounded-lg bg-surface-container-lowest text-white font-mono text-xs border border-white/10 focus:outline-none focus:border-primary"
+                      className="w-full px-3 py-2 rounded-lg bg-surface-container-lowest text-white font-mono text-xs border border-white/[0.08] focus:outline-none focus:border-primary"
                       required
                     />
                   </div>
@@ -1285,8 +1321,13 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                     </label>
                     <select
                       value={quickSrvEngine}
-                      onChange={(e) => setQuickSrvEngine(e.target.value)}
-                      className="w-full px-3 py-2 rounded-lg bg-surface-container-lowest text-primary font-mono font-bold text-xs border border-white/10 focus:outline-none focus:border-primary cursor-pointer"
+                      onChange={(e) => {
+                        setQuickSrvEngine(e.target.value);
+                        // Extract engine name (without version) for API call
+                        const engine = e.target.value.split(' ')[0].toLowerCase();
+                        fetchAvailableVersions(engine);
+                      }}
+                      className="w-full px-3 py-2 rounded-lg bg-surface-container-lowest text-primary font-mono font-bold text-xs border border-white/[0.08] focus:outline-none focus:border-primary cursor-pointer"
                     >
                       <option value="PaperMC 1.21.4">PaperMC 1.21.4</option>
                       <option value="Purpur 1.21.4">Purpur 1.21.4</option>
@@ -1299,13 +1340,30 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
 
                   <div>
                     <label className="block font-mono text-[10px] uppercase text-outline mb-1">
+                      Server Version
+                    </label>
+                    <select
+                      value={quickSrvVersion}
+                      onChange={(e) => setQuickSrvVersion(e.target.value)}
+                      className="w-full px-3 py-2 rounded-lg bg-surface-container-lowest text-primary font-mono font-bold text-xs border border-white/[0.08] focus:outline-none focus:border-primary cursor-pointer"
+                    >
+                      {availableVersions.map((version) => (
+                        <option key={version} value={version}>
+                          {version}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block font-mono text-[10px] uppercase text-outline mb-1">
                       Local Port
                     </label>
                     <input
                       type="number"
                       value={quickSrvPort}
                       onChange={(e) => setQuickSrvPort(Number(e.target.value))}
-                      className="w-full px-3 py-2 rounded-lg bg-surface-container-lowest text-tertiary font-mono text-xs border border-white/10 focus:outline-none focus:border-primary"
+                      className="w-full px-3 py-2 rounded-lg bg-surface-container-lowest text-tertiary font-mono text-xs border border-white/[0.08] focus:outline-none focus:border-primary"
                     />
                   </div>
 
@@ -1319,21 +1377,21 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                       max={32}
                       value={quickSrvRamGb}
                       onChange={(e) => setQuickSrvRamGb(Number(e.target.value))}
-                      className="w-full px-3 py-2 rounded-lg bg-surface-container-lowest text-white font-mono text-xs border border-white/10 focus:outline-none focus:border-primary"
+                      className="w-full px-3 py-2 rounded-lg bg-surface-container-lowest text-white font-mono text-xs border border-white/[0.08] focus:outline-none focus:border-primary"
                     />
                   </div>
                 </div>
               </div>
 
               <div className="space-y-2 pt-1">
-                <div className="p-2 rounded bg-surface-container-lowest border border-white/5 font-mono text-[11px] truncate">
+                <div className="p-2 rounded bg-surface-container-lowest border border-white/[0.06] font-mono text-[11px] truncate">
                   <span className="text-outline">Target Path: </span>
                   <span className="text-secondary font-bold">{previewTargetFolder}</span>
                 </div>
                 <button
                   type="submit"
                   disabled={installingServer}
-                  className="w-full py-2.5 rounded-lg bg-secondary hover:bg-secondary/90 text-surface-dim font-mono text-xs font-bold flex items-center justify-center gap-1.5 shadow-md cursor-pointer"
+                  className="w-full py-2.5 rounded-lg bg-secondary hover:bg-secondary/90 text-surface-dim font-mono text-xs font-bold flex items-center justify-center gap-1.5 cursor-pointer"
                 >
                   <span className="material-symbols-outlined text-base">install_desktop</span>
                   <span>
@@ -1342,17 +1400,27 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                       : `Install "${quickSrvName || 'Server'}" Inside Folder Now`}
                   </span>
                 </button>
+                {installingServer && installJob && (
+                  <JobProgressBar
+                    job={installJob}
+                    className="mt-2"
+                    onCancel={() => {
+                      void cancelJob(installJob.id);
+                    }}
+                  />
+                )}
               </div>
             </form>
           </div>
 
           {/* Live Local PC Installed Server Subfolders List (fs.readdirSync) */}
           {installConfig && installConfig.installedFolders.length > 0 && (
-            <div className="pt-3 border-t border-white/10 space-y-2.5">
+            <div className="pt-3 border-t border-white/[0.08] space-y-2.5">
               <div className="flex items-center justify-between">
                 <span className="font-label-caps text-label-caps uppercase text-outline flex items-center gap-1.5">
                   <span className="size-2 rounded-full bg-secondary animate-ping" />
-                  Live Server Subfolders Installed Inside `{installConfig.installRootDir}` (Local PC Disk)
+                  Live Server Subfolders Installed Inside `{installConfig.installRootDir}` (Local PC
+                  Disk)
                 </span>
                 <span className="font-mono text-[11px] text-secondary">
                   Disk Path: {installConfig.resolvedDiskRoot}
@@ -1363,7 +1431,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                 {installConfig.installedFolders.map((folder) => (
                   <div
                     key={folder.folderName}
-                    className="p-3 rounded-xl bg-surface-container border border-white/5 font-mono text-xs flex flex-col justify-between gap-2"
+                    className="p-3 rounded-xl bg-surface-container border border-white/[0.06] font-mono text-xs flex flex-col justify-between gap-2"
                   >
                     <div className="flex items-start justify-between gap-2">
                       <div className="min-w-0">
@@ -1385,7 +1453,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                       </span>
                     </div>
 
-                    <div className="flex items-center justify-between gap-1 flex-wrap pt-1 border-t border-white/5 text-[10px]">
+                    <div className="flex items-center justify-between gap-1 flex-wrap pt-1 border-t border-white/[0.06] text-[10px]">
                       <div className="flex items-center gap-1 flex-wrap">
                         {folder.hasEula && (
                           <span className="px-1.5 py-0.2 rounded bg-primary/15 text-primary">
@@ -1424,8 +1492,8 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
 
       {/* ================= 2. REAL-TIME GLOBAL RAM ALLOCATOR (SYNCED WITH LOCAL PC PHYSICAL MEMORY) ================= */}
       {(activeTab === 'all' || activeTab === 'ram') && (
-        <section className="p-6 rounded-xl bg-surface-container-low border border-white/10 shadow-lg space-y-5">
-          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 pb-3 border-b border-white/10">
+        <section className="p-6 rounded-xl bg-surface-container-low border border-white/[0.08] space-y-5">
+          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 pb-3 border-b border-white/[0.08]">
             <div className="flex items-start gap-3">
               <div className="p-2.5 rounded-xl bg-primary/15 text-primary border border-primary/30">
                 <span className="material-symbols-outlined text-2xl">memory</span>
@@ -1471,7 +1539,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
               <button
                 type="button"
                 onClick={handleAutoBalanceEqual}
-                className="px-3 py-1.5 rounded-lg bg-surface-container-high hover:bg-surface-bright text-white font-code-sm text-code-sm flex items-center gap-1.5 border border-white/10 cursor-pointer"
+                className="px-3 py-1.5 rounded-lg bg-surface-container-high hover:bg-surface-bright text-white font-code-sm text-code-sm flex items-center gap-1.5 border border-white/[0.08] cursor-pointer"
               >
                 <span className="material-symbols-outlined text-sm text-primary">balance</span>
                 <span>Auto-Balance Equally</span>
@@ -1479,7 +1547,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
               <button
                 type="button"
                 onClick={handlePrioritizeOnline}
-                className="px-3 py-1.5 rounded-lg bg-surface-container-high hover:bg-surface-bright text-white font-code-sm text-code-sm flex items-center gap-1.5 border border-white/10 cursor-pointer"
+                className="px-3 py-1.5 rounded-lg bg-surface-container-high hover:bg-surface-bright text-white font-code-sm text-code-sm flex items-center gap-1.5 border border-white/[0.08] cursor-pointer"
               >
                 <span className="material-symbols-outlined text-sm text-secondary">bolt</span>
                 <span>Boost Running Servers</span>
@@ -1487,7 +1555,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
               <button
                 type="button"
                 onClick={handleEcoFootprint}
-                className="px-3 py-1.5 rounded-lg bg-surface-container-high hover:bg-surface-bright text-white font-code-sm text-code-sm flex items-center gap-1.5 border border-white/10 cursor-pointer"
+                className="px-3 py-1.5 rounded-lg bg-surface-container-high hover:bg-surface-bright text-white font-code-sm text-code-sm flex items-center gap-1.5 border border-white/[0.08] cursor-pointer"
               >
                 <span className="material-symbols-outlined text-sm text-tertiary">eco</span>
                 <span>Eco Footprint</span>
@@ -1498,7 +1566,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
           {/* Host Physical RAM, Pool Limit & Live Recharts Memory Stream */}
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-stretch">
             <div className="lg:col-span-7 grid grid-cols-1 sm:grid-cols-2 gap-4">
-              <div className="p-4 rounded-xl bg-surface-container border border-white/5 space-y-2 flex flex-col justify-between">
+              <div className="p-4 rounded-xl bg-surface-container border border-white/[0.06] space-y-2 flex flex-col justify-between">
                 <div className="flex items-center justify-between">
                   <span className="font-label-caps text-label-caps uppercase text-outline">
                     Local PC Physical RAM Ceiling
@@ -1514,7 +1582,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                       onClick={handleSyncToRealLocalPcRam}
                       className={`px-2.5 py-1.5 rounded-lg font-mono text-xs font-bold transition-all cursor-pointer ${
                         Math.abs(hostTotalRamGb - hostTelemetry.osTotalGb) < 0.6
-                          ? 'bg-secondary text-surface-dim shadow-sm'
+                          ? 'bg-secondary text-surface-dim '
                           : 'bg-secondary/15 text-secondary border border-secondary/30 hover:bg-secondary/25'
                       }`}
                     >
@@ -1528,7 +1596,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                       onClick={() => {
                         const nextCap = Math.min(
                           cap - 2,
-                          globalRamCapGb > cap - 2 ? cap - 2 : Math.round(cap * 0.85)
+                          globalRamCapGb > cap - 2 ? cap - 2 : Math.round(cap * 0.85),
                         );
                         onUpdateGlobalRamConfig(cap, nextCap);
                         syncRamWithBackend({ hostTotalGb: cap, globalCapGb: nextCap });
@@ -1536,12 +1604,12 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                           `Host RAM Set to ${cap} GB`,
                           `Global panel allocation ceiling synced to ${nextCap} GB.`,
                           'info',
-                          'memory'
+                          'memory',
                         );
                       }}
                       className={`flex-1 py-1.5 rounded-lg font-mono text-xs font-bold transition-all cursor-pointer ${
                         hostTotalRamGb === cap
-                          ? 'bg-primary text-on-primary shadow-sm'
+                          ? 'bg-primary text-on-primary '
                           : 'bg-surface-container-lowest text-on-surface-variant hover:text-white'
                       }`}
                     >
@@ -1557,7 +1625,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                 </div>
               </div>
 
-              <div className="p-4 rounded-xl bg-surface-container border border-white/5 space-y-2 flex flex-col justify-between">
+              <div className="p-4 rounded-xl bg-surface-container border border-white/[0.06] space-y-2 flex flex-col justify-between">
                 <div className="flex items-center justify-between">
                   <span className="font-label-caps text-label-caps uppercase text-outline">
                     Global Panel RAM Pool Cap
@@ -1588,7 +1656,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
             </div>
 
             {/* Real-Time Recharts Local PC RAM vs Fleet Allocation Stream */}
-            <div className="lg:col-span-5 p-3.5 rounded-xl bg-surface-container border border-white/5 flex flex-col justify-between">
+            <div className="lg:col-span-5 p-3.5 rounded-xl bg-surface-container border border-white/[0.06] flex flex-col justify-between">
               <div className="flex items-center justify-between mb-1">
                 <span className="font-label-caps text-label-caps uppercase text-outline">
                   Live Local PC RAM Used vs Fleet Heap (GB)
@@ -1654,7 +1722,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
             {servers.map((srv) => (
               <div
                 key={srv.id}
-                className="p-3.5 rounded-xl bg-surface-container border border-white/5 flex flex-col justify-between space-y-2.5"
+                className="p-3.5 rounded-xl bg-surface-container border border-white/[0.06] flex flex-col justify-between space-y-2.5"
               >
                 <div className="flex items-center justify-between gap-2">
                   <div className="flex items-center gap-2 min-w-0">
@@ -1663,8 +1731,8 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                         srv.status === 'running'
                           ? 'bg-secondary'
                           : srv.status === 'restarting'
-                          ? 'bg-primary animate-ping'
-                          : 'bg-error'
+                            ? 'bg-primary animate-ping'
+                            : 'bg-error'
                       }`}
                     />
                     <span className="font-bold text-white text-sm truncate">{srv.name}</span>
@@ -1706,7 +1774,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                             `Synced ${srv.name} RAM`,
                             `Live max heap (-Xmx) set to ${presetGb} GB.`,
                             'info',
-                            'memory'
+                            'memory',
                           );
                         }}
                         className={`px-1.5 py-0.5 rounded font-mono text-[10px] cursor-pointer ${
@@ -1728,8 +1796,8 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
 
       {/* ================= 3. REAL-TIME GLOBAL SERVER KILL LIST & LOCAL PC OS KERNEL PROCESSES ================= */}
       {(activeTab === 'all' || activeTab === 'servers') && (
-        <section className="p-6 rounded-xl bg-surface-container-low border border-white/10 shadow-lg space-y-6">
-          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 pb-3 border-b border-white/10">
+        <section className="p-6 rounded-xl bg-surface-container-low border border-white/[0.08] space-y-6">
+          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 pb-3 border-b border-white/[0.08]">
             <div className="flex items-start gap-3">
               <div className="p-2.5 rounded-xl bg-error/15 text-error border border-error/30">
                 <span className="material-symbols-outlined text-2xl">bolt</span>
@@ -1765,7 +1833,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                 type="button"
                 onClick={handleLiveKillAllServers}
                 disabled={runningServersCount === 0}
-                className="px-4 py-2 rounded-lg bg-error hover:bg-error/90 disabled:opacity-40 text-on-error font-mono text-xs font-bold flex items-center gap-1.5 shadow-lg shadow-error/20 transition-all cursor-pointer"
+                className="px-4 py-2 rounded-lg bg-error hover:bg-error/90 disabled:opacity-40 text-on-error font-mono text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer"
               >
                 <span className="material-symbols-outlined text-base">dangerous</span>
                 <span>EMERGENCY KILL ALL SERVERS (SIGKILL -9)</span>
@@ -1793,10 +1861,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                   const isRunning = srv.status === 'running' || srv.status === 'restarting';
                   const isCurrent = srv.id === activeServer.id;
                   return (
-                    <tr
-                      key={srv.id}
-                      className="hover:bg-surface-container/60 transition-colors"
-                    >
+                    <tr key={srv.id} className="hover:bg-surface-container/60 transition-colors">
                       <td className="py-3 px-3">
                         <div className="flex items-center gap-2.5">
                           <span
@@ -1804,8 +1869,8 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                               srv.status === 'running'
                                 ? 'bg-secondary shadow-[0_0_8px_rgba(52,245,155,0.7)]'
                                 : srv.status === 'restarting'
-                                ? 'bg-primary animate-ping'
-                                : 'bg-error'
+                                  ? 'bg-primary animate-ping'
+                                  : 'bg-error'
                             }`}
                           />
                           <div>
@@ -1841,12 +1906,17 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
 
                       <td className="py-3 px-3 font-mono text-xs">
                         <div className="text-white">
-                          CPU: <strong className="text-primary">{srv.cpuUsage}%</strong> (
-                          {srv.cpuTemp}
-                          °C) • <span className="text-secondary">{srv.tps} TPS</span>
+                          CPU: <strong className="text-primary">{srv.cpuUsage}%</strong>
+                          {srv.tps > 0 ? (
+                            <>
+                              {' '}
+                              • <span className="text-secondary">{srv.tps} TPS</span>
+                            </>
+                          ) : null}
                         </div>
                         <div className="text-secondary">
-                          RAM: {srv.ramUsedGb} / {srv.ramMaxGb} GB ({srv.tickMs} mspt)
+                          RAM: {srv.ramUsedGb} / {srv.ramMaxGb} GB
+                          {srv.tickMs > 0 ? ` (${srv.tickMs} mspt)` : ''}
                         </div>
                       </td>
 
@@ -1856,8 +1926,8 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                             srv.status === 'running'
                               ? 'bg-secondary/15 text-secondary'
                               : srv.status === 'restarting'
-                              ? 'bg-primary/20 text-primary'
-                              : 'bg-error/15 text-error'
+                                ? 'bg-primary/20 text-primary'
+                                : 'bg-error/15 text-error'
                           }`}
                         >
                           {srv.status}
@@ -1905,7 +1975,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                               <button
                                 type="button"
                                 onClick={() => handleLiveServerAction(srv, 'kill')}
-                                className="px-3 py-1 rounded bg-error hover:bg-error/85 text-on-error font-mono text-xs font-bold flex items-center gap-1 shadow-sm cursor-pointer"
+                                className="px-3 py-1 rounded bg-error hover:bg-error/85 text-on-error font-mono text-xs font-bold flex items-center gap-1 cursor-pointer"
                                 title={`Force Kill PID ${srv.pid} (SIGKILL -9)`}
                               >
                                 <span className="material-symbols-outlined text-sm">bolt</span>
@@ -1935,7 +2005,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
 
           {/* Real-Time Local PC OS Kernel Process Table (ps -eo) with Real process.kill(pid, 'SIGKILL') */}
           {osProcesses.length > 0 && (
-            <div className="pt-4 border-t border-white/10 space-y-3">
+            <div className="pt-4 border-t border-white/[0.08] space-y-3">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                 <div className="flex items-center gap-2">
                   <span className="size-2.5 rounded-full bg-secondary animate-ping" />
@@ -2025,9 +2095,9 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
           {/* Left: Real-Time Edit Profile Form + Local PC OS Account & Mojang Fetcher (8 cols) */}
           <form
             onSubmit={handleSaveProfile}
-            className="xl:col-span-8 p-6 rounded-xl bg-surface-container-low border border-white/10 shadow-lg space-y-5"
+            className="xl:col-span-8 p-6 rounded-xl bg-surface-container-low border border-white/[0.08] space-y-5"
           >
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-white/10">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-white/[0.08]">
               <div className="flex items-center gap-3">
                 <img
                   src={avatarUrl}
@@ -2048,7 +2118,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                 </div>
               </div>
 
-              <label className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-surface-container border border-white/10 cursor-pointer">
+              <label className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-surface-container border border-white/[0.08] cursor-pointer">
                 <input
                   type="checkbox"
                   checked={liveAutoSyncProfile}
@@ -2078,7 +2148,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                   <button
                     type="button"
                     onClick={handleImportLocalPcUserToProfile}
-                    className="px-3.5 py-2 rounded-lg bg-secondary text-surface-dim font-mono text-xs font-bold flex items-center gap-1.5 shadow-sm cursor-pointer shrink-0"
+                    className="px-3.5 py-2 rounded-lg bg-secondary text-surface-dim font-mono text-xs font-bold flex items-center gap-1.5 cursor-pointer shrink-0"
                   >
                     <span className="material-symbols-outlined text-sm">download</span>
                     <span>
@@ -2088,7 +2158,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                 </div>
 
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 font-mono text-xs">
-                  <div className="p-2.5 rounded-lg bg-surface-container-lowest border border-white/5">
+                  <div className="p-2.5 rounded-lg bg-surface-container-lowest border border-white/[0.06]">
                     <span className="text-[10px] text-outline block uppercase">
                       OS Username / UID
                     </span>
@@ -2096,7 +2166,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                       {localPcUser.username} (uid={localPcUser.uid}, gid={localPcUser.gid})
                     </span>
                   </div>
-                  <div className="p-2.5 rounded-lg bg-surface-container-lowest border border-white/5">
+                  <div className="p-2.5 rounded-lg bg-surface-container-lowest border border-white/[0.06]">
                     <span className="text-[10px] text-outline block uppercase">
                       Home Dir &amp; Shell
                     </span>
@@ -2108,7 +2178,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                     </span>
                     <span className="text-[10px] text-outline">{localPcUser.shell}</span>
                   </div>
-                  <div className="p-2.5 rounded-lg bg-surface-container-lowest border border-white/5">
+                  <div className="p-2.5 rounded-lg bg-surface-container-lowest border border-white/[0.06]">
                     <span className="text-[10px] text-outline block uppercase">
                       Primary NIC / MAC
                     </span>
@@ -2117,7 +2187,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                     </span>
                     <span className="text-[10px] text-outline block">{localPcUser.primaryMac}</span>
                   </div>
-                  <div className="p-2.5 rounded-lg bg-surface-container-lowest border border-white/5">
+                  <div className="p-2.5 rounded-lg bg-surface-container-lowest border border-white/[0.06]">
                     <span className="text-[10px] text-outline block uppercase">
                       Runtime &amp; Working Dir
                     </span>
@@ -2152,7 +2222,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                   value={mojangLookupInput}
                   onChange={(e) => setMojangLookupInput(e.target.value)}
                   placeholder="Enter any real Minecraft Java IGN (e.g. Notch, jeb_, Grian, MumboJumbo)..."
-                  className="flex-1 px-3 py-2 rounded-lg bg-surface-container-lowest text-white font-mono text-xs border border-white/10 focus:outline-none focus:border-primary"
+                  className="flex-1 px-3 py-2 rounded-lg bg-surface-container-lowest text-white font-mono text-xs border border-white/[0.08] focus:outline-none focus:border-primary"
                 />
                 <button
                   type="button"
@@ -2179,7 +2249,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                   type="text"
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
-                  className="w-full px-3.5 py-2.5 rounded-lg bg-surface-container text-white font-mono text-sm border border-white/10 focus:outline-none focus:border-primary"
+                  className="w-full px-3.5 py-2.5 rounded-lg bg-surface-container text-white font-mono text-sm border border-white/[0.08] focus:outline-none focus:border-primary"
                   required
                 />
               </div>
@@ -2192,7 +2262,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                   type="text"
                   value={displayName}
                   onChange={(e) => setDisplayName(e.target.value)}
-                  className="w-full px-3.5 py-2.5 rounded-lg bg-surface-container text-white text-sm border border-white/10 focus:outline-none focus:border-primary"
+                  className="w-full px-3.5 py-2.5 rounded-lg bg-surface-container text-white text-sm border border-white/[0.08] focus:outline-none focus:border-primary"
                   required
                 />
               </div>
@@ -2205,7 +2275,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                   type="email"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
-                  className="w-full px-3.5 py-2.5 rounded-lg bg-surface-container text-white font-mono text-sm border border-white/10 focus:outline-none focus:border-primary"
+                  className="w-full px-3.5 py-2.5 rounded-lg bg-surface-container text-white font-mono text-sm border border-white/[0.08] focus:outline-none focus:border-primary"
                   required
                 />
               </div>
@@ -2217,10 +2287,12 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                 <select
                   value={role}
                   onChange={(e) => setRole(e.target.value as AuthUser['role'])}
-                  className="w-full px-3.5 py-2.5 rounded-lg bg-surface-container text-primary font-mono font-bold text-sm border border-white/10 focus:outline-none focus:border-primary cursor-pointer"
+                  className="w-full px-3.5 py-2.5 rounded-lg bg-surface-container text-primary font-mono font-bold text-sm border border-white/[0.08] focus:outline-none focus:border-primary cursor-pointer"
                 >
                   <option value="Root Admin">Root Admin (Full Kernel &amp; SIGKILL Access)</option>
-                  <option value="DevOps Engineer">DevOps Engineer (JVM &amp; Network Access)</option>
+                  <option value="DevOps Engineer">
+                    DevOps Engineer (JVM &amp; Network Access)
+                  </option>
                   <option value="Operator">Operator (Console &amp; Plugins Access)</option>
                   <option value="Moderator">Moderator (Player &amp; Chat Management)</option>
                 </select>
@@ -2234,7 +2306,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                   type="text"
                   value={mcUuid}
                   onChange={(e) => setMcUuid(e.target.value)}
-                  className="w-full px-3.5 py-2.5 rounded-lg bg-surface-container text-secondary font-mono text-sm border border-white/10 focus:outline-none focus:border-primary"
+                  className="w-full px-3.5 py-2.5 rounded-lg bg-surface-container text-secondary font-mono text-sm border border-white/[0.08] focus:outline-none focus:border-primary"
                 />
               </div>
 
@@ -2247,7 +2319,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                   value={newPassword}
                   onChange={(e) => setNewPassword(e.target.value)}
                   placeholder="Enter new operator passphrase..."
-                  className="w-full px-3.5 py-2.5 rounded-lg bg-surface-container text-white font-mono text-sm border border-white/10 focus:outline-none focus:border-primary"
+                  className="w-full px-3.5 py-2.5 rounded-lg bg-surface-container text-white font-mono text-sm border border-white/[0.08] focus:outline-none focus:border-primary"
                 />
               </div>
             </div>
@@ -2266,7 +2338,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                     className={`p-1 rounded-xl border-2 transition-all cursor-pointer ${
                       avatarUrl === url
                         ? 'border-primary bg-primary/20 scale-105'
-                        : 'border-white/10 hover:border-white/30'
+                        : 'border-white/[0.08] hover:border-white/30'
                     }`}
                   >
                     <img
@@ -2281,15 +2353,15 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                   value={avatarUrl}
                   onChange={(e) => setAvatarUrl(e.target.value)}
                   placeholder="Or paste custom avatar image URL..."
-                  className="flex-1 min-w-[220px] px-3 py-2 rounded-lg bg-surface-container text-white font-mono text-xs border border-white/10 focus:outline-none focus:border-primary"
+                  className="flex-1 min-w-[220px] px-3 py-2 rounded-lg bg-surface-container text-white font-mono text-xs border border-white/[0.08] focus:outline-none focus:border-primary"
                 />
               </div>
             </div>
 
-            <div className="flex items-center justify-end gap-3 pt-2 border-t border-white/10">
+            <div className="flex items-center justify-end gap-3 pt-2 border-t border-white/[0.08]">
               <button
                 type="submit"
-                className="px-5 py-2.5 rounded-lg bg-primary hover:bg-primary-fixed text-on-primary font-bold text-sm flex items-center gap-2 shadow-lg shadow-primary/20 cursor-pointer"
+                className="px-5 py-2.5 rounded-lg bg-primary hover:bg-primary-fixed text-on-primary font-bold text-sm flex items-center gap-2 cursor-pointer"
               >
                 <span className="material-symbols-outlined text-base">save</span>
                 <span>Commit Profile to Local PC Disk Now</span>
@@ -2300,7 +2372,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
           {/* Right: Discord Bot Verification Quota, Linked OAuth Providers & Audit Stream (4 cols) */}
           <div className="xl:col-span-4 space-y-4">
             {/* Discord Server & Bot Verification Quota Card */}
-            <div className="p-5 rounded-xl bg-gradient-to-br from-[#5865F2]/15 via-surface-container-low to-surface-container-low border border-[#5865F2]/35 shadow-lg space-y-3.5">
+            <div className="p-5 rounded-xl bg-gradient-to-br from-[#5865F2]/15 via-surface-container-low to-surface-container-low border border-[#5865F2]/35 space-y-3.5">
               <div className="flex items-center justify-between gap-2">
                 <h3 className="font-title-md text-title-md text-white font-bold flex items-center gap-2">
                   <span className="material-symbols-outlined text-[#8ea1e1]">verified_user</span>
@@ -2311,23 +2383,24 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                     currentUser.discordVerified
                       ? 'bg-secondary/20 text-secondary border border-secondary/40'
                       : currentUser.discordMemberStatus === 'left_guild'
-                      ? 'bg-error/20 text-error border border-error/40'
-                      : 'bg-amber-400/20 text-amber-300 border border-amber-400/40'
+                        ? 'bg-error/20 text-error border border-error/40'
+                        : 'bg-amber-400/20 text-amber-300 border border-amber-400/40'
                   }`}
                 >
                   {currentUser.discordVerified
                     ? 'Bot Verified • 10 Max'
                     : currentUser.discordMemberStatus === 'left_guild'
-                    ? 'Left Discord • Reset to 2'
-                    : 'Standard • 2 Max'}
+                      ? 'Left Discord • Reset to 2'
+                      : 'Standard • 2 Max'}
                 </span>
               </div>
 
-              <div className="p-3 rounded-lg bg-surface-container border border-white/10 space-y-2 text-xs font-mono">
+              <div className="p-3 rounded-lg bg-surface-container border border-white/[0.08] space-y-2 text-xs font-mono">
                 <div className="flex items-center justify-between">
                   <span className="text-outline">Server Creation Limit:</span>
                   <span className="text-white font-bold">
-                    {servers.length} / {currentUser.discordVerified ? currentUser.maxServerLimit || 10 : 2} Servers
+                    {servers.length} /{' '}
+                    {currentUser.discordVerified ? currentUser.maxServerLimit || 10 : 2} Servers
                   </span>
                 </div>
                 <div className="w-full h-2 rounded-full bg-surface-lowest overflow-hidden">
@@ -2340,7 +2413,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                         100,
                         (servers.length /
                           (currentUser.discordVerified ? currentUser.maxServerLimit || 10 : 2)) *
-                          100
+                          100,
                       )}%`,
                     }}
                   />
@@ -2362,8 +2435,8 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                     {currentUser.discordVerified ? 'manage_accounts' : 'verified'}
                   </span>
                   {currentUser.discordVerified
-                    ? 'Open Discord Bot Verification Console'
-                    : 'Connect Discord & Verify by Bot (Unlock >2 Servers)'}
+                    ? 'Open Discord Verification Console'
+                    : 'Connect Discord & Verify (Unlock >2 Servers)'}
                 </button>
 
                 {currentUser.discordVerified && onLeaveDiscordServer && (
@@ -2379,7 +2452,14 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
               </div>
             </div>
 
-            <div className="p-5 rounded-xl bg-surface-container-low border border-white/10 shadow-lg space-y-4">
+            <DiscordAccessSettings
+              isSuperAdmin={
+                Boolean(currentUser.isSuperAdmin) || currentUser.role === 'Super Admin'
+              }
+              onShowToast={onShowToast}
+            />
+
+            <div className="p-5 rounded-xl bg-surface-container-low border border-white/[0.08] space-y-4">
               <div className="flex items-center justify-between">
                 <h3 className="font-title-md text-title-md text-white font-bold flex items-center gap-2">
                   <span className="material-symbols-outlined text-primary">hub</span>
@@ -2402,7 +2482,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                   return (
                     <div
                       key={prov.id}
-                      className="p-3 rounded-lg bg-surface-container border border-white/5 flex items-center justify-between gap-2"
+                      className="p-3 rounded-lg bg-surface-container border border-white/[0.06] flex items-center justify-between gap-2"
                     >
                       <div>
                         <div className="font-bold text-white text-xs flex items-center gap-2">
@@ -2431,7 +2511,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                 })}
               </div>
 
-              <div className="pt-2 border-t border-white/10 flex gap-2">
+              <div className="pt-2 border-t border-white/[0.08] flex gap-2">
                 <button
                   type="button"
                   onClick={() => onOpenAuthModal('signin')}
@@ -2450,7 +2530,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
             </div>
 
             {/* Real-Time Panel Audit Event Stream */}
-            <div className="p-5 rounded-xl bg-surface-container-low border border-white/10 shadow-lg space-y-3">
+            <div className="p-5 rounded-xl bg-surface-container-low border border-white/[0.08] space-y-3">
               <div className="flex items-center justify-between">
                 <h3 className="font-title-md text-title-md text-white font-bold flex items-center gap-2">
                   <span className="material-symbols-outlined text-secondary">rss_feed</span>
@@ -2462,7 +2542,7 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                 {auditEvents.map((evt) => (
                   <div
                     key={evt.id}
-                    className="p-2.5 rounded-lg bg-surface-container border border-white/5 space-y-1"
+                    className="p-2.5 rounded-lg bg-white/[0.02] border border-white/[0.06] space-y-1"
                   >
                     <div className="flex items-center justify-between text-[10px]">
                       <span
@@ -2470,8 +2550,8 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
                           evt.category === 'SIGKILL'
                             ? 'bg-error/20 text-error'
                             : evt.category === 'RAM_ALLOC'
-                            ? 'bg-primary/20 text-primary'
-                            : 'bg-secondary/15 text-secondary'
+                              ? 'bg-primary/20 text-primary'
+                              : 'bg-secondary/15 text-secondary'
                         }`}
                       >
                         {evt.category}

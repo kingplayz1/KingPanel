@@ -1,39 +1,131 @@
 name: Build and Release
 
+# A tag is the only trigger: the workflow publishes whatever version
+# package.json declares, so the tag must agree with it (checked below).
 on:
   push:
     tags:
-      - 'v*' # Push to tags matching v*
+      - 'v*'
+
+permissions:
+  contents: write
+
+# Two runs for the same tag would upload assets to one release at the same time;
+# queue them instead of cancelling, so a release is never left half-uploaded.
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
-  build:
+  release:
     runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Setup Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: '18'
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          # The backend bundle targets node22 and Vite 8 needs >=20.19, so the
+          # Node 18 this workflow used to pin could not build the app at all.
+          node-version: '22'
+          cache: npm
 
-    - name: Install dependencies
-      run: npm ci
+      - name: Install dependencies
+        run: npm ci
 
-    - name: Build application
-      run: npm run electron:build:win
+      # Builds server.cjs, the UI, and the NSIS installer, then verifies the
+      # packaged backend, app-update.yml, latest.yml and installer all agree.
+      # `--publish never` is baked in: uploading is this workflow's job.
+      - name: Build installer and update metadata
+        run: npm run electron:build
 
-    - name: Create Release
-      id: create_release
-      uses: softprops/action-gh-release@v2
-      with:
-        tag_name: ${{ github.ref_name }}
-        name: Release ${{ github.ref_name }}
-        draft: false
-        prerelease: false
+      # Fails if the tag and package.json version disagree, or if any of the
+      # three files is missing. Writes the exact names to the next step.
+      - name: Verify tag and release artifacts
+        id: assets
+        run: node scripts/release-assets.mjs --tag "${GITHUB_REF_NAME}"
 
-    - name: Upload Release Assets
-      uses: softprops/action-gh-release@v2
-      with:
-        tag_name: ${{ github.ref_name }}
-        files: dist_electron/IS King Panel Setup x64.exe
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          # Named explicitly rather than globbed, so a stale artifact left in
+          # dist_electron can never be published alongside this release.
+          fail_on_unmatched_files: true
+          overwrite_files: true
+          files: |
+            dist_electron/${{ steps.assets.outputs.installer }}
+            dist_electron/${{ steps.assets.outputs.blockmap }}
+            dist_electron/${{ steps.assets.outputs.latest }}
+
+      # Uploading is not the same as being installable: re-read what GitHub now
+      # serves and check it against the build. This is the step that would have
+      # caught the old workflow, which uploaded only the .exe.
+      - name: Verify published release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          tag="${GITHUB_REF_NAME}"
+          installer='${{ steps.assets.outputs.installer }}'
+          blockmap='${{ steps.assets.outputs.blockmap }}'
+          latest='${{ steps.assets.outputs.latest }}'
+          verify_dir="${RUNNER_TEMP}/release-verify"
+          mkdir -p "$verify_dir"
+
+          release="repos/${GITHUB_REPOSITORY}/releases/tags/${tag}"
+
+          flags=$(gh api "$release" --jq '"\(.draft) \(.prerelease)"')
+          if [ "$flags" != "false false" ]; then
+            echo "::error::Release ${tag} is draft/pre-release (${flags}); electron-updater ignores both."
+            exit 1
+          fi
+
+          assets=$(gh api "$release" --jq '.assets[].name')
+          echo "Published assets:"
+          printf '%s\n' "$assets"
+
+          missing=0
+          for name in "$installer" "$blockmap" "$latest"; do
+            if ! printf '%s\n' "$assets" | grep -Fxq "$name"; then
+              echo "::error::Release ${tag} is missing ${name}"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+
+          # Download the published bytes and re-run the same metadata checks a
+          # client's updater will rely on.
+          gh release download "$tag" \
+            --pattern "$installer" \
+            --pattern "$blockmap" \
+            --pattern "$latest" \
+            --dir "$verify_dir" \
+            --clobber
+          node scripts/release-assets.mjs --tag "$tag" --dir "$verify_dir"
+
+          # electron-updater fetches latest.yml anonymously, with no token. A
+          # private repository returns 404 there, so report it loudly: the
+          # release exists, but no installed copy can find it.
+          feed="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/${latest}"
+          code=$(curl -sS -o "$verify_dir/feed-${latest}" -w '%{http_code}' -L "$feed")
+          if [ "$code" != "200" ]; then
+            echo "::warning::Anonymous fetch of ${feed} returned HTTP ${code}. Installed copies check this URL without credentials, so they will not see this release until the repository or the release feed is publicly readable."
+          elif cmp -s "$verify_dir/feed-${latest}" "dist_electron/${latest}"; then
+            echo "Feed is publicly readable and serves the exact latest.yml from this build."
+          else
+            # A warning, not a failure: the authenticated download above is the
+            # authoritative check, and the CDN can still be serving the previous
+            # latest.yml seconds after a republish of the same tag.
+            echo "::warning::The anonymously served ${latest} differs from this build — usually CDN lag after a republish. Re-check the feed URL in a few minutes."
+          fi
