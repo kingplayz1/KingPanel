@@ -112,7 +112,7 @@
     "electron": "^31.7.7",
     "electron-builder": "^26.15.3",
     "electron-packager": "^17.1.2",
-    "esbuild": "^0.25.0",
+    "esbuild": "^0.28.0",
     "tailwindcss": "^4.3.3",
     "tsx": "^4.21.0",
     "typescript": "^7.0.2"
