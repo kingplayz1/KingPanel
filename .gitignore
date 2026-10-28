@@ -11,3 +11,16 @@ coverage/
 
 .tmp/
 build_out*/
+
+# Local runtime state. Packaged builds keep accounts and the database under
+# %APPDATA%\IS King Panel; these paths only appear while developing, and a real
+# user list, database or managed server directory here must never be published.
+.local-users-db.json
+.local-operator-profile.json
+server_runtime.json
+database/*.sqlite
+database/*.sqlite-shm
+database/*.sqlite-wal
+database/mongodb_collections/*
+!database/mongodb_collections/.gitkeep
+KingServers/
