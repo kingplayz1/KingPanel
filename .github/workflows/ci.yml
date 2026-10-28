@@ -1,0 +1,82 @@
+name: CI
+
+# Runs before a release exists. release.yml installs dependencies too, but the
+# only feedback there is a failed release after the tag is already public: v1.0.0,
+# v1.0.1 and v1.0.2 all published nothing for exactly that reason. This job
+# installs the same way, on the pull request instead.
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  dependencies:
+    name: Dependencies resolve with peer checks enforced
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          # Same Node line as release.yml: npm ships with Node, so this is the
+          # npm version and peer-resolution behaviour the release runner uses.
+          node-version: '22'
+          cache: npm
+
+      # Installing these commits on a developer machine succeeds while the runner
+      # fails, because that machine has legacy-peer-deps=true in ~/.npmrc and npm
+      # reads that before it considers the project. Command-line flags outrank
+      # every config file, so the install below cannot be masked by one.
+      - name: Install with dependency checks enforced
+        run: |
+          set -euo pipefail
+          echo "node $(node --version), npm $(npm --version)"
+
+          # --legacy-peer-deps=false  restore peer resolution (a stray npmrc or
+          #                           npx inheriting user config otherwise disables it)
+          # --strict-peer-deps        make conflicting peer ranges fatal instead of
+          #                           a warning npm prints and then ignores
+          # --ignore-scripts          resolution is what is under test; skipping
+          #                           install scripts keeps this fast and avoids
+          #                           downloading the Electron binary
+          #
+          # npm ci also fails when package.json and the lockfile disagree, so
+          # lockfile drift is covered by the same command.
+          npm ci \
+            --legacy-peer-deps=false \
+            --strict-peer-deps \
+            --ignore-scripts \
+            --no-audit \
+            --no-fund
+
+      - name: Prove no config re-disables the check
+        run: |
+          set -euo pipefail
+
+          # The remaining way to make the step above lie: commit an .npmrc that
+          # turns peer checking back off. The CLI flag still wins here, but the
+          # file would hide the next conflict from everyone who installs without
+          # it, which is how these three releases failed in the first place.
+          found=0
+          while IFS= read -r file; do
+            [ -n "$file" ] || continue
+            if grep -qiE '^[[:space:]]*legacy-peer-deps[[:space:]]*=[[:space:]]*true' "$file"; then
+              echo "::error file=$file::legacy-peer-deps=true is committed here and masks the dependency checks the release build enforces."
+              found=1
+            fi
+          done < <(git ls-files | grep -iE '(^|/)\.npmrc$' || true)
+          [ "$found" -eq 0 ] || exit 1
+
+          echo "No committed .npmrc re-enables legacy-peer-deps."
