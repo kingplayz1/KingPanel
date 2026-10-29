@@ -13,6 +13,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
+    "check:data": "node scripts/check-tracked-data.mjs",
     "test": "node --import tsx --test test/*.test.mjs",
     "electron": "electron electron-main.cjs",
     "verify:upgrade": "node scripts/verify-installed-upgrade.mjs",

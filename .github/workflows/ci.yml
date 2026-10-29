@@ -80,3 +80,25 @@ jobs:
           [ "$found" -eq 0 ] || exit 1
 
           echo "No committed .npmrc re-enables legacy-peer-deps."
+
+  # A real account list, a live SQLite database and a cookie jar were committed
+  # once already, on a repo that is now public. .gitignore does not help with a
+  # path that is already tracked, so this job reads the index itself: it fails on
+  # a runtime-state path, on a file whose bytes are a database, cookie table or
+  # credential records (even renamed), and on .gitignore losing those rules.
+  # It needs no dependencies, so it cannot be skipped by an install failure.
+  tracked-data:
+    name: No user lists, databases or session data are tracked
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Scan tracked paths and contents
+        run: node scripts/check-tracked-data.mjs

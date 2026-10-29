@@ -2,7 +2,16 @@ node_modules/
 # Build output, except the NSIS include that packaging actually needs.
 build/*
 !build/installer.nsh
-dist/
+# electron-builder output: dist_electron/, plus the dist_electron_new/ folder and
+# the stray dist_dist file older builds left behind. No trailing slash, so this
+# covers those leftover files as well as the directories. Generated, hundreds of
+# megabytes, and a tracked copy is also how a stale installer gets published.
+dist*
+build_out*/
+# The bundled backend (npm run build:backend) and hand-made copies of it.
+server.cjs*
+# Portable archives built in the repo root (~300 MB each).
+/*.zip
 coverage/
 .DS_Store
 *.log
@@ -10,7 +19,17 @@ coverage/
 !.env.example
 
 .tmp/
-build_out*/
+
+# Scratch left by a debugging session at the repo root: a dev-server or uploader
+# pid file, redirected stdout/stderr, and the one-off helper scripts that wrote
+# them. Regenerated on the next run, never source. The helpers are named instead
+# of matched as /*.sh on purpose — read_schema.ps1 and six test_*.sh scripts at
+# the root are tracked, so a blanket rule would silently cover them too.
+*.pid
+*.out
+*.err
+/upload.ps1
+/upload_bg.sh
 
 # Local runtime state. Packaged builds keep accounts and the database under
 # %APPDATA%\IS King Panel; these paths only appear while developing, and a real
@@ -24,3 +43,19 @@ database/*.sqlite-wal
 database/mongodb_collections/*
 !database/mongodb_collections/.gitkeep
 KingServers/
+
+# The same runtime state copied outside database/ — a dev checkout, a support
+# bundle, a cookie jar exported from a browser. Matched by shape as well as by
+# name so a renamed export cannot be staged either. scripts/check-tracked-data.mjs
+# enforces this in CI and fails the build if these rules disappear.
+*cookies*.txt
+cookies*.json
+# Chrome/Chromium's cookie store has no extension at all.
+Cookies
+Cookies-journal
+sessions.json
+session-store.json
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
