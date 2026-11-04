@@ -98,6 +98,11 @@ const MUST_BE_IGNORED = [
   'database/isking_panel.sqlite',
   'database/isking_panel.sqlite-wal',
   'database/mongodb_collections/users.bson',
+  // Signing material: a committed PFX/PVK is a leaked private key, and the
+  // certificate itself is never needed in the repository.
+  'certificate.pfx',
+  'certificate.p12',
+  'signing-key.pvk',
 ];
 
 const IDENTITY_KEYS = /^(id|uuid|user_?name|login|email|e_?mail|display_?name|name)$/i;

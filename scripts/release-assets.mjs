@@ -8,23 +8,34 @@
  *   2. after `gh release download`, pointing --dir at the downloaded copies, to
  *      confirm the bytes users will actually receive still match the metadata.
  *
- * It fails (non-zero exit) when:
- *  - the pushed tag does not match package.json's version, or
- *  - the installer, its .blockmap or latest.yml is missing or empty, or
- *  - latest.yml names, sizes or hashes anything other than the installer next
- *    to it.
+ * The rules themselves live in scripts/release-verify.mjs, shared with the build
+ * and the tests, so there is one definition of a valid release rather than three
+ * that drift apart.
  *
- * Usage: node scripts/release-assets.mjs [--tag v1.0.1] [--dir dist_electron]
+ * Usage:
+ *   node scripts/release-assets.mjs [--tag v1.0.2] [--dir dist_electron]
+ *     [--runtime] [--privacy] [--signing]
  *
- * When $GITHUB_OUTPUT is set, `installer`, `blockmap`, `latest` and `version`
- * are written there so the workflow uploads exactly the files verified here.
+ * `--runtime` also verifies the packaged app under <dir>/win-unpacked: the pinned
+ * runtime outside the asar, the backend bundle and app-update.yml.
+ *
+ * `--privacy` reads the same tree for developer data — the resources allowlist,
+ * every app.asar entry, and SQLite/secret content — because a version-and-hash
+ * check cannot tell a clean installer from one carrying its author's database.
+ *
+ * When $GITHUB_OUTPUT is set, `installer`, `blockmap`, `latest` and `version` are
+ * written there so the workflow uploads exactly the files verified here.
  */
-import { createHash } from 'node:crypto';
-import { readFile, stat } from 'node:fs/promises';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import yaml from 'js-yaml';
-import { resolveReleaseAssets } from './release-naming.mjs';
+import {
+  verifyArtifacts,
+  verifyPackagedPrivacy,
+  verifyPackagedRuntime,
+  verifyReleaseSignatures,
+  verifyTag,
+} from './release-verify.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DEFAULT_DIR = path.join(ROOT, 'dist_electron');
@@ -43,91 +54,77 @@ function fail(problems) {
 async function main() {
   const tag = arg('--tag');
   const dir = arg('--dir') ? path.resolve(ROOT, arg('--dir')) : DEFAULT_DIR;
+  const checkRuntime = process.argv.includes('--runtime');
+  const checkSigning = process.argv.includes('--signing');
+  const installedIndex = process.argv.indexOf('--installed');
+  const installedDir =
+    installedIndex === -1
+      ? process.env.ISK_INSTALLED_DIR || ''
+      : path.resolve(ROOT, process.argv[installedIndex + 1] ?? '');
+  const checkPrivacy = process.argv.includes('--privacy');
+  const tagOnly = process.argv.includes('--tag-only');
 
-  const pkg = JSON.parse(await readFile(path.join(ROOT, 'package.json'), 'utf8'));
-  const { version, installer, blockmap, latestYml } = resolveReleaseAssets(pkg);
-  console.log(`[assets] package.json version ${version}`);
-  console.log(`[assets] installer ${installer}`);
+  const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
 
-  const problems = [];
-
-  if (!/^\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?$/.test(version)) {
-    problems.push(`package.json version "${version}" is not a valid semver release version`);
+  // Preflight: the tag and package.json alone, before anything is built.
+  if (tagOnly) {
+    const problems = verifyTag(tag, pkg.version);
+    if (problems.length) fail(problems);
+    console.log(`[assets] OK  tag ${tag} matches package.json ${pkg.version} (no artifacts checked)`);
+    return;
   }
 
-  // electron-updater compares the tag's latest.yml version against the installed
-  // app's version, so a mismatch here ships an update no client can ever match.
-  if (tag) {
-    const accepted = new Set([version, `v${version}`]);
-    if (!accepted.has(tag)) {
-      problems.push(
-        `tag ${tag} does not match package.json version ${version} ` +
-          `(expected ${tag.startsWith('v') ? 'v' : ''}${version}); ` +
-          'bump the version before tagging',
-      );
-    }
-  }
+  const result = await verifyArtifacts({ dir, pkg, tag });
+  console.log(`[assets] package.json version ${result.version}`);
+  console.log(`[assets] installer ${result.installer}`);
 
-  const files = {
-    installer: path.join(dir, installer),
-    blockmap: path.join(dir, blockmap),
-    latest: path.join(dir, latestYml),
-  };
-  const sizes = {};
-  for (const [label, file] of Object.entries(files)) {
-    try {
-      const info = await stat(file);
-      if (!info.isFile() || info.size === 0) throw new Error('empty');
-      sizes[label] = info.size;
-    } catch {
-      problems.push(
-        `${label} is missing or empty: ${path.relative(ROOT, file) || file} ` +
-          '(run `npm run electron:build` first)',
-      );
-    }
-  }
-  if (problems.length) fail(problems);
+  const problems = [...result.problems];
 
-  let meta;
-  try {
-    meta = yaml.load(await readFile(files.latest, 'utf8'));
-  } catch (err) {
-    fail([`${latestYml} is not readable YAML: ${err.message}`]);
-  }
-  if (!meta || typeof meta !== 'object') fail([`${latestYml} did not parse to an object`]);
-
-  const entries = Array.isArray(meta.files) ? meta.files : [];
-  const listed = entries.find((entry) => entry?.url === installer) ?? entries[0] ?? {};
-  const checksum = createHash('sha512').update(await readFile(files.installer)).digest('base64');
-
-  if (meta.version !== version) {
-    problems.push(`${latestYml} version ${meta.version} != package.json ${version}`);
-  }
-  if (meta.path !== installer) {
-    problems.push(`${latestYml} path "${meta.path}" != "${installer}"`);
-  }
-  if (listed.url !== installer) {
-    problems.push(`${latestYml} files[0].url "${listed.url}" != "${installer}"`);
-  }
-  if (Number(listed.size) !== sizes.installer) {
+  if (checkRuntime && problems.length === 0) {
     problems.push(
-      `${latestYml} files[0].size ${listed.size} != ${sizes.installer} bytes on disk`,
+      ...verifyPackagedRuntime({
+        resourcesDir: path.join(dir, 'win-unpacked', 'resources'),
+        manifestPath: path.join(ROOT, 'runtime', 'runtime.json'),
+      }),
     );
   }
-  if (listed.sha512 !== checksum) {
-    problems.push(`${latestYml} files[0].sha512 does not match ${installer} on disk`);
+
+  // Developer data in the installer: the leak this gate was written for, and
+  // the one no version/hash check can see.
+  let privacy = null;
+  if (checkPrivacy && problems.length === 0) {
+    privacy = verifyPackagedPrivacy({ dir });
+    problems.push(...privacy.problems);
   }
-  if (meta.sha512 && meta.sha512 !== listed.sha512) {
-    problems.push(`${latestYml} top-level sha512 disagrees with files[0].sha512`);
+
+  // Optional here, mandatory in the release workflow: a tag build passes
+  // ISK_REQUIRE_SIGNING=1 and a missing or untrusted signature stops it.
+  if (checkSigning && problems.length === 0) {
+    const pin = JSON.parse(fs.readFileSync(path.join(ROOT, 'runtime', 'runtime.json'), 'utf8'));
+    const signing = verifyReleaseSignatures({
+      dir,
+      pkg,
+      runtimePublisher: pin.publisher,
+      requireSigned: process.env.ISK_REQUIRE_SIGNING === '1',
+      installedDir,
+      requireUninstaller: Boolean(installedDir) && process.env.ISK_REQUIRE_SIGNING === '1',
+    });
+    problems.push(...signing.problems);
+    for (const problem of signing.problems) {
+      // Printed through the shared failure list; keep the detail visible early.
+      console.log(`[assets] signature: ${problem}`);
+    }
   }
   if (problems.length) fail(problems);
 
-  // The workflow reads these to upload the verified files by name, instead of
-  // globbing a directory where a stale artifact could also match.
-  const outputs = { installer, blockmap, latest: latestYml, version };
+  const outputs = {
+    installer: result.installer,
+    blockmap: result.blockmap,
+    latest: result.latestYml,
+    version: result.version,
+  };
   if (process.env.GITHUB_OUTPUT) {
-    const { appendFile } = await import('node:fs/promises');
-    await appendFile(
+    fs.appendFileSync(
       process.env.GITHUB_OUTPUT,
       Object.entries(outputs)
         .map(([key, value]) => `${key}=${value}\n`)
@@ -136,8 +133,13 @@ async function main() {
   }
 
   console.log(
-    `[assets] OK  ${installer} ${(sizes.installer / 1024 / 1024).toFixed(1)} MB  ` +
-      `${blockmap}  ${latestYml} (version/path/size/sha512 match)`,
+    `[assets] OK  ${result.installer} ${(result.sizes.installer / 1024 / 1024).toFixed(1)} MB  ` +
+      `${result.blockmap}  ${result.latestYml} (version/path/size/sha512/blockmap match)` +
+      (checkRuntime ? '  packaged runtime pinned' : '') +
+      (privacy
+        ? `  no developer data (${privacy.facts.payloadEntries} payload file(s), ` +
+          `${privacy.facts.sqliteInspected} database(s) inspected, ${privacy.facts.stateFilesInspected} state file(s) scanned)`
+        : ''),
   );
 }
 

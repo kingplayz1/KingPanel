@@ -18,7 +18,24 @@ coverage/
 .env*
 !.env.example
 
+# Authenticode signing material. The release build takes a PFX only through
+# CSC_LINK/CSC_KEY_PASSWORD, so nothing here is ever needed in the tree — but a
+# certificate exported "just for a moment" is exactly how one gets committed. The
+# package excludes these too (build.files); this stops them being staged at all.
+*.pfx
+*.p12
+*.pvk
+*.p7b
+
 .tmp/
+
+# Bundled Node runtime (runtime/node.exe). Deliberately not committed: a ~70 MB
+# binary with its own licence, supplied per builder. runtime/README.md documents
+# the convention and stays tracked.
+runtime/*
+!runtime/README.md
+# The pin (version + official checksum) is committed; the binary it describes is not.
+!runtime/runtime.json
 
 # Scratch left by a debugging session at the repo root: a dev-server or uploader
 # pid file, redirected stdout/stderr, and the one-off helper scripts that wrote
@@ -59,3 +76,12 @@ session-store.json
 *.sqlite-shm
 *.sqlite-wal
 *.db
+
+# Root-level scratch from ad-hoc debugging: copied source, console captures and
+# throwaway notes. Never project files, and named explicitly because a blanket
+# /*.txt or /*.log rule would also cover tracked fixtures and documentation.
+/debug_*.txt
+/electron_output.txt
+/output.txt
+/test.txt
+/log.txt

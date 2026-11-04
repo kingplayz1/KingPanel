@@ -1,0 +1,12 @@
+{
+  "$comment": "Pinned backend runtime. Every field is checked by scripts/fetch-runtime.mjs and by the release build; changing a version means changing all of them together.",
+  "nodeVersion": "22.23.1",
+  "architecture": "win-x64",
+  "minimumBackendVersion": "22.5.0",
+  "source": "https://nodejs.org/dist/v22.23.1/win-x64/node.exe",
+  "checksums": "https://nodejs.org/dist/v22.23.1/SHASUMS256.txt",
+  "license": "https://raw.githubusercontent.com/nodejs/node/v22.23.1/LICENSE",
+  "licenseSha256": "c738ae413cf561f174e34f6961f8ca458aae2369a73640dda6234c629b98bcc4",
+  "publisher": "OpenJS Foundation",
+  "sha256": "f8d162c0641dcee512132f3bcf8a68169c7ecb852efd8e1a46c9fec5a0f469ed"
+}

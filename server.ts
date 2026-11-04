@@ -14,6 +14,25 @@ import {
   type ForwardVerification,
 } from './server/port-forward-windows';
 import { JobManager, JobCancelledError, type JobContext } from './server/job-manager';
+import {
+  hashPassword,
+  verifyPassword,
+  isLegacyHash,
+  passwordPolicyError,
+  MIN_PASSWORD_LENGTH,
+  MAX_PASSWORD_LENGTH,
+} from './server/password';
+import {
+  ensureOwnershipTable,
+  recordServerOwner,
+  assignServerOwner,
+  canAccessServer,
+  accessibleFolders,
+  readServerOwner,
+  type Viewer,
+} from './server/ownership';
+import { migrateLegacyStateDir, type MigrationResult } from './server/state-dir';
+import { resolveTokenKey, encryptSecret, decryptSecret, isEncryptedSecret } from './server/token-crypto';
 import http from 'http';
 import path from 'path';
 import os from 'os';
@@ -59,6 +78,36 @@ try {
 
 const SQLITE_DB_PATH = dbFile;
 
+// --- One-time state-directory migration -------------------------------------
+// Electron pins userData to %APPDATA%\IS King Panel, but builds before that
+// change wrote to %APPDATA%\react-example. The main process passes both paths;
+// the copy happens here, before the database is opened, so no empty store is
+// ever created at the new location while the old one still holds the accounts.
+// A failed migration sets bootStateError and the account layer fails closed.
+const LEGACY_DB_DIR = (process.env.LEGACY_APPDATA_DB_DIR || '').trim();
+let bootStateError: string | null = null;
+let stateMigration: MigrationResult | null = null;
+if (LEGACY_DB_DIR) {
+  try {
+    stateMigration = migrateLegacyStateDir({ stateDir: dbDir, legacyDir: LEGACY_DB_DIR });
+    if (stateMigration.status === 'migrated') {
+      console.log(
+        `[State] Migrated ${stateMigration.copied.length} state file(s) from ${LEGACY_DB_DIR} to ${dbDir}`
+      );
+      console.log(`[State] Source database snapshot: ${stateMigration.snapshot || '(none)'}`);
+    } else if (stateMigration.status === 'failed') {
+      bootStateError = `state migration failed: ${stateMigration.error}`;
+      console.error(`[State] ${bootStateError}`);
+      console.error('[State] The legacy directory was left untouched; this build will not start a new database.');
+    } else {
+      console.log(`[State] No migration needed (${stateMigration.status}).`);
+    }
+  } catch (err) {
+    bootStateError = `state migration threw: ${err instanceof Error ? err.message : String(err)}`;
+    console.error(`[State] ${bootStateError}`);
+  }
+}
+
 // SQLite database interfaces
 interface SqliteStatement {
   run: (...params: unknown[]) => { changes: number; lastInsertRowid: number | bigint };
@@ -73,7 +122,7 @@ interface SqliteDatabase {
 
 // SQLite database initialization
 let sqliteDb: SqliteDatabase | null = null;
-try {
+if (!bootStateError) try {
   const { DatabaseSync } = requireModule('node:sqlite') as {
     DatabaseSync: new (filename: string) => SqliteDatabase;
   };
@@ -182,6 +231,13 @@ const clearedSessionCookie = (req: express.Request) =>
   `king_session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=Lax${
     req.secure ? '; Secure' : ''
   }`;
+/**
+ * The session id is the only thing that authenticates a session, so it carries
+ * 256 bits of randomness. The previous `${Date.now()}-<3 random bytes>` shape
+ * left a millisecond timestamp plus 24 bits, which is guessable between two
+ * observed logins.
+ */
+const newSessionId = () => `sess-${crypto.randomBytes(32).toString('base64url')}`;
 
 const validateSession = (req: express.Request, res: express.Response, next: express.NextFunction) => {
   try {
@@ -523,6 +579,10 @@ async function startServer() {
   // Honor PORT when the desktop shell assigns an alternate port (e.g. 3000 is
   // occupied by another application on Windows, where binds can silently share).
   const PORT = Number.parseInt(process.env.PORT ?? '', 10) || 3000;
+  // Loopback by default. This backend can start game servers and edit files on
+  // disk; binding every interface put that control plane on the LAN behind one
+  // shared admin password. Remote access is now an explicit opt-in.
+  const BIND_HOST = (process.env.PANEL_BIND_HOST || '127.0.0.1').trim() || '127.0.0.1';
 
   app.use(express.json());
 
@@ -766,7 +826,7 @@ async function startServer() {
     ).run(JSON.stringify(connectedProviders), userId);
 
     // Create session for the user
-    const sessionId = `sess-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+    const sessionId = newSessionId();
     if (sqliteDb) {
       try {
         sqliteDb
@@ -804,7 +864,8 @@ async function startServer() {
 
   // ============================================================================
   // 1B. PERSISTENT SQLITE3 DATABASE SYSTEM, USER LOGIN & DISCORD BOT VERIFICATION
-  //     Super Admin: kingplayz | ID: SA-KINGPLAYZ-001 | Pass: KingPlayz#2026
+  //     Bootstrap Super Admin: kingplayz | ID: SA-KINGPLAYZ-001
+  //     Password: generated per install on first run, never shipped in source.
   // ============================================================================
   // Reuse the APPDATA-aware paths resolved at module scope. Re-deriving these
   // from process.cwd() pointed the packaged app at its (read-only) install
@@ -832,7 +893,9 @@ async function startServer() {
   }
 
   let sqliteDb: SqliteDatabase | null = null;
-  try {
+  // A failed state migration must not be papered over with a fresh, empty
+  // database: skipping the open makes every account route answer 503 instead.
+  if (!bootStateError) try {
     const { DatabaseSync } = requireModule('node:sqlite') as {
       DatabaseSync: new (filename: string) => SqliteDatabase;
     };
@@ -977,11 +1040,48 @@ async function startServer() {
     console.warn('SQLite initialization fallback:', err);
   }
 
-  // Existing installs predate the Advanced Panel columns. CREATE TABLE IF NOT
-  // EXISTS never alters an existing table, so add each missing column in place
-  // and keep every user row intact.
-  const ensureAdvancedPanelColumns = () => {
-    if (!sqliteDb) return;
+  // Every column the account layer reads or writes, declared in the same order
+  // as the canonical CREATE TABLE above. CREATE TABLE IF NOT EXISTS never alters
+  // an existing table, so a database born under an older build keeps whatever
+  // subset of columns it had. `loadUsersDb` selects `ORDER BY is_super_admin`,
+  // and that single missing column threw the entire query, which silently
+  // demoted a real SQLite store to the JSON fallback: logins then read a
+  // different file than the one the app had just written, so accounts
+  // disappeared from the panel even though their rows were still on disk.
+  // Backfilling in place keeps every row and lets SQLite be the store it is
+  // documented to be.
+  const USER_TABLE_COLUMNS: Array<[string, string]> = [
+    ['display_name', 'TEXT'],
+    ['password_hash', 'TEXT'],
+    // Local accounts have no email channel, so recovery is proved with a code
+    // issued once per account instead of by naming someone else's username.
+    ['recovery_hash', 'TEXT'],
+    ['role', 'TEXT'],
+    ['is_super_admin', 'INTEGER DEFAULT 0'],
+    ['provider', "TEXT DEFAULT 'local'"],
+    ['avatar_url', 'TEXT'],
+    ['mc_uuid', 'TEXT'],
+    ['connected_providers', `TEXT DEFAULT '["local"]'`],
+    ['last_login', 'TEXT'],
+    ['session_sha', 'TEXT'],
+    ['discord_verified', 'INTEGER DEFAULT 0'],
+    ['discord_member_status', "TEXT DEFAULT 'not_connected'"],
+    ['discord_user_id', 'TEXT'],
+    ['discord_username', 'TEXT'],
+    ['discord_guild_id', 'TEXT'],
+    ['discord_guild_name', 'TEXT'],
+    ['discord_invite_url', 'TEXT'],
+    ['discord_bot_verified_at', 'TEXT'],
+    ['discord_role_verified', 'INTEGER DEFAULT 0'],
+    ['discord_linked_at', 'TEXT'],
+    ['advanced_panel_enabled', 'INTEGER DEFAULT 0'],
+    ['advanced_panel_reason', 'TEXT'],
+    ['advanced_panel_checked_at', 'TEXT'],
+    ['max_server_limit', 'INTEGER DEFAULT 2'],
+    ['created_at', "TEXT DEFAULT ''"],
+  ];
+  const ensureUserTableColumns = (): string[] => {
+    if (!sqliteDb) return [];
     try {
       const existing = new Set(
         sqliteDb
@@ -989,23 +1089,110 @@ async function startServer() {
           .all()
           .map((row) => String(row.name))
       );
-      const additions: Array<[string, string]> = [
-        ['discord_role_verified', 'INTEGER DEFAULT 0'],
-        ['discord_linked_at', 'TEXT'],
-        ['advanced_panel_enabled', 'INTEGER DEFAULT 0'],
-        ['advanced_panel_reason', 'TEXT'],
-        ['advanced_panel_checked_at', 'TEXT'],
-      ];
-      for (const [name, definition] of additions) {
+      const added: string[] = [];
+      for (const [name, definition] of USER_TABLE_COLUMNS) {
         if (!existing.has(name)) {
           sqliteDb.exec(`ALTER TABLE users ADD COLUMN ${name} ${definition}`);
+          added.push(name);
         }
       }
-    } catch {
-      // Leave the schema as-is; access checks fail closed without these columns.
+      if (added.length > 0) {
+        console.log(`[SQLite] users table migrated, added column(s): ${added.join(', ')}`);
+      }
+
+      // Rows written by an older build carry no Super Admin flag. The account
+      // layer already treats this username as the Super Admin, so mirror that
+      // into the column that ORDER BY and the exports read.
+      const flagged = sqliteDb
+        .prepare(
+          "UPDATE users SET is_super_admin = 1 WHERE lower(username) = 'kingplayz' AND COALESCE(is_super_admin, 0) = 0"
+        )
+        .run();
+      if (flagged.changes > 0) {
+        console.log(`[SQLite] flagged ${flagged.changes} row(s) as Super Admin`);
+      }
+      return added;
+    } catch (err) {
+      // A schema this broken cannot be served: every read of this table would
+      // throw later, and the JSON fallback would silently answer with a second
+      // source of truth. Record it so authentication fails closed instead.
+      accountStoreError = `users table migration failed: ${
+        err instanceof Error ? err.message : String(err)
+      }`;
+      console.error('[SQLite] users table migration failed:', err);
+      return [];
     }
   };
-  ensureAdvancedPanelColumns();
+
+  // Until this migration the SQLite read always threw, so the JSON mirror was
+  // the store the panel had actually been writing: it holds the values an
+  // ALTER cannot invent (multi-provider links, Discord ids, session hashes).
+  // Seed the columns that were just created from it, and only those, so no
+  // value already in SQLite is overwritten.
+  const backfillAddedColumnsFromJsonMirror = (added: string[]) => {
+    if (!sqliteDb || added.length === 0) return;
+    const mapping: Array<[string, string, 'text' | 'bool' | 'number' | 'json']> = [
+      ['isSuperAdmin', 'is_super_admin', 'bool'],
+      ['connectedProviders', 'connected_providers', 'json'],
+      ['sessionSha', 'session_sha', 'text'],
+      ['discordVerified', 'discord_verified', 'bool'],
+      ['discordMemberStatus', 'discord_member_status', 'text'],
+      ['discordUserId', 'discord_user_id', 'text'],
+      ['discordUsername', 'discord_username', 'text'],
+      ['discordGuildId', 'discord_guild_id', 'text'],
+      ['discordGuildName', 'discord_guild_name', 'text'],
+      ['discordInviteUrl', 'discord_invite_url', 'text'],
+      ['discordBotVerifiedAt', 'discord_bot_verified_at', 'text'],
+      ['maxServerLimit', 'max_server_limit', 'number'],
+    ];
+    try {
+      if (!fs.existsSync(LOCAL_USERS_DB_PATH)) return;
+      const parsed = JSON.parse(fs.readFileSync(LOCAL_USERS_DB_PATH, 'utf8'));
+      if (!Array.isArray(parsed)) return;
+      const created = new Set(added);
+      let updated = 0;
+      for (const entry of parsed as Array<Record<string, unknown>>) {
+        const id = typeof entry.id === 'string' ? entry.id : '';
+        if (!id) continue;
+        const assignments: string[] = [];
+        const values: unknown[] = [];
+        for (const [field, column, kind] of mapping) {
+          if (!created.has(column)) continue;
+          const value = entry[field];
+          if (value === undefined || value === null) continue;
+          assignments.push(`${column} = ?`);
+          if (kind === 'bool') values.push(value ? 1 : 0);
+          else if (kind === 'json') values.push(JSON.stringify(value));
+          else values.push(value);
+        }
+        if (assignments.length === 0) continue;
+        updated += sqliteDb
+          .prepare(`UPDATE users SET ${assignments.join(', ')} WHERE id = ?`)
+          .run(...values, id).changes;
+      }
+      if (updated > 0) {
+        console.log(`[SQLite] backfilled ${updated} row(s) from the JSON mirror`);
+      }
+    } catch (err) {
+      console.warn('[SQLite] JSON mirror backfill skipped:', err);
+    }
+  };
+  // Set when the account store cannot be trusted. Authentication then fails
+  // closed rather than reading a stale JSON mirror or inventing a fresh, empty
+  // store: that silent fallback is exactly how accounts appear to vanish after
+  // a failed upgrade while their rows are still on disk. Declared before the
+  // migration runs so the migration itself can set it.
+  let accountStoreError: string | null = bootStateError
+    ? bootStateError
+    : sqliteDb
+    ? null
+    : 'SQLite account store could not be opened';
+
+  backfillAddedColumnsFromJsonMirror(ensureUserTableColumns());
+
+  // Server-folder ownership. Folders created before this table existed have no
+  // row, which means Super-Admin-only — see server/ownership.ts.
+  ensureOwnershipTable(sqliteDb);
 
   // Persistent operation jobs: installs, backups, restores and reinstalls keep
   // their progress and result across UI refreshes (and are marked interrupted
@@ -1197,6 +1384,8 @@ async function startServer() {
     displayName: string;
     email: string;
     passwordHash: string;
+    /** scrypt hash of this account's one-time recovery code, when one was issued. */
+    recoveryHash?: string;
     role: 'Super Admin' | 'Root Admin' | 'DevOps Engineer' | 'Moderator' | 'Operator';
     isSuperAdmin?: boolean;
     provider: 'local' | 'discord' | 'github' | 'google';
@@ -1236,9 +1425,9 @@ async function startServer() {
     updatedAt: string;
   }
 
-  const hashPassword = (rawPassword: string): string => {
-    return crypto.createHash('sha256').update(`isking_salt_v48:${rawPassword}`).digest('hex');
-  };
+  // Passwords are hashed by server/password.ts (scrypt + per-password salt).
+  // The old single-round SHA-256 helper that lived here is gone; legacy hashes
+  // are still verified there so no existing account is locked out.
 
   // Precedence: these defaults < .env < .local-discord-config.json (written by
   // the Super Admin settings card). The guild, role and invite are installation
@@ -1266,12 +1455,12 @@ async function startServer() {
     // ignore
   }
 
-  const SUPER_ADMIN_KINGPLAYZ: StoredUserAccount = {
+  const buildSuperAdminAccount = (passwordHash: string): StoredUserAccount => ({
     id: 'SA-KINGPLAYZ-001',
     username: 'kingplayz',
     displayName: 'KingPlayz (Super Admin)',
     email: 'kingplayz@iskingpanel.exe',
-    passwordHash: hashPassword('KingPlayz#2026'),
+    passwordHash,
     role: 'Super Admin',
     isSuperAdmin: true,
     provider: 'local',
@@ -1289,65 +1478,88 @@ async function startServer() {
     discordInviteUrl: discordBotConfig.inviteUrl,
     discordBotVerifiedAt: new Date().toISOString(),
     maxServerLimit: 999,
+  });
+
+  // --- First-run credentials -------------------------------------------------
+  // Nothing in this file is a usable password. The installer is public, so a
+  // fixed credential here is a published Super Admin login: the previous build
+  // seeded `KingPlayz#2026` and three demo operators on `kingpanel123`, and both
+  // strings were also compiled into the renderer. A fresh install now generates
+  // a random password for the bootstrap Super Admin and writes it once, owner
+  // readable, next to the database; an existing install that still has one of
+  // those published hashes gets it rotated on the next start.
+  const FIRST_RUN_CREDENTIALS_PATH = path.join(appStateDir, 'FIRST-RUN-CREDENTIALS.txt');
+  const COMPROMISED_DEFAULT_PASSWORDS = ['KingPlayz#2026', 'kingpanel123'] as const;
+
+  const generateBootstrapPassword = (): string => crypto.randomBytes(18).toString('base64url');
+
+  const writeFirstRunCredentials = (
+    entries: Array<{ username: string; password: string; note: string }>
+  ): void => {
+    if (entries.length === 0) return;
+    const lines = [
+      '',
+      `IS King Panel - one-time credentials, written ${new Date().toISOString()}`,
+      'Each password is shown once. Sign in, change it, then delete this file.',
+      '',
+      ...entries.map((e) => `${e.username}\t${e.password}\t${e.note}`),
+      '',
+    ];
+    try {
+      fs.appendFileSync(FIRST_RUN_CREDENTIALS_PATH, lines.join(os.EOL), { mode: 0o600 });
+      try {
+        fs.chmodSync(FIRST_RUN_CREDENTIALS_PATH, 0o600);
+      } catch {
+        // Windows ACLs, not POSIX modes; the profile directory is already per-user.
+      }
+      console.warn(`[Accounts] One-time credentials written to ${FIRST_RUN_CREDENTIALS_PATH}`);
+    } catch (err) {
+      console.error('[Accounts] Could not write the one-time credentials file:', err);
+    }
   };
 
-  const DEFAULT_SEED_USERS: StoredUserAccount[] = [
-    SUPER_ADMIN_KINGPLAYZ,
-    {
-      id: 'op-mio',
-      username: 'Mio_Sakura',
-      displayName: 'Mio Sakura',
-      email: 'mio.sakura@kingsmp.net',
-      passwordHash: hashPassword('kingpanel123'),
-      role: 'Root Admin',
-      isSuperAdmin: false,
-      provider: 'local',
-      avatarUrl: 'https://mc-heads.net/avatar/MHF_Alex/128',
-      mcUuid: 'f84c6a79-0a4e-45e0-879b-cd49ebd4c4e2',
-      connectedProviders: ['local', 'github'],
-      lastLogin: 'Today at 14:32 UTC',
-      sessionSha: '8f9a2b1c...e401',
-      discordVerified: false,
-      discordMemberStatus: 'not_connected',
-      maxServerLimit: 2,
-    },
-    {
-      id: 'op-aki',
-      username: 'Aki_Craft99',
-      displayName: 'Aki Redstone',
-      email: 'aki.devops@kingsmp.net',
-      passwordHash: hashPassword('kingpanel123'),
-      role: 'DevOps Engineer',
-      isSuperAdmin: false,
-      provider: 'github',
-      avatarUrl: 'https://mc-heads.net/avatar/MHF_Steve/128',
-      mcUuid: '3b91a2e4-72c1-44d8-918a-5e2b99f01a88',
-      connectedProviders: ['github', 'google'],
-      lastLogin: 'Today at 12:15 UTC',
-      sessionSha: '3d7e91a0...b219',
-      discordVerified: false,
-      discordMemberStatus: 'not_connected',
-      maxServerLimit: 2,
-    },
-    {
-      id: 'op-kuro',
-      username: 'Kuro_Neko_JP',
-      displayName: 'Kuro Neko',
-      email: 'kuro.mod@kingsmp.net',
-      passwordHash: hashPassword('kingpanel123'),
-      role: 'Moderator',
-      isSuperAdmin: false,
-      provider: 'discord',
-      avatarUrl: 'https://mc-heads.net/avatar/Notch/128',
-      mcUuid: '99c100f2-18b4-4099-b811-77a910de3310',
-      connectedProviders: ['local'],
-      lastLogin: 'Yesterday at 21:40 UTC',
-      sessionSha: '7c4b11e8...99a2',
-      discordVerified: false,
-      discordMemberStatus: 'not_connected',
-      maxServerLimit: 2,
-    },
-  ];
+  const createBootstrapSuperAdmin = (): StoredUserAccount => {
+    const password = generateBootstrapPassword();
+    const account = buildSuperAdminAccount(hashPassword(password));
+    writeFirstRunCredentials([
+      {
+        username: account.username,
+        password,
+        note: 'bootstrap Super Admin - change this password after signing in',
+      },
+    ]);
+    return account;
+  };
+
+  /**
+   * Replace any stored hash that matches a password published in an earlier
+   * build. Existing accounts are kept, only the known hash is replaced, and the
+   * new password goes to the same one-time file so the operator can reclaim it.
+   */
+  const rotateCompromisedDefaultPasswords = (users: StoredUserAccount[]): number => {
+    const rotated: Array<{ username: string; password: string; note: string }> = [];
+    for (const user of users) {
+      const stored = String(user.passwordHash || '');
+      // Only legacy rows can carry a published hash; scrypt rows never do.
+      if (!isLegacyHash(stored)) continue;
+      const compromised = COMPROMISED_DEFAULT_PASSWORDS.some((pw) => verifyPassword(pw, stored).ok);
+      if (!compromised) continue;
+      const replacement = generateBootstrapPassword();
+      user.passwordHash = hashPassword(replacement);
+      rotated.push({
+        username: user.username,
+        password: replacement,
+        note: 'rotated: this account used a password published in an earlier build',
+      });
+    }
+    if (rotated.length > 0) {
+      writeFirstRunCredentials(rotated);
+      console.warn(
+        `[Accounts] Rotated ${rotated.length} account(s) off a published default password.`
+      );
+    }
+    return rotated.length;
+  };
 
   const syncUserToSqlite = (u: StoredUserAccount) => {
     // Also push user & profile into MongoDB collections automatically
@@ -1475,6 +1687,7 @@ async function startServer() {
       displayName: String(row.display_name),
       email: String(row.email),
       passwordHash: String(row.password_hash),
+      recoveryHash: row.recovery_hash ? String(row.recovery_hash) : undefined,
       role: (isSa ? 'Super Admin' : String(row.role)) as StoredUserAccount['role'],
       isSuperAdmin: isSa,
       provider: String(row.provider || 'local') as StoredUserAccount['provider'],
@@ -1512,38 +1725,44 @@ async function startServer() {
   };
 
   const loadUsersDb = (): StoredUserAccount[] => {
-    // 1. Read from SQLite if available
+    if (accountStoreError) return [];
+
+    // 1. Read from SQLite. It is the store of record.
     if (sqliteDb) {
       try {
         const rows = sqliteDb.prepare('SELECT * FROM users ORDER BY is_super_admin DESC, created_at ASC').all();
         if (rows.length > 0) {
           const mapped = rows.map(mapSqliteRowToUser);
-          // Ensure kingplayz Super Admin is always present
+          // The bootstrap Super Admin must exist; its password is generated,
+          // never read from source.
           if (!mapped.some((u) => u.username.toLowerCase() === 'kingplayz')) {
-            syncUserToSqlite(SUPER_ADMIN_KINGPLAYZ);
-            mapped.unshift(SUPER_ADMIN_KINGPLAYZ);
+            const sa = createBootstrapSuperAdmin();
+            syncUserToSqlite(sa);
+            mapped.unshift(sa);
           }
           return mapped;
         }
-      } catch {
-        // fallback below
+      } catch (err) {
+        accountStoreError = `users query failed: ${err instanceof Error ? err.message : String(err)}`;
+        console.error('[SQLite] account store unusable; refusing to serve accounts:', err);
+        return [];
       }
     }
 
-    // 2. Migrate from JSON if present, and ensure kingplayz is seeded at index 0
-    let initialList: StoredUserAccount[] = [...DEFAULT_SEED_USERS];
+    // 2. An empty SQLite store: migrate the JSON mirror if an older build left
+    //    one, otherwise bootstrap. Nothing here invents a password.
+    const initialList: StoredUserAccount[] = [];
     try {
       if (fs.existsSync(LOCAL_USERS_DB_PATH)) {
         const parsed = JSON.parse(fs.readFileSync(LOCAL_USERS_DB_PATH, 'utf8'));
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          const hasKingPlayz = parsed.some(
-            (u: StoredUserAccount) => String(u.username || '').toLowerCase() === 'kingplayz'
-          );
-          initialList = hasKingPlayz ? parsed : [SUPER_ADMIN_KINGPLAYZ, ...parsed];
-        }
+        if (Array.isArray(parsed) && parsed.length > 0) initialList.push(...parsed);
       }
-    } catch {
-      // ignore
+    } catch (err) {
+      console.warn('[Accounts] JSON mirror could not be read:', err);
+    }
+
+    if (!initialList.some((u) => String(u.username || '').toLowerCase() === 'kingplayz')) {
+      initialList.unshift(createBootstrapSuperAdmin());
     }
 
     for (const u of initialList) {
@@ -1552,7 +1771,7 @@ async function startServer() {
     try {
       fs.writeFileSync(LOCAL_USERS_DB_PATH, JSON.stringify(initialList, null, 2), 'utf8');
     } catch {
-      // ignore
+      // The mirror is a convenience copy; SQLite still holds the accounts.
     }
     return initialList;
   };
@@ -1568,8 +1787,85 @@ async function startServer() {
     }
   };
 
-  // Initialize users DB at startup so kingplayz Super Admin is guaranteed in SQLite
-  loadUsersDb();
+  // ============================================================================
+  // 1B-1. ACCOUNT RECOVERY CODES
+  //       A local account has no email channel, so recovery is proved by a code
+  //       issued once per account and hashed at rest exactly like a password.
+  //       The alternative — name an account, type a new password — let any
+  //       caller on the machine take over any account, including the Super
+  //       Admin, and revealed which usernames exist.
+  // ============================================================================
+  /** Crockford-style alphabet: no I, O, 0 or 1 to misread from the file. */
+  const RECOVERY_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+
+  const generateRecoveryCode = (): string => {
+    const bytes = crypto.randomBytes(15);
+    const chars = Array.from(bytes, (b) => RECOVERY_ALPHABET[b % RECOVERY_ALPHABET.length]);
+    return `ISK-${chars.slice(0, 5).join('')}-${chars.slice(5, 10).join('')}-${chars.slice(10, 15).join('')}`;
+  };
+
+  /** Tolerant of case and separators when the code is typed back in. */
+  const normalizeRecoveryCode = (value: unknown): string => {
+    const raw = String(value ?? '').trim().toUpperCase();
+    const body = raw.replace(/[^A-Z0-9]/g, '');
+    const stripped = body.startsWith('ISK') ? body.slice(3) : body;
+    if (stripped.length !== 15) return raw;
+    return `ISK-${stripped.slice(0, 5)}-${stripped.slice(5, 10)}-${stripped.slice(10, 15)}`;
+  };
+
+  const saveRecoveryHash = (userId: string, hash: string | null): boolean => {
+    if (!sqliteDb || !userId) return false;
+    try {
+      sqliteDb.prepare('UPDATE users SET recovery_hash = ? WHERE id = ?').run(hash, userId);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  /**
+   * Issue (or re-issue) an account's recovery code. Only the hash is stored; the
+   * code itself is written once to the first-run credentials file so the
+   * operator can actually find it again.
+   */
+  const issueRecoveryCode = (user: StoredUserAccount, note: string): string | null => {
+    const code = generateRecoveryCode();
+    const hash = hashPassword(code);
+    if (!saveRecoveryHash(user.id, hash)) return null;
+    user.recoveryHash = hash;
+    writeFirstRunCredentials([{ username: user.username, password: code, note }]);
+    return code;
+  };
+
+  /**
+   * Start-up pass over the account store: guarantee the bootstrap Super Admin
+   * exists, replace any password that shipped in a published build, and make
+   * sure every account has recovery material. Called once, after every helper
+   * it uses exists.
+   */
+  const initializeAccountStore = (): void => {
+    const users = loadUsersDb();
+    if (accountStoreError) {
+      console.error(`[Accounts] Account store unavailable: ${accountStoreError}`);
+      return;
+    }
+    if (rotateCompromisedDefaultPasswords(users) > 0) {
+      saveUsersDb(users);
+    }
+    // Accounts that predate this release have no recovery code. Issuing one here
+    // (rather than at sign-in) keeps the write in one place and means a locked
+    // out operator has material to recover with before they need it.
+    let issued = 0;
+    for (const user of users) {
+      if (user.recoveryHash) continue;
+      if (issueRecoveryCode(user, 'account recovery code - keep this private')) issued += 1;
+    }
+    if (issued > 0) {
+      console.warn(`[Accounts] Issued recovery codes for ${issued} account(s).`);
+    }
+  };
+
+  initializeAccountStore();
 
   const sanitizeUser = (u: StoredUserAccount) => {
     const { passwordHash: _pw, ...rest } = u;
@@ -1745,6 +2041,21 @@ async function startServer() {
 
   const DISCORD_MEMBER_SCOPE = 'guilds.members.read';
 
+  // Provider tokens are encrypted at rest (see server/token-crypto.ts). The key
+  // is wrapped with Electron safeStorage (DPAPI on Windows) by the main process
+  // and handed over in the environment; a dev run falls back to a local key file
+  // and says so, because that copy sits beside the ciphertext.
+  const tokenKeyState = resolveTokenKey(appStateDir, process.env.OAUTH_TOKEN_KEY);
+  const tokenKey = tokenKeyState.key;
+  if (tokenKeyState.error) {
+    console.error(`[Tokens] ${tokenKeyState.error}`);
+  } else if (tokenKeyState.source === 'file') {
+    console.warn(
+      `[Tokens] Using the local key file ${path.join(appStateDir, '.oauth-key')}: tokens are encrypted, ` +
+        'but the key is stored beside the database. Packaged builds supply a DPAPI-wrapped key instead.'
+    );
+  }
+
   const ensureDiscordTokenTable = (): void => {
     try {
       sqliteDb?.exec(`
@@ -1763,9 +2074,47 @@ async function startServer() {
   };
   ensureDiscordTokenTable();
 
-  /** Tokens stay in SQLite and are never included in any API payload. */
+  /**
+   * Encrypt rows written before this change. Idempotent: already-encrypted rows
+   * are skipped, and a row that cannot be read is left exactly as it is rather
+   * than being overwritten with an unusable value. No token value is logged.
+   */
+  const encryptStoredProviderTokens = (): void => {
+    if (!sqliteDb || !tokenKey) return;
+    try {
+      const rows = sqliteDb
+        .prepare('SELECT user_id, access_token, refresh_token FROM discord_oauth_tokens')
+        .all();
+      let updated = 0;
+      for (const row of rows) {
+        const access = String(row.access_token ?? '');
+        const refresh = row.refresh_token ? String(row.refresh_token) : '';
+        const accessIsPlain = Boolean(access) && !isEncryptedSecret(access);
+        const refreshIsPlain = Boolean(refresh) && !isEncryptedSecret(refresh);
+        if (!accessIsPlain && !refreshIsPlain) continue;
+        const nextAccess = accessIsPlain ? encryptSecret(tokenKey, access) : access;
+        const nextRefresh = refreshIsPlain ? encryptSecret(tokenKey, refresh) : refresh;
+        sqliteDb
+          .prepare('UPDATE discord_oauth_tokens SET access_token = ?, refresh_token = ? WHERE user_id = ?')
+          .run(nextAccess ?? '', nextRefresh || null, String(row.user_id));
+        updated += 1;
+      }
+      if (updated > 0) {
+        console.log(`[Tokens] Encrypted ${updated} previously plaintext provider token row(s).`);
+      }
+    } catch (err) {
+      console.warn('[Tokens] Could not migrate stored provider tokens:', err);
+    }
+  };
+  encryptStoredProviderTokens();
+
+  /** Tokens stay in SQLite, encrypted, and are never included in any API payload. */
   const saveDiscordTokens = (userId: string, tokens: StoredDiscordTokens): void => {
     if (!sqliteDb || !userId) return;
+    if (!tokenKey) {
+      console.error('[Tokens] Refusing to store provider tokens: no usable encryption key.');
+      return;
+    }
     try {
       sqliteDb
         .prepare(
@@ -1780,8 +2129,8 @@ async function startServer() {
         )
         .run(
           userId,
-          tokens.accessToken,
-          tokens.refreshToken || null,
+          encryptSecret(tokenKey, tokens.accessToken) ?? '',
+          encryptSecret(tokenKey, tokens.refreshToken) || null,
           tokens.expiresAt,
           tokens.scopes || '',
           new Date().toISOString()
@@ -1798,9 +2147,13 @@ async function startServer() {
         .prepare('SELECT access_token, refresh_token, expires_at, scopes FROM discord_oauth_tokens WHERE user_id = ?')
         .get(userId);
       if (!row?.access_token) return null;
+      // A value that cannot be authenticated means the key changed: the account
+      // has to reconnect, which the caller already reports as a reauth state.
+      const accessToken = decryptSecret(tokenKey, String(row.access_token));
+      if (!accessToken) return null;
       return {
-        accessToken: String(row.access_token),
-        refreshToken: row.refresh_token ? String(row.refresh_token) : '',
+        accessToken,
+        refreshToken: decryptSecret(tokenKey, row.refresh_token ? String(row.refresh_token) : '') || '',
         expiresAt: Number(row.expires_at) || 0,
         scopes: row.scopes ? String(row.scopes) : '',
       };
@@ -2315,18 +2668,37 @@ async function startServer() {
   //     Read-only from the renderer's perspective: it can submit work through
   //     the feature endpoints, list jobs and cancel its own job.
   // ============================================================================
+  /**
+   * Jobs are per-account too. The queue is shared by every signed-in operator,
+   * so a plain list would show one account the other's installs and backup
+   * paths, and the cancel route would let it abort their work.
+   */
+  const canSeeJob = (
+    req: express.Request,
+    job: { actor?: string; serverId?: string | null } | null | undefined
+  ): boolean => {
+    if (!job) return false;
+    const viewer = requestViewer(req);
+    if (!viewer) return false;
+    if (viewer.isSuperAdmin) return true;
+    if (job.serverId && !canAccessRuntimeFolder(req, job.serverId)) return false;
+    return String(job.actor || '').toLowerCase() === viewer.username.toLowerCase();
+  };
+
   app.get('/api/jobs', validateSession, (req, res) => {
-    const jobs = jobManager.list({
-      serverId: req.query.serverId ? String(req.query.serverId) : undefined,
-      limit: Number(req.query.limit) || 50,
-    });
+    const jobs = jobManager
+      .list({
+        serverId: req.query.serverId ? String(req.query.serverId) : undefined,
+        limit: Number(req.query.limit) || 50,
+      })
+      .filter((job) => canSeeJob(req, job));
     res.setHeader('Cache-Control', 'no-store');
     res.json({ ok: true, jobs });
   });
 
   app.get('/api/jobs/:id', validateSession, (req, res) => {
     const job = jobManager.get(String(req.params.id || ''));
-    if (!job) {
+    if (!job || !canSeeJob(req, job)) {
       res.status(404).json({ ok: false, error: 'Job not found' });
       return;
     }
@@ -2335,6 +2707,11 @@ async function startServer() {
   });
 
   app.post('/api/jobs/:id/cancel', validateSession, (req, res) => {
+    const existing = jobManager.get(String(req.params.id || ''));
+    if (!existing || !canSeeJob(req, existing)) {
+      res.status(404).json({ ok: false, error: 'Job not found' });
+      return;
+    }
     const result = jobManager.cancel(String(req.params.id || ''));
     if (!result.ok) {
       res.status(result.job ? 409 : 404).json({
@@ -2374,16 +2751,165 @@ async function startServer() {
     });
   });
 
+  // ============================================================================
+  // 1B-2. SERVER FOLDER ATTRIBUTION (Super Admin)
+  //       A folder created before ownership was recorded — or provisioned
+  //       straight onto disk — belongs to nobody, which makes it Super Admin
+  //       only. This is the explicit, audited way to hand one to the account
+  //       that should have it. It is never automatic: an unowned folder is
+  //       never adopted by whoever signs in first.
+  // ============================================================================
+  const requireSuperAdmin = (req: express.Request, res: express.Response): StoredUserAccount | null => {
+    const actor = readUserById(String((req as any).userId || ''));
+    if (!actor) {
+      res.status(401).json({ ok: false, code: 'SESSION_REQUIRED', error: 'Sign in again to continue.' });
+      return null;
+    }
+    if (!isSuperAdminAccount(actor)) {
+      res.status(403).json({
+        ok: false,
+        code: 'SUPER_ADMIN_REQUIRED',
+        error: 'Only a Super Admin can manage server folder ownership.',
+      });
+      return null;
+    }
+    return actor;
+  };
+
+  app.get('/api/admin/server-ownership', validateSession, (req, res) => {
+    const actor = requireSuperAdmin(req, res);
+    if (!actor) return;
+
+    const root = resolveWritableDiskRoot(serverInstallConfig.installRootDir);
+    const folders: Array<{
+      name: string;
+      diskPath: string;
+      owner: ReturnType<typeof readServerOwner>;
+    }> = [];
+    try {
+      for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        folders.push({
+          name: entry.name,
+          diskPath: path.join(root, entry.name),
+          owner: readServerOwner(sqliteDb, entry.name),
+        });
+      }
+    } catch {
+      // No install root yet: an empty list is the honest answer.
+    }
+    folders.sort((a, b) => {
+      const aOrphan = a.owner ? 1 : 0;
+      const bOrphan = b.owner ? 1 : 0;
+      return aOrphan - bOrphan || a.name.localeCompare(b.name);
+    });
+
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      ok: true,
+      installRoot: root,
+      unattributedCount: folders.filter((f) => !f.owner).length,
+      folders,
+      accounts: loadUsersDb().map((u) => ({
+        id: u.id,
+        username: u.username,
+        displayName: u.displayName,
+        role: isSuperAdminAccount(u) ? 'Super Admin' : u.role,
+        isSuperAdmin: isSuperAdminAccount(u),
+      })),
+    });
+  });
+
+  app.post('/api/admin/server-ownership/assign', validateSession, (req, res) => {
+    const actor = requireSuperAdmin(req, res);
+    if (!actor) return;
+
+    const folderName = String((req.body || {}).folderName || '').trim();
+    const targetRef = String((req.body || {}).username || '').trim();
+    if (!folderName || !targetRef) {
+      res.status(400).json({
+        ok: false,
+        error: 'Provide both the server folder name and the account it belongs to.',
+      });
+      return;
+    }
+
+    // Validate the folder the same way the server routes resolve one, and then
+    // require it to sit directly inside the configured install root: a recorded
+    // fallback path must not let an assignment point at an arbitrary directory.
+    const diskRoot = resolveWritableDiskRoot(serverInstallConfig.installRootDir);
+    const dir = resolveRuntimeDir(folderName, '');
+    if (!dir) {
+      res.status(404).json({ ok: false, error: 'Server folder not found on disk' });
+      return;
+    }
+    const resolved = path.resolve(dir);
+    if (path.dirname(resolved) !== path.resolve(diskRoot)) {
+      res.status(400).json({
+        ok: false,
+        code: 'FOLDER_OUTSIDE_INSTALL_ROOT',
+        error: 'That folder is outside the configured server install folder.',
+      });
+      return;
+    }
+
+    // Validate the target account.
+    const target = loadUsersDb().find(
+      (u) => u.id === targetRef || u.username.toLowerCase() === targetRef.toLowerCase()
+    );
+    if (!target) {
+      res.status(404).json({ ok: false, error: 'No panel account matches that username or id.' });
+      return;
+    }
+
+    const folder = path.basename(resolved);
+    const result = assignServerOwner(sqliteDb, folder, target.id, target.username);
+    if (!result.ok) {
+      res.status(503).json({
+        ok: false,
+        code: 'OWNERSHIP_STORE_UNAVAILABLE',
+        error: 'Could not record the folder owner.',
+      });
+      return;
+    }
+
+    pushPanelAudit(
+      'SECURITY',
+      result.changed
+        ? `Assigned server folder "${folder}" to @${target.username}${
+            result.previous ? ` (previously @${result.previous.ownerUsername})` : ' (was unattributed)'
+          }`
+        : `Server folder "${folder}" already belongs to @${target.username}`,
+      `${actor.username} (Super Admin)`
+    );
+
+    res.json({
+      ok: true,
+      folder,
+      changed: result.changed,
+      owner: { id: target.id, username: target.username },
+      previousOwner: result.previous,
+    });
+  });
+
   app.post('/api/auth/register', (req, res) => {
     const {
       username,
       displayName,
       email,
       password,
-      role = 'Root Admin',
       mcUuid,
       avatarUrl,
     } = req.body || {};
+
+    if (accountStoreError) {
+      res.status(503).json({
+        ok: false,
+        code: 'ACCOUNT_STORE_UNAVAILABLE',
+        error: 'The local account database is unavailable, so no account can be created.',
+      });
+      return;
+    }
 
     if (!username || !String(username).trim() || !email || !String(email).trim() || !password) {
       res.status(400).json({
@@ -2393,7 +2919,26 @@ async function startServer() {
       return;
     }
 
+    // New accounts are ordinary operators. The role used to be taken from the
+    // request body (defaulting to Root Admin), so `{"role":"Super Admin"}` on
+    // this public endpoint created a privileged account with no approval step.
+    // Only a Super Admin can change a role afterwards.
+    const grantedRole: StoredUserAccount['role'] = 'Operator';
+
+    const passwordProblem = passwordPolicyError(password);
+    if (passwordProblem) {
+      res.status(400).json({ ok: false, code: 'WEAK_PASSWORD', error: passwordProblem });
+      return;
+    }
+
     const cleanUsername = String(username).trim().replace(/\s+/g, '_');
+    if (cleanUsername.toLowerCase() === 'kingplayz') {
+      res.status(409).json({
+        ok: false,
+        error: 'That username is reserved for the Super Admin account.',
+      });
+      return;
+    }
     const cleanEmail = String(email).trim().toLowerCase();
     const users = loadUsersDb();
 
@@ -2423,7 +2968,7 @@ async function startServer() {
       displayName: String(displayName || cleanUsername).trim(),
       email: cleanEmail,
       passwordHash: hashPassword(String(password)),
-      role: role as StoredUserAccount['role'],
+      role: grantedRole,
       provider: 'local',
       avatarUrl: resolvedAvatarUrl,
       mcUuid: mcUuid ? String(mcUuid).trim() : 'a12d88e1-55f0-4c12-9001-bc88210fa912',
@@ -2461,7 +3006,7 @@ async function startServer() {
     // Sign the new account in with a real session row. The old placeholder
     // cookie was never in auth_sessions, so the first authenticated request
     // after sign-up (and now the panel-access check) failed.
-    const registerSessionId = `sess-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+    const registerSessionId = newSessionId();
     if (sqliteDb) {
       try {
         sqliteDb
@@ -2486,15 +3031,43 @@ async function startServer() {
     }
     res.setHeader('Set-Cookie', sessionCookie(req, registerSessionId));
 
+    // Issue this account's recovery code and return it exactly once. There is no
+    // email channel, so without it a forgotten password is unrecoverable; it is
+    // also written to the first-run credentials file for the operator.
+    const recoveryCode = issueRecoveryCode(newUser, 'account recovery code - keep this private');
+
     res.json({
       ok: true,
       user: sanitized,
+      recoveryCode,
+      recoveryCodeIssued: Boolean(recoveryCode),
       mongoPushed: true,
       mongoDocumentId: mongoDoc._id,
       mongoDatabase: dbEngineConfig.mongoDatabase,
       discordConfig: discordBotConfig,
     });
   });
+
+  // Sign-in throttle. A local panel still has a network surface (and the
+  // renderer is not the only client), so guessing is rate-limited per
+  // identifier+address instead of being free.
+  const loginAttempts = new Map<string, number[]>();
+  const LOGIN_WINDOW_MS = 10 * 60 * 1000;
+  const LOGIN_MAX_FAILURES = 10;
+  const loginThrottleKey = (req: express.Request, identifier: string) =>
+    `${String(req.ip || req.socket?.remoteAddress || 'local')}|${identifier.toLowerCase()}`;
+  const loginBlocked = (key: string): boolean => {
+    const now = Date.now();
+    const recent = (loginAttempts.get(key) || []).filter((t) => now - t < LOGIN_WINDOW_MS);
+    loginAttempts.set(key, recent);
+    return recent.length >= LOGIN_MAX_FAILURES;
+  };
+  const recordLoginFailure = (key: string) => {
+    const now = Date.now();
+    const recent = (loginAttempts.get(key) || []).filter((t) => now - t < LOGIN_WINDOW_MS);
+    recent.push(now);
+    loginAttempts.set(key, recent);
+  };
 
   app.post('/api/auth/login', (req, res) => {
     const { identifier, password } = req.body || {};
@@ -2506,8 +3079,27 @@ async function startServer() {
       return;
     }
 
+    if (accountStoreError) {
+      res.status(503).json({
+        ok: false,
+        code: 'ACCOUNT_STORE_UNAVAILABLE',
+        error: 'The local account database is unavailable. Sign-in is disabled until it is repaired.',
+      });
+      return;
+    }
+
     const q = String(identifier).trim().toLowerCase();
     const rawPass = String(password);
+    const throttleKey = loginThrottleKey(req, q);
+    if (loginBlocked(throttleKey)) {
+      res.status(429).json({
+        ok: false,
+        code: 'TOO_MANY_ATTEMPTS',
+        error: 'Too many failed sign-in attempts. Wait a few minutes and try again.',
+      });
+      return;
+    }
+
     const users = loadUsersDb();
 
     const idx = users.findIndex(
@@ -2517,30 +3109,46 @@ async function startServer() {
         u.email.toLowerCase() === q
     );
 
-    if (idx === -1) {
+    // One message for "no such account" and "wrong password": the previous
+    // copy named the account that existed and echoed the supplied identifier,
+    // which turned the sign-in form into an account enumerator. The timing is
+    // equalised by hashing before the lookup result is used.
+    const rejected = () => {
+      recordLoginFailure(throttleKey);
       res.status(401).json({
         ok: false,
-        error: `No operator account found for "${identifier}". Use Super Admin ID "SA-KINGPLAYZ-001" / "kingplayz" or click "Sign Up".`,
+        code: 'INVALID_CREDENTIALS',
+        error: 'That username or password is not correct. Use "Reset Password" if you have lost it.',
       });
+    };
+
+    if (idx === -1) {
+      // Spend the same work as a real check so a missing account is not faster.
+      verifyPassword(rawPass, hashPassword('decoy-password-value'));
+      rejected();
       return;
     }
 
     const found = users[idx];
-    const incomingHash = hashPassword(rawPass);
     const isKingPlayzSuperAdmin =
       found.username.toLowerCase() === 'kingplayz' || found.id === 'SA-KINGPLAYZ-001';
-    // Only the stored hash is accepted. The old fallbacks (`kingpanel123`, a
-    // masked dot string, and hard-coded Super Admin passwords) let anyone sign
-    // in as any known account, which would have made every panel entitlement
-    // meaningless.
-    const isPasswordValid = found.passwordHash === incomingHash;
 
-    if (!isPasswordValid) {
-      res.status(401).json({
-        ok: false,
-        error: 'Invalid password for this operator account. Use your registered password or click "Reset Password".',
-      });
+    // Only the stored hash is accepted. Legacy SHA-256 rows verify here too and
+    // are replaced with a scrypt hash on the first successful sign-in, so an
+    // upgrade never needs a bulk password reset.
+    const check = verifyPassword(rawPass, found.passwordHash);
+    if (!check.ok) {
+      rejected();
       return;
+    }
+
+    loginAttempts.delete(throttleKey);
+
+    // Transparent upgrade: a legacy SHA-256 row becomes scrypt the moment the
+    // operator proves the password, so no account has to be reset by hand.
+    if (check.needsRehash) {
+      found.passwordHash = hashPassword(rawPass);
+      console.log(`[Accounts] Upgraded stored password hash for @${found.username}`);
     }
 
     found.lastLogin = `Today at ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })} UTC`;
@@ -2561,7 +3169,7 @@ async function startServer() {
     saveUsersDb(users);
 
     // Record session in SQLite auth_sessions table
-    const sessionId = `sess-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+    const sessionId = newSessionId();
     if (sqliteDb) {
       try {
         sqliteDb
@@ -2640,7 +3248,9 @@ async function startServer() {
       const token = generatePasswordResetToken();
       const expiresAt = Date.now() + 60 * 60 * 1000; // 1 hour
 
-      passwordResetTokens.set(token, {
+      // Keyed by the token's digest: a memory dump or a debugger view of this
+      // map yields no usable reset token.
+      passwordResetTokens.set(crypto.createHash('sha256').update(token).digest('hex'), {
         userId: user.id,
         expiresAt
       });
@@ -2654,9 +3264,9 @@ async function startServer() {
         }
       }
 
-      // In a real implementation, you would send an email here
-      // For now, we'll log it (in production, never log tokens)
-      console.log(`Password reset token generated for user ${user.id}: ${token}`);
+      // There is no delivery channel for this token yet, and logging it wrote a
+      // working reset credential into stdout and every captured log. Nothing is
+      // printed; the local recovery path is POST /api/auth/reset-password.
     }
   });
 
@@ -2673,7 +3283,9 @@ async function startServer() {
       return;
     }
 
-    const tokenData = passwordResetTokens.get(token);
+    const tokenData = passwordResetTokens.get(
+      crypto.createHash('sha256').update(String(token)).digest('hex')
+    );
 
     // Check if token exists and is not expired
     if (!tokenData || Date.now() > tokenData.expiresAt) {
@@ -2694,7 +3306,9 @@ async function startServer() {
       saveUsersDb(users);
 
       // Remove used token
-      passwordResetTokens.delete(token);
+      passwordResetTokens.delete(
+        crypto.createHash('sha256').update(String(token)).digest('hex')
+      );
     }
 
     // Always return generic response
@@ -2709,8 +3323,14 @@ async function startServer() {
     try {
       const { currentPassword, newPassword } = req.body || {};
 
-      // Generic response to prevent user enumeration
-      if (!currentPassword || !newPassword || String(newPassword).length < 4) {
+      const policyProblem = passwordPolicyError(newPassword, 'New password');
+      if (policyProblem) {
+        // The caller already holds this session, so there is nothing to
+        // enumerate: say plainly why the change did not happen.
+        res.status(400).json({ ok: false, code: 'WEAK_PASSWORD', error: policyProblem });
+        return;
+      }
+      if (!currentPassword) {
         res.json({
           ok: true,
           message: 'If the current password is correct and the new password meets requirements, your password has been updated.'
@@ -2733,9 +3353,8 @@ async function startServer() {
         return;
       }
 
-      // Verify current password
-      const incomingHash = hashPassword(String(currentPassword));
-      const isPasswordValid = user.password_hash === incomingHash;
+      // Verify current password (constant-time, and legacy-format aware)
+      const isPasswordValid = verifyPassword(String(currentPassword), user.password_hash).ok;
 
       if (!isPasswordValid) {
         // Still return generic response to prevent user enumeration
@@ -2755,7 +3374,7 @@ async function startServer() {
       sqliteDb.prepare('DELETE FROM auth_sessions WHERE user_id = ?').run(userId);
 
       // Create new session for current login
-      const sessionId = `sess-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+      const sessionId = newSessionId();
       try {
         sqliteDb
           .prepare(
@@ -2876,7 +3495,7 @@ async function startServer() {
       // ignore
     }
 
-    const sessionId = `sess-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+    const sessionId = newSessionId();
     if (sqliteDb) {
       try {
         sqliteDb
@@ -3226,12 +3845,12 @@ async function startServer() {
     });
   });
 
-  app.post('/api/auth/session', (req, res) => {
-    const { username, provider } = req.body || {};
-    res.setHeader(
-      'Set-Cookie',
-      sessionCookie(req, Buffer.from(`${username || 'admin'}:${provider || 'local'}:${Date.now()}`).toString('base64'))
-    );
+  // Unauthenticated heartbeat. It used to mint a `king_session` cookie from the
+  // request body: that cookie was never a real session row, but it did overwrite
+  // the caller's genuine cookie and sign them out. No caller in the renderer
+  // uses it, so nothing is set here.
+  app.post('/api/auth/session', (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
     res.json({ ok: true, timestamp: new Date().toISOString() });
   });
 
@@ -3340,11 +3959,12 @@ async function startServer() {
   });
 
   // ============================================================================
-  // 1F. LOCAL PASSWORD RESET
-  //     The panel can be reached over the LAN (the server binds 0.0.0.0), so an
-  //     unauthenticated "reset any password" route would be a remote account
-  //     takeover. The reset box in the sign-in card only works from the machine
-  //     running the panel, where the account database file is already readable.
+  // 1F. LOCAL ACCOUNT RECOVERY
+  //     Proof of ownership is this account's recovery code, never the password
+  //     alone. "Type a username and pick a new password" was a cross-account
+  //     takeover — it worked for any stored account, including the Super Admin,
+  //     and its 404 told the caller which usernames existed. Failures are now
+  //     deliberately indistinguishable from one another.
   // ============================================================================
   const isLoopbackRequest = (req: express.Request): boolean => {
     const raw = String(req.ip || req.socket?.remoteAddress || '').replace(/^::ffff:/i, '');
@@ -3365,11 +3985,18 @@ async function startServer() {
     }
     const identifier = String((req.body || {}).identifier || '').trim();
     const newPassword = String((req.body || {}).newPassword || '');
-    if (!identifier || newPassword.length < 4) {
+    const recoveryCode = normalizeRecoveryCode((req.body || {}).recoveryCode);
+    if (!identifier || !recoveryCode) {
       res.status(400).json({
         ok: false,
-        error: 'Provide your username or email and a new password of at least 4 characters.',
+        code: 'RECOVERY_CODE_REQUIRED',
+        error: 'Enter your username or email, your recovery code, and a new password.',
       });
+      return;
+    }
+    const resetPolicyProblem = passwordPolicyError(newPassword, 'New password');
+    if (resetPolicyProblem) {
+      res.status(400).json({ ok: false, code: 'WEAK_PASSWORD', error: resetPolicyProblem });
       return;
     }
 
@@ -3379,12 +4006,33 @@ async function startServer() {
     if (recent.length >= RESET_MAX_ATTEMPTS) {
       res.status(429).json({
         ok: false,
-        error: 'Too many password reset attempts. Wait a few minutes and try again.',
+        error: 'Too many recovery attempts. Wait a few minutes and try again.',
       });
       return;
     }
     recent.push(now);
     resetAttempts.set(key, recent);
+
+    /**
+     * One answer for "no such account", "that account has no recovery code"
+     * and "wrong code", so this route cannot be used to enumerate usernames.
+     */
+    const rejectRecovery = () => {
+      res.status(401).json({
+        ok: false,
+        code: 'INVALID_RECOVERY',
+        error: 'That account and recovery code do not match.',
+      });
+    };
+
+    if (accountStoreError) {
+      res.status(503).json({
+        ok: false,
+        code: 'ACCOUNT_STORE_UNAVAILABLE',
+        error: 'The local account database is unavailable, so recovery is disabled.',
+      });
+      return;
+    }
 
     const users = loadUsersDb();
     const idx = users.findIndex(
@@ -3393,29 +4041,43 @@ async function startServer() {
         String(u.email || '').toLowerCase() === key
     );
     if (idx === -1) {
-      // Honest failure beats a fake success; the caller is on this machine.
-      res.status(404).json({ ok: false, error: 'No local account matches that username or email.' });
+      // Same work as a real check, so a missing account is not faster to try.
+      verifyPassword(recoveryCode, hashPassword('decoy-recovery-value'));
+      rejectRecovery();
       return;
     }
 
-    users[idx].passwordHash = hashPassword(newPassword);
+    const target = users[idx];
+    const storedRecovery = String(target.recoveryHash || '');
+    if (!storedRecovery || !verifyPassword(recoveryCode, storedRecovery).ok) {
+      rejectRecovery();
+      return;
+    }
+
+    target.passwordHash = hashPassword(newPassword);
+    // A used recovery code is spent: a fresh one is issued below, so a leaked
+    // code cannot be replayed later.
     saveUsersDb(users);
+    const replacement = issueRecoveryCode(target, 'new recovery code issued after a password reset');
 
     // A password change invalidates every existing session for that account.
     try {
       if (sqliteDb) {
-        sqliteDb.prepare('DELETE FROM auth_sessions WHERE user_id = ?').run(users[idx].id);
+        sqliteDb.prepare('DELETE FROM auth_sessions WHERE user_id = ?').run(target.id);
       }
     } catch {
       // session table unavailable — the new password still applies
     }
     resetAttempts.delete(key);
-    pushPanelAudit('PROFILE', `Local password reset completed for @${users[idx].username}`, 'local operator');
+    pushPanelAudit('SECURITY', `Password recovery completed for @${target.username}`, 'verified by recovery code');
 
     res.setHeader('Set-Cookie', clearedSessionCookie(req));
     res.json({
       ok: true,
-      message: `Password updated for @${users[idx].username}. Sign in with the new password.`,
+      message: `Password updated for @${target.username}. Sign in with the new password.`,
+      // Shown once, so the operator can store the code they will need next time.
+      recoveryCode: replacement,
+      recoveryCodeIssued: Boolean(replacement),
     });
   });
 
@@ -3881,7 +4543,7 @@ async function startServer() {
   // if it bypasses the UI.
   app.post('/api/marketplace/install', validateSession, requireAdvancedPanel, async (req, res) => {
     const { serverId, serverName, slug, versionId, projectType = 'mod' } = req.body || {};
-    const dir = resolveRuntimeDir(String(serverId || ''), String(serverName || ''));
+    const dir = resolveRuntimeDirForRequest(req, String(serverId || ''), String(serverName || ''));
     if (!dir) {
       res.status(404).json({ ok: false, error: 'Server folder not found on disk' });
       return;
@@ -5418,7 +6080,10 @@ async function startServer() {
   interface PanelAuditEvent {
     id: string;
     time: string;
-    category: 'RAM_ALLOC' | 'SIGKILL' | 'PROFILE' | 'OAUTH' | 'SYSTEM' | 'MARKETPLACE';
+    // SECURITY is for access-control events (ownership changes, credential
+    // recovery, dropped databases): they need to be separable from routine
+    // system noise when someone reviews the log after an incident.
+    category: 'RAM_ALLOC' | 'SIGKILL' | 'PROFILE' | 'OAUTH' | 'SYSTEM' | 'MARKETPLACE' | 'SECURITY';
     message: string;
     actor: string;
   }
@@ -6199,28 +6864,32 @@ async function startServer() {
   app.post('/api/panel/profile-sync', validateSession, (req, res) => {
     const { user, changeNote } = req.body || {};
     let mongoDocId: string | undefined;
-    if (user?.username) {
-      const users = loadUsersDb();
-      const idx = users.findIndex(
-        (u) =>
-          u.id === user.id ||
-          u.username.toLowerCase() === String(user.username).toLowerCase()
-      );
-      if (idx !== -1) {
-        users[idx] = {
-          ...users[idx],
-          username: user.username || users[idx].username,
-          displayName: user.displayName || users[idx].displayName,
-          email: user.email || users[idx].email,
-          role: user.role || users[idx].role,
-          avatarUrl: user.avatarUrl || users[idx].avatarUrl || DEFAULT_SERVER_PROFILE_ICON,
-          mcUuid: user.mcUuid || users[idx].mcUuid,
-        };
-        saveUsersDb(users);
-      }
-      const pushed = pushToMongoDB('user_profiles', 'username', user.username, {
-        ...user,
-        avatarUrl: user.avatarUrl || DEFAULT_SERVER_PROFILE_ICON,
+    // Only the signed-in account's own profile, and only its cosmetic fields.
+    // The previous version looked users up by body-supplied id/username and
+    // copied `role` from the body, so any session could make itself Super Admin.
+    const actorId = String((req as any).userId || '');
+    const users = loadUsersDb();
+    const idx = users.findIndex((u) => u.id === actorId);
+    if (idx === -1) {
+      res.status(401).json({ ok: false, code: 'SESSION_REQUIRED', error: 'Sign in again to continue.' });
+      return;
+    }
+    {
+      users[idx] = {
+        ...users[idx],
+        displayName: user?.displayName || users[idx].displayName,
+        email: user?.email || users[idx].email,
+        avatarUrl: user?.avatarUrl || users[idx].avatarUrl || DEFAULT_SERVER_PROFILE_ICON,
+        mcUuid: user?.mcUuid || users[idx].mcUuid,
+      };
+      saveUsersDb(users);
+    }
+    {
+      const stored = sanitizeUser(users[idx]);
+      const pushed = pushToMongoDB('user_profiles', 'username', stored.username, {
+        ...stored,
+        role: users[idx].role,
+        avatarUrl: stored.avatarUrl || DEFAULT_SERVER_PROFILE_ICON,
         updatedAt: new Date().toISOString(),
       });
       mongoDocId = String(pushed._id);
@@ -6228,20 +6897,19 @@ async function startServer() {
       try {
         fs.writeFileSync(
           LOCAL_PROFILE_PATH,
-          JSON.stringify({ ...user, mongoId: mongoDocId, savedToDiskAt: new Date().toISOString() }, null, 2),
+          JSON.stringify({ ...stored, mongoId: mongoDocId, savedToDiskAt: new Date().toISOString() }, null, 2),
           'utf8'
         );
       } catch {
         // ignore fs write error
       }
-      res.setHeader(
-        'Set-Cookie',
-        sessionCookie(req, Buffer.from(`${user.username}:${user.provider || 'local'}:${Date.now()}`).toString('base64'))
-      );
+      // No Set-Cookie here: saving a profile must not replace the session id
+      // with a base64 string that is not a row in auth_sessions (that signed the
+      // caller out on the next request).
       pushPanelAudit(
         'PROFILE',
-        changeNote || `Saved operator profile @${user.username} to local PC disk & MongoDB (${mongoDocId})`,
-        user.displayName || user.username
+        changeNote || `Saved operator profile @${users[idx].username} to local PC disk & MongoDB (${mongoDocId})`,
+        users[idx].displayName || users[idx].username
       );
     }
     res.json({
@@ -6256,12 +6924,24 @@ async function startServer() {
 
   // Update Global Server Installation Folder & Provision All Fleet Server Subfolders Inside It
   app.post('/api/panel/install-folder', validateSession, (req, res) => {
+    // The install root is global: it is where every account's server folders
+    // live. Repointing it from a normal session would move (and hide) every
+    // other account's servers, so it is a Super Admin action.
+    const viewer = requestViewer(req);
+    if (!viewer || !viewer.isSuperAdmin) {
+      res.status(403).json({
+        ok: false,
+        code: 'SUPER_ADMIN_REQUIRED',
+        error: 'Only a Super Admin can change the global server install folder.',
+      });
+      return;
+    }
+    const actor = viewer.username;
     const {
       installRootDir,
       autoCreateSubfolders = true,
       autoAcceptEula = true,
       servers = [],
-      actor = 'Operator',
     } = req.body || {};
 
     if (!installRootDir || !String(installRootDir).trim()) {
@@ -6297,6 +6977,7 @@ async function startServer() {
             ramMaxGb: s.ramMaxGb,
           });
           updatedServerPaths[s.id] = prov.displayPath;
+          recordServerOwner(sqliteDb, prov.folderName, viewer.id, viewer.username);
         }
       }
     }
@@ -6363,6 +7044,18 @@ async function startServer() {
       : Math.max(1, Number(requestUser.maxServerLimit) || discordBotConfig.defaultServerLimit);
 
     const requestedRoot = String(installRootDir || '').trim();
+    if (
+      requestedRoot &&
+      requestedRoot !== serverInstallConfig.installRootDir &&
+      !isSuperAdminAccount(requestUser)
+    ) {
+      res.status(403).json({
+        ok: false,
+        code: 'SUPER_ADMIN_REQUIRED',
+        error: 'Only a Super Admin can change the global server install folder.',
+      });
+      return;
+    }
     if (requestedRoot && requestedRoot !== serverInstallConfig.installRootDir) {
       serverInstallConfig = {
         ...serverInstallConfig,
@@ -6411,6 +7104,10 @@ async function startServer() {
       });
       return;
     }
+
+    // Record ownership before the job starts, so the first follow-up call from
+    // the renderer (setup, then power) already resolves to the new folder.
+    recordServerOwner(sqliteDb, folderName, requestUser.id, requestUser.username);
 
     const parsedEngine = parseEngineLabel(engine, String(requestedVersion || ''));
     const jarEngine = parsedEngine.engine || 'paper';
@@ -7152,6 +7849,22 @@ async function startServer() {
       });
       return;
     }
+    // Schema injection runs against a named database, so a normal account may
+    // only touch databases that belong to servers it owns (a Super Admin may
+    // touch any). Otherwise this is a write path into another account's server.
+    if (!requestViewer(req)?.isSuperAdmin) {
+      const foreign = names.filter((n) => {
+        const folder = folderForPanelDatabase(n);
+        return !folder || !canAccessRuntimeFolder(req, folder);
+      });
+      if (foreign.length) {
+        res.status(404).json({
+          ok: false,
+          error: 'No server you own matches that database.',
+        });
+        return;
+      }
+    }
     if (engine === 'mongodb') {
       res.status(400).json({
         ok: false,
@@ -7300,11 +8013,12 @@ async function startServer() {
       windowsAppDataPath: WINDOWS_APPDATA_DB_DISPLAY_PATH,
       sizeBytes: dbFileSizeBytes,
       sizeFormatted: `${Math.max(48, Math.round(dbFileSizeBytes / 1024))} KB`,
+      // No credential material here. This endpoint only needs a session, so a
+      // password hint in the body was readable by every signed-in operator.
       superAdmin: {
         id: 'SA-KINGPLAYZ-001',
         username: 'kingplayz',
         email: 'kingplayz@iskingpanel.exe',
-        passwordHint: 'KingPlayz#2026',
         role: 'Super Admin',
         maxServerLimit: 999,
       },
@@ -7458,10 +8172,11 @@ async function startServer() {
       sqliteDbPath: SQLITE_DB_PATH,
       windowsAppDataDbPath: WINDOWS_APPDATA_DB_DISPLAY_PATH,
       serverInstallRoot: serverInstallConfig.installRootDir,
-      superAdminCredentials: {
+      // Identity only. The password is generated per install and never leaves
+      // the first-run credentials file.
+      superAdminAccount: {
         id: 'SA-KINGPLAYZ-001',
         username: 'kingplayz',
-        password: 'KingPlayz#2026',
         role: 'Super Admin',
       },
     });
@@ -7940,8 +8655,27 @@ async function startServer() {
     });
   });
 
+  /**
+   * True when the request named a server it does not own. Answers with the same
+   * 404 a missing folder gets, so a caller cannot probe for other accounts'
+   * folder names. An empty ref list is not a denial: the route's own validation
+   * handles that.
+   */
+  const denyForeignServer = (
+    req: express.Request,
+    res: express.Response,
+    ...refs: Array<string | undefined>
+  ): boolean => {
+    const ids = refs.map((r) => String(r ?? '').trim()).filter(Boolean);
+    if (ids.length === 0) return false;
+    if (ids.some((id) => canAccessRuntimeFolder(req, id))) return false;
+    res.status(404).json({ ok: false, error: 'Server folder not found on disk' });
+    return true;
+  };
+
   app.post('/api/backups/create', validateSession, (req, res) => {
     const { serverId = '', serverName = '', title = 'Manual checkpoint' } = req.body || {};
+    if (denyForeignServer(req, res, serverId, serverName)) return;
     const dir = resolveServerDiskDir(String(serverName));
     if (!fs.existsSync(dir)) {
       res.status(404).json({ ok: false, error: 'Server folder not found on disk' });
@@ -7994,6 +8728,7 @@ async function startServer() {
 
   app.post('/api/backups/pin', validateSession, (req, res) => {
     const { serverId = '', serverName = '', id } = req.body || {};
+    if (denyForeignServer(req, res, serverId, serverName)) return;
     const list = listServerArchives(String(serverId), String(serverName));
     const found = list.find((s) => s.id === id);
     if (!found) {
@@ -8008,6 +8743,7 @@ async function startServer() {
 
   app.post('/api/backups/restore', validateSession, (req, res) => {
     const { serverId = '', serverName = '', id } = req.body || {};
+    if (denyForeignServer(req, res, serverId, serverName)) return;
     const dir = resolveServerDiskDir(String(serverName));
     const list = listServerArchives(String(serverId), String(serverName));
     const found = list.find((s) => s.id === id);
@@ -8060,6 +8796,7 @@ async function startServer() {
     const id = String(req.params.id);
     const serverId = String(req.query.serverId || '');
     const serverName = String(req.query.serverName || '');
+    if (denyForeignServer(req, res, serverId, serverName)) return;
     const list = listServerArchives(serverId, serverName);
     const found = list.find((s) => s.id === id);
     if (!found) {
@@ -8201,6 +8938,7 @@ async function startServer() {
       res.status(400).json({ ok: false, error: 'serverId required' });
       return;
     }
+    if (denyForeignServer(req, res, id, serverName)) return;
     const payload = String(commandPayload || "").trim();
     if (!payload) {
       res.status(400).json({ ok: false, error: 'A console command is required' });
@@ -8242,6 +8980,8 @@ async function startServer() {
       return;
     }
     const job = list[idx];
+    // The stored row is authoritative for which server this schedule targets.
+    if (denyForeignServer(req, res, job.serverId)) return;
     const result = await executeSimpleSchedule(job);
     job.lastRunAt = new Date().toISOString();
     job.lastResult = result;
@@ -8264,6 +9004,7 @@ async function startServer() {
       res.status(404).json({ ok: false, error: 'Schedule not found' });
       return;
     }
+    if (denyForeignServer(req, res, list[idx].serverId)) return;
     list[idx].enabled = !list[idx].enabled;
     if (list[idx].enabled) {
       list[idx].nextRunAt = Date.now() + Math.max(1, list[idx].intervalMinutes) * 60_000;
@@ -8284,6 +9025,7 @@ async function startServer() {
       res.status(404).json({ ok: false, error: 'Schedule not found' });
       return;
     }
+    if (denyForeignServer(req, res, list[idx].serverId)) return;
     const [removed] = list.splice(idx, 1);
     saveSimpleSchedules(list);
     res.json({
@@ -8384,6 +9126,17 @@ async function startServer() {
   });
 
   app.post('/api/database/configure-engine', validateSession, async (req, res) => {
+    // This is installation-wide: it holds the MySQL host/user/password and the
+    // Mongo URI every account's panel talks to. A normal session must not be able
+    // to repoint it at another host, nor overwrite the stored credentials.
+    if (!requestViewer(req)?.isSuperAdmin) {
+      res.status(403).json({
+        ok: false,
+        code: 'SUPER_ADMIN_REQUIRED',
+        error: 'Only a Super Admin can change the database engine configuration.',
+      });
+      return;
+    }
     const {
       activePrimaryEngine,
       mysqlHost,
@@ -8451,7 +9204,10 @@ async function startServer() {
     });
   });
 
-  app.post('/api/database/mongodb/push-all', validateSession, (_req, res) => {
+  app.post('/api/database/mongodb/push-all', validateSession, (req, res) => {
+    // Bulk-exports every account row to an external database: Super Admin only.
+    const actor = requireSuperAdmin(req, res);
+    if (!actor) return;
     const users = loadUsersDb();
     for (const u of users) {
       const clean = sanitizeUser(u);
@@ -8566,6 +9322,33 @@ async function startServer() {
   const sanitizeFolderName = (raw: string): string =>
     raw.trim().replace(/[^a-zA-Z0-9_-]/g, '_').replace(/_+/g, '_') || 'Server_Instance';
 
+  /** The authenticated account behind a request, as an ownership viewer. */
+  const requestViewer = (req: express.Request): Viewer | null => {
+    const userId = String((req as any).userId || '');
+    if (!userId) return null;
+    const user = readUserById(userId);
+    if (!user) return null;
+    return { id: user.id, username: user.username, isSuperAdmin: isSuperAdminAccount(user) };
+  };
+
+  /** May this request act on the named server folder? */
+  const canAccessRuntimeFolder = (req: express.Request, folderName: string): boolean =>
+    canAccessServer(sqliteDb, folderName, requestViewer(req));
+
+  /**
+   * Resolve a folder only if the caller owns it. Both "no such folder" and "not
+   * yours" return null, so a caller learns nothing about other accounts' disks.
+   */
+  const resolveRuntimeDirForRequest = (
+    req: express.Request,
+    serverId?: string,
+    serverName?: string
+  ): string | null => {
+    const resolved = resolveRuntimeDir(serverId, serverName);
+    if (!resolved) return null;
+    return canAccessRuntimeFolder(req, path.basename(resolved)) ? resolved : null;
+  };
+
   /** Resolve a request's serverId/serverName to an existing folder on disk. */
   const resolveRuntimeDir = (serverId?: string, serverName?: string): string | null => {
     const root = resolveWritableDiskRoot(serverInstallConfig.installRootDir);
@@ -8630,13 +9413,18 @@ async function startServer() {
     return engine ? engine.charAt(0).toUpperCase() + engine.slice(1) : 'PaperMC';
   };
 
-  app.get('/api/servers', validateSession, (_req, res) => {
+  app.get('/api/servers', validateSession, (req, res) => {
     const root = resolveWritableDiskRoot(serverInstallConfig.installRootDir);
     const servers: unknown[] = [];
     const setupMap = loadSetupMap();
+    // `null` means "every folder" (Super Admin). Otherwise this is the set of
+    // folders the signed-in account created; everything else is not listed at
+    // all rather than listed and refused.
+    const visibleFolders = accessibleFolders(sqliteDb, requestViewer(req));
     try {
       for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
         if (!entry.isDirectory()) continue;
+        if (visibleFolders && !visibleFolders.has(entry.name.toLowerCase())) continue;
         const dir = path.join(root, entry.name);
         const setup = setupMap[entry.name] || {};
         const engine = String(setup.engine || 'paper');
@@ -8676,7 +9464,7 @@ async function startServer() {
 
   // --- Live event stream (console lines + state changes over SSE) -----------
   app.get('/api/servers/:id/events', validateSession, (req, res) => {
-    const dir = resolveRuntimeDir(String(req.params.id), String(req.query.serverName || ''));
+    const dir = resolveRuntimeDirForRequest(req, String(req.params.id), String(req.query.serverName || ''));
     if (!dir) {
       res.status(404).json({ ok: false, error: 'Server folder not found on disk' });
       return;
@@ -8709,7 +9497,7 @@ async function startServer() {
   // --- Power: start / stop / restart / force-kill (real processes) ----------
   app.post('/api/server-runtime/power', validateSession, async (req, res) => {
     const { serverId, serverName, action, ramMaxGb } = req.body || {};
-    const dir = resolveRuntimeDir(String(serverId || ''), String(serverName || ''));
+    const dir = resolveRuntimeDirForRequest(req, String(serverId || ''), String(serverName || ''));
     if (!dir) {
       res.status(404).json({ ok: false, error: 'Server folder not found on disk' });
       return;
@@ -8781,7 +9569,7 @@ async function startServer() {
   // --- Console command (validated, written to the process stdin) ------------
   app.post('/api/server-runtime/command', validateSession, (req, res) => {
     const { serverId, serverName, command } = req.body || {};
-    const dir = resolveRuntimeDir(String(serverId || ''), String(serverName || ''));
+    const dir = resolveRuntimeDirForRequest(req, String(serverId || ''), String(serverName || ''));
     if (!dir) {
       res.status(404).json({ ok: false, error: 'Server folder not found on disk' });
       return;
@@ -8800,7 +9588,7 @@ async function startServer() {
     const serverId = String(req.query.serverId || '');
     const serverName = String(req.query.serverName || '');
     const ramMaxGb = Number(req.query.ramMaxGb) || 4;
-    const dir = resolveRuntimeDir(serverId, serverName);
+    const dir = resolveRuntimeDirForRequest(req, serverId, serverName);
     const id = dir ? path.basename(dir) : serverId;
     const stored = loadSetupMap()[id] || {};
     const mainFile =
@@ -8835,6 +9623,13 @@ async function startServer() {
     const id = String(serverId || '').trim();
     if (!id) {
       res.status(400).json({ ok: false, error: 'serverId required' });
+      return;
+    }
+    // The stored setup carries the startup command, JVM path and a git access
+    // token, so writing somebody else's entry is both a data change and a
+    // credential overwrite.
+    if (!canAccessRuntimeFolder(req, id)) {
+      res.status(404).json({ ok: false, error: 'Server folder not found on disk' });
       return;
     }
     const allowed = [
@@ -8886,7 +9681,7 @@ async function startServer() {
       filename = '',
       build = '',
     } = req.body || {};
-    const dir = resolveRuntimeDir(String(serverId || ''), String(serverName || ''));
+    const dir = resolveRuntimeDirForRequest(req, String(serverId || ''), String(serverName || ''));
     if (!dir) {
       res.status(404).json({ ok: false, error: 'Server folder not found on disk' });
       return;
@@ -8974,7 +9769,7 @@ async function startServer() {
       serverName?: string;
       deleteFiles?: boolean;
     };
-    const dir = resolveRuntimeDir(String(serverId || ''), String(serverName || ''));
+    const dir = resolveRuntimeDirForRequest(req, String(serverId || ''), String(serverName || ''));
     if (!dir) {
       res.status(404).json({ ok: false, error: 'Server folder not found on disk' });
       return;
@@ -9099,7 +9894,7 @@ async function startServer() {
   app.get('/api/server-runtime/live-state', validateSession, async (req, res) => {
     const serverId = String(req.query.serverId || '');
     const serverName = String(req.query.serverName || '');
-    const dir = resolveRuntimeDir(serverId, serverName);
+    const dir = resolveRuntimeDirForRequest(req, serverId, serverName);
     const id = dir ? path.basename(dir) : null;
     const snap: SupervisorSnapshot | null = id ? supervisor.getSnapshot(id) : null;
     const running = snap?.state === 'online' || snap?.state === 'starting';
@@ -9173,7 +9968,7 @@ async function startServer() {
 
   // --- File manager (read/write inside one server folder, escape-proof) -----
   app.get('/api/server-runtime/files', validateSession, (req, res) => {
-    const dir = resolveRuntimeDir(String(req.query.serverId || ''), String(req.query.serverName || ''));
+    const dir = resolveRuntimeDirForRequest(req, String(req.query.serverId || ''), String(req.query.serverName || ''));
     if (!dir) {
       res.status(404).json({ ok: false, error: 'Server folder not found on disk' });
       return;
@@ -9218,7 +10013,7 @@ async function startServer() {
   });
 
   app.get('/api/server-runtime/file', validateSession, (req, res) => {
-    const dir = resolveRuntimeDir(String(req.query.serverId || ''), String(req.query.serverName || ''));
+    const dir = resolveRuntimeDirForRequest(req, String(req.query.serverId || ''), String(req.query.serverName || ''));
     if (!dir) {
       res.status(404).json({ ok: false, error: 'Server folder not found on disk' });
       return;
@@ -9252,7 +10047,7 @@ async function startServer() {
 
   app.post('/api/server-runtime/file', validateSession, (req, res) => {
     const { serverId, serverName, path: relPath, content } = req.body || {};
-    const dir = resolveRuntimeDir(String(serverId || ''), String(serverName || ''));
+    const dir = resolveRuntimeDirForRequest(req, String(serverId || ''), String(serverName || ''));
     if (!dir) {
       res.status(404).json({ ok: false, error: 'Server folder not found on disk' });
       return;
@@ -9273,7 +10068,7 @@ async function startServer() {
 
   app.post('/api/server-runtime/file-create', validateSession, (req, res) => {
     const { serverId, serverName, path: relPath, kind = 'file', content = '' } = req.body || {};
-    const dir = resolveRuntimeDir(String(serverId || ''), String(serverName || ''));
+    const dir = resolveRuntimeDirForRequest(req, String(serverId || ''), String(serverName || ''));
     if (!dir) {
       res.status(404).json({ ok: false, error: 'Server folder not found on disk' });
       return;
@@ -9303,7 +10098,7 @@ async function startServer() {
 
   app.post('/api/server-runtime/file-delete', validateSession, (req, res) => {
     const { serverId, serverName, path: relPath } = req.body || {};
-    const dir = resolveRuntimeDir(String(serverId || ''), String(serverName || ''));
+    const dir = resolveRuntimeDirForRequest(req, String(serverId || ''), String(serverName || ''));
     if (!dir) {
       res.status(404).json({ ok: false, error: 'Server folder not found on disk' });
       return;
@@ -9328,7 +10123,7 @@ async function startServer() {
 
   // --- Java runtime check ("server image" for the Startup tab) --------------
   app.get('/api/server-runtime/java-check', validateSession, async (req, res) => {
-    const dir = resolveRuntimeDir(String(req.query.serverId || ''), String(req.query.serverName || ''));
+    const dir = resolveRuntimeDirForRequest(req, String(req.query.serverId || ''), String(req.query.serverName || ''));
     const setup = dir ? loadSetupMap()[path.basename(dir)] || {} : {};
     const requestedVersion = String(req.query.version || setup.version || '');
 
@@ -9389,7 +10184,7 @@ async function startServer() {
 
   // --- Container lifecycle state (installer / installing / ready / running) -
   app.get('/api/server-runtime/container-state', validateSession, async (req, res) => {
-    const dir = resolveRuntimeDir(String(req.query.serverId || ''), String(req.query.serverName || ''));
+    const dir = resolveRuntimeDirForRequest(req, String(req.query.serverId || ''), String(req.query.serverName || ''));
     if (!dir) {
       res.status(404).json({ ok: false, error: 'Server folder not found on disk' });
       return;
@@ -9453,7 +10248,7 @@ async function startServer() {
       .slice()
       .reverse()
       .slice(0, 200);
-    const dir = resolveRuntimeDir(serverId, serverName);
+    const dir = resolveRuntimeDirForRequest(req, serverId, serverName);
     const setup = dir ? loadSetupMap()[path.basename(dir)] || {} : {};
     res.json({ ok: true, serverId, entries, setupUpdatedAt: setup.updatedAt || null, total: entries.length });
   });
@@ -9471,7 +10266,7 @@ async function startServer() {
   ];
 
   app.get('/api/server-runtime/backups', validateSession, (req, res) => {
-    const dir = resolveRuntimeDir(String(req.query.serverId || ''), String(req.query.serverName || ''));
+    const dir = resolveRuntimeDirForRequest(req, String(req.query.serverId || ''), String(req.query.serverName || ''));
     if (!dir) {
       res.status(404).json({ ok: false, error: 'Server folder not found on disk' });
       return;
@@ -9619,7 +10414,7 @@ async function startServer() {
 
   app.post('/api/server-runtime/backup-create', validateSession, (req, res) => {
     const { serverId, serverName, title, scopes } = req.body || {};
-    const dir = resolveRuntimeDir(String(serverId || ''), String(serverName || ''));
+    const dir = resolveRuntimeDirForRequest(req, String(serverId || ''), String(serverName || ''));
     if (!dir) {
       res.status(404).json({ ok: false, error: 'Server folder not found on disk' });
       return;
@@ -9660,7 +10455,7 @@ async function startServer() {
 
   app.post('/api/server-runtime/backup-restore', validateSession, async (req, res) => {
     const { serverId, serverName, file } = req.body || {};
-    const dir = resolveRuntimeDir(String(serverId || ''), String(serverName || ''));
+    const dir = resolveRuntimeDirForRequest(req, String(serverId || ''), String(serverName || ''));
     if (!dir) {
       res.status(404).json({ ok: false, error: 'Server folder not found on disk' });
       return;
@@ -9709,7 +10504,7 @@ async function startServer() {
   });
 
   app.delete('/api/server-runtime/backup', validateSession, (req, res) => {
-    const dir = resolveRuntimeDir(String(req.query.serverId || ''), String(req.query.serverName || ''));
+    const dir = resolveRuntimeDirForRequest(req, String(req.query.serverId || ''), String(req.query.serverName || ''));
     if (!dir) {
       res.status(404).json({ ok: false, error: 'Server folder not found on disk' });
       return;
@@ -9731,7 +10526,7 @@ async function startServer() {
   // --- Resetup: wipe & re-provision a server container ----------------------
   app.post('/api/server-runtime/reinstall', validateSession, async (req, res) => {
     const { serverId, serverName, wipe = true, keepBackups = true } = req.body || {};
-    const dir = resolveRuntimeDir(String(serverId || ''), String(serverName || ''));
+    const dir = resolveRuntimeDirForRequest(req, String(serverId || ''), String(serverName || ''));
     if (!dir) {
       res.status(404).json({ ok: false, error: 'Server folder not found on disk' });
       return;
@@ -10014,6 +10809,8 @@ async function startServer() {
       return;
     }
     const job = list[idx];
+    // The stored row is authoritative for which server this schedule targets.
+    if (denyForeignServer(req, res, job.serverId)) return;
     const result = await executeSimpleSchedule(job);
     job.lastRunAt = new Date().toISOString();
     job.lastResult = result;
@@ -10032,6 +10829,7 @@ async function startServer() {
       res.status(404).json({ ok: false, error: 'Schedule not found' });
       return;
     }
+    if (denyForeignServer(req, res, list[idx].serverId)) return;
     const [removed] = list.splice(idx, 1);
     saveSimpleSchedules(list);
     pushPanelAudit('SYSTEM', `Deleted schedule "${removed.title}" for server "${removed.serverId}"`, 'Operator');
@@ -10077,7 +10875,7 @@ async function startServer() {
       onlineMode,
       viewDistance,
     } = req.body || {};
-    const dir = resolveRuntimeDir(String(serverId || ''), String(serverName || ''));
+    const dir = resolveRuntimeDirForRequest(req, String(serverId || ''), String(serverName || ''));
     if (!dir) {
       res.status(404).json({ ok: false, error: 'Server folder not found on disk' });
       return;
@@ -10160,7 +10958,7 @@ async function startServer() {
       connectTimeout: 2000,
     });
 
-  app.get('/api/database/server-databases', validateSession, async (_req, res) => {
+  app.get('/api/database/server-databases', validateSession, async (req, res) => {
     const host = dbEngineConfig.mysqlHost || '127.0.0.1';
     const port = Number(dbEngineConfig.mysqlPort) || 3306;
     const probe = await probeLocalTcpPort(port, host);
@@ -10181,6 +10979,13 @@ async function startServer() {
         authPluginIssue = described.authPluginIssue;
       }
     }
+    // Only the databases belonging to servers this account owns. A Super Admin
+    // sees all of them; `databases` is left intact for that case.
+    const visibleDatabases = databases.filter((name) => {
+      const folder = folderForPanelDatabase(name);
+      return Boolean(folder) && canAccessRuntimeFolder(req, folder as string);
+    });
+
     res.json({
       ok: true,
       connected,
@@ -10191,7 +10996,8 @@ async function startServer() {
       user: dbEngineConfig.mysqlUser || 'root',
       passwordSet: Boolean(dbEngineConfig.mysqlPassword),
       baseDatabase: SIMPLE_PANEL_BASE_DB,
-      databases,
+      databases: visibleDatabases,
+      hiddenDatabaseCount: databases.length - visibleDatabases.length,
       error,
       phpMyAdminUrl: 'http://localhost/phpmyadmin',
     });
@@ -10199,6 +11005,7 @@ async function startServer() {
 
   app.post('/api/database/provision-server', validateSession, async (req, res) => {
     const { serverId } = req.body || {};
+    if (denyForeignServer(req, res, String(serverId || ''))) return;
     const slug = sanitizeDbSlug(String(serverId || ''));
     const baseDb = SIMPLE_PANEL_BASE_DB;
     const serverDb = `${SIMPLE_PANEL_BASE_DB}_${slug}`;
@@ -10237,18 +11044,53 @@ async function startServer() {
     }
   });
 
+  /**
+   * Which server folder does a panel database belong to?
+   *
+   * The name is `<base>_<slug>`, and the slug is lossy (lowercased, every
+   * non-alphanumeric run collapsed to `_`), so it cannot be reversed. Instead
+   * the slug is recomputed for each folder on disk and compared, which also
+   * means a database whose folder no longer exists belongs to nobody.
+   */
+  const folderForPanelDatabase = (databaseName: string): string | null => {
+    const wanted = String(databaseName || '').toLowerCase();
+    const root = resolveWritableDiskRoot(serverInstallConfig.installRootDir);
+    try {
+      for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        if (`${SIMPLE_PANEL_BASE_DB}_${sanitizeDbSlug(entry.name)}` === wanted) return entry.name;
+      }
+    } catch {
+      // No install root: nothing can be attributed.
+    }
+    return null;
+  };
+
   app.delete('/api/database/server-database/:name', validateSession, async (req, res) => {
     const name = String(req.params.name || '');
     if (!new RegExp(`^${SIMPLE_PANEL_BASE_DB}_[a-z0-9_]+$`).test(name)) {
       res.status(400).json({ ok: false, error: 'Only panel-created databases (iskingpanel_*) can be dropped here' });
       return;
     }
+    // Dropping a database destroys that server's world/plugin data, so it needs
+    // the same ownership as the server itself. An unattributable database is
+    // Super Admin only, never "nobody's, so anyone's".
+    const folder = folderForPanelDatabase(name);
+    if (!folder || !canAccessRuntimeFolder(req, folder)) {
+      res.status(404).json({ ok: false, error: 'No server you own matches that database.' });
+      return;
+    }
     try {
       const conn = await connectLocalMysql();
       await conn.query(`DROP DATABASE \`${name}\``);
       await conn.end();
-      pushPanelAudit('SYSTEM', `Dropped MySQL database "${name}"`, 'Operator');
-      res.json({ ok: true, dropped: name });
+      const actor = requestViewer(req);
+      pushPanelAudit(
+        'SECURITY',
+        `Dropped MySQL database "${name}" for server "${folder}"`,
+        actor ? actor.username : 'Operator'
+      );
+      res.json({ ok: true, dropped: name, server: folder });
     } catch (err) {
       res.status(500).json({ ok: false, error: err instanceof Error ? err.message : 'Could not drop database' });
     }
@@ -10299,8 +11141,14 @@ async function startServer() {
     process.exit(1);
   });
 
-  httpServer.listen(PORT, '0.0.0.0', () => {
-    console.log(`KingPanel Server running on http://0.0.0.0:${PORT}`);
+  httpServer.listen(PORT, BIND_HOST, () => {
+    console.log(`KingPanel Server running on http://${BIND_HOST}:${PORT}`);
+    if (BIND_HOST !== '127.0.0.1' && BIND_HOST !== 'localhost') {
+      console.warn(
+        `[Security] Listening on ${BIND_HOST}: the panel is reachable from other machines ` +
+          '(PANEL_BIND_HOST). Restrict it with a firewall rule you control.'
+      );
+    }
 
     // A rule saved as ACTIVE is a claim about the OS state at some past moment.
     // Re-read netsh once after boot and downgrade anything that is no longer

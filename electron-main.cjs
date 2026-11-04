@@ -5,9 +5,54 @@
 const { app, BrowserWindow, shell, ipcMain, Tray, Menu, nativeImage } = require('electron');
 const path = require('path');
 const { spawn } = require('child_process');
+const { resolveBackendRuntime } = require('./runtime-resolver.cjs');
 const net = require('net');
 const http = require('http');
 const fs = require('fs');
+
+/**
+ * The application-data directory is a permanent identity, not a detail: it holds
+ * the account database, so moving it is indistinguishable from data loss.
+ *
+ * Electron derives `userData` from the package's `name` field, which is still
+ * "react-example" — an artefact of the project template. Pinning the path here,
+ * by value, means renaming that field (or the product) can never move the data.
+ * An explicit `--user-data-dir` is still honoured (see state-dirs.cjs).
+ */
+const { resolveStateDirs } = require('./state-dirs.cjs');
+const { evaluateUpdaterPolicy } = require('./updater-policy.cjs');
+/**
+ * The publisher this build expects to be signed by. Compiled in from
+ * package.json, so a build can never be told at runtime which identity to trust.
+ */
+const SIGNING_POLICY = require('./package.json').iskSigning || {};
+
+/** Absolute state directory, and the legacy directories worth migrating from. */
+function currentStateDirs() {
+  let switchValue = '';
+  try {
+    switchValue = app.commandLine.getSwitchValue('user-data-dir');
+  } catch {
+    // No command line parsed yet; argv still carries it.
+  }
+  return resolveStateDirs({ appData: app.getPath('appData'), argv: process.argv, switchValue });
+}
+
+const STATE_DIRS = currentStateDirs();
+if (!STATE_DIRS.pinned) {
+  console.log(`[State] Using the profile directory from --user-data-dir: ${STATE_DIRS.stateDir}`);
+}
+/** Legacy database directories, i.e. `<legacy>/database` for each old name. */
+const LEGACY_DB_DIRS = STATE_DIRS.legacyStateDirs
+  .filter((dir) => dir !== STATE_DIRS.stateDir)
+  .map((dir) => path.join(dir, 'database'));
+// Must run before anything reads userData (Electron caches window state and
+// session data there too, so doing it late would split the profile).
+try {
+  app.setPath('userData', STATE_DIRS.stateDir);
+} catch (err) {
+  console.error(`Could not pin the application data directory: ${err && err.message ? err.message : err}`);
+}
 
 let mainWindow = null;
 let backendProcess = null;
@@ -242,6 +287,42 @@ function waitForBackend(port, timeoutMs = 15000) {
   });
 }
 
+/**
+ * The backend encrypts provider OAuth tokens with a 32-byte key.
+ *
+ * That key is wrapped here with Electron's safeStorage (DPAPI on Windows, bound
+ * to the logged-in OS user) and only the unwrapped value is handed to the
+ * backend. The file beside the database is therefore useless on another machine
+ * or under another OS account, which is the property a plaintext key file or
+ * plaintext tokens cannot offer.
+ */
+function resolveOAuthTokenKey() {
+  const file = path.join(STATE_DIRS.stateDir, 'oauth-token-key.dpapi');
+  try {
+    const { safeStorage } = require('electron');
+    if (!safeStorage.isEncryptionAvailable()) {
+      console.warn(
+        '[Tokens] OS encryption is not available; the backend will fall back to its local key file.'
+      );
+      return '';
+    }
+    if (fs.existsSync(file)) {
+      const key = safeStorage.decryptString(fs.readFileSync(file));
+      if (Buffer.from(key, 'base64').length === 32) return key;
+      console.error(`[Tokens] ${file} does not contain a usable key; provider links must be renewed.`);
+      return '';
+    }
+    const key = require('crypto').randomBytes(32).toString('base64');
+    fs.mkdirSync(STATE_DIRS.stateDir, { recursive: true });
+    fs.writeFileSync(file, safeStorage.encryptString(key), { mode: 0o600 });
+    console.log('[Tokens] Created a DPAPI-wrapped provider-token key.');
+    return key;
+  } catch (err) {
+    console.warn(`[Tokens] Could not prepare the token key: ${err && err.message ? err.message : err}`);
+    return '';
+  }
+}
+
 function startEmbeddedBackend(port) {
   if (backendStarted) {
     console.log('Backend already started, skipping');
@@ -265,22 +346,40 @@ function startEmbeddedBackend(port) {
     serverPath = path.join(__dirname, 'server.cjs');
   }
 
-  // Use the system Node.js executable to run the backend, not the Electron executable
-  let nodePath;
-  if (process.env.NODE_PATH) {
-    nodePath = process.env.NODE_PATH;
-  } else {
-    // Default Node.js installation path on Windows
-    const defaultNodePath = 'C:\\Program Files\\nodejs\\node.exe';
-    if (require('fs').existsSync(defaultNodePath)) {
-      nodePath = defaultNodePath;
-    } else {
-      // Fallback to hoping node is in PATH
-      nodePath = 'node';
+  // Pick a runtime that can actually host the backend: Node >= 22.5 with
+  // node:sqlite. Each candidate is proved with a probe rather than assumed, so a
+  // machine without Node fails with an explanation instead of starting a backend
+  // whose every account call would answer 503.
+  const runtime = resolveBackendRuntime({
+    packaged: isPackaged,
+    resourcesPath: process.resourcesPath,
+    appDir: __dirname,
+    execPath: process.execPath,
+  });
+  if (!runtime.ok) {
+    const detail = runtime.attempts
+      .map((a) => `  - ${a.source}: ${a.reason || 'unusable'}${a.version ? ` (Node ${a.version})` : ''}`)
+      .join('\n');
+    console.error(`No usable Node runtime found:\n${detail}`);
+    const explanation = app.isPackaged
+      ? 'The Node runtime that ships inside this installation is missing or unusable, so the ' +
+        'installation is incomplete.\n\nReinstall IS King Panel with the installer you downloaded. ' +
+        'Nothing on your PC needs to be changed, and your data has not been touched.'
+      : 'No suitable Node.js runtime was found for the development checkout.\n\n' +
+        'Install Node.js 22.5 or newer, or set ISK_NODE_PATH to one, then start KingPanel again.';
+    try {
+      require('electron').dialog.showErrorBox(
+        'KingPanel cannot start its backend',
+        `${explanation}\n\nTried:\n${detail}`
+      );
+    } catch {
+      // No display available (a headless run): the console output above stands.
     }
+    return false;
   }
+  const nodePath = runtime.command;
   console.log(`Starting backend from: ${serverPath}`);
-  console.log(`Node path: ${nodePath}`);
+  console.log(`Runtime: ${runtime.source} (Node ${runtime.version}) at ${nodePath}`);
   console.log(`isPackaged: ${app.isPackaged}`);
   console.log(`resourcesPath: ${process.resourcesPath}`);
   console.log(`__dirname: ${__dirname}`);
@@ -296,19 +395,26 @@ function startEmbeddedBackend(port) {
     ? path.join(process.resourcesPath, '..')
     : __dirname;
 
-  backendProcess = spawn(nodePath, [serverPath], {
+  backendProcess = spawn(nodePath, [...runtime.args, serverPath], {
     cwd: backendCwd,
     env: {
       ...process.env,
+      ...runtime.env,
       PORT: String(port),
       NODE_ENV: 'production',
       IS_WINDOWS_DESKTOP_APP: 'true',
-      // userData already resolves to "%APPDATA%\<productName>" in a packaged
-      // build (productName is still "IS King Panel" — it is the install/userData
-      // identity and is deliberately not part of the display rebrand); appending
-      // the product name again produced a nested, separate database that lost
-      // every account between launches.
-      APPDATA_DB_DIR: app.isPackaged ? path.join(app.getPath('userData'), 'database') : path.join(__dirname, 'database'),
+      // Packaged builds keep state in the pinned per-user directory; a dev run
+      // keeps it next to the source so the checkout stays self-contained.
+      // LEGACY_APPDATA_DB_DIR lets the backend bring a pre-pin installation
+      // across before it opens the database (see server/state-dir.ts).
+      APPDATA_DB_DIR: app.isPackaged
+        ? path.join(STATE_DIRS.stateDir, 'database')
+        : path.join(__dirname, 'database'),
+      ...(app.isPackaged && STATE_DIRS.pinned && LEGACY_DB_DIRS.length
+        ? { LEGACY_APPDATA_DB_DIR: LEGACY_DB_DIRS[0] }
+        : {}),
+      // Passed through memory only; the wrapped copy on disk is DPAPI-encrypted.
+      OAUTH_TOKEN_KEY: resolveOAuthTokenKey(),
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -333,6 +439,7 @@ function startEmbeddedBackend(port) {
   });
 
   backendStarted = true;
+  return true;
 }
 
 function createWindowsAppWindow() {
@@ -453,11 +560,23 @@ function scheduleAutoUpdateCheck() {
     return;
   }
 
+  // Fail closed before any download. electron-updater skips signature
+  // verification entirely when app-update.yml has no publisherName, so an
+  // unpinned or mismatched feed must not be consulted at all.
+  const trust = evaluateUpdaterPolicy({
+    appUpdate: config,
+    expectedPublisher: SIGNING_POLICY.expectedPublisher,
+  });
+  if (!trust.allowed) {
+    console.warn(`[Updater] Update checks disabled — ${trust.problems.join('; ')}`);
+    return;
+  }
+
   const feed =
     config.provider === 'github'
       ? `github:${config.owner}/${config.repo}`
       : `${config.provider}:${config.url || config.bucket || ''}`;
-  console.log(`[Updater] Checking ${feed} for updates to v${app.getVersion()}…`);
+  console.log(`[Updater] Checking ${feed} for updates to v${app.getVersion()} (publisher: ${trust.expected})…`);
 
   // Never let an update check compete with window creation or backend startup;
   // it also keeps offline launches fast. Failures (no published release yet,
@@ -504,7 +623,9 @@ function scheduleAutoUpdateCheck() {
 async function initializeApp() {
   registerWindowIpc();
   activePort = await resolveBackendPort();
-  startEmbeddedBackend(activePort);
+  if (startEmbeddedBackend(activePort) === false) {
+    throw new Error('No usable Node runtime was found to host the backend.');
+  }
   console.log(`Waiting for backend on port ${activePort} to be ready...`);
   try {
     await waitForBackend(activePort);

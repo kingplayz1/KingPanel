@@ -36,8 +36,14 @@ export const EXTERNAL = [
   'sqlite',
 ];
 
-/** Marker the entry point prints once the Express app is listening. */
-export const ENTRY_MARKER = 'KingPanel Server running on http://0.0.0.0:';
+/**
+ * Marker the entry point prints once the Express app is listening.
+ *
+ * The host is deliberately not part of it: the bind address became configurable
+ * (loopback by default) and a marker that pinned `0.0.0.0` failed every release
+ * build for a banner nobody had broken.
+ */
+export const ENTRY_MARKER = 'KingPanel Server running on http://';
 
 async function main() {
   const startedAt = Date.now();

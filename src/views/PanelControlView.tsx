@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { cancelJob, submitJob, type OperationJob } from '../lib/jobs';
 import { JobProgressBar } from '../components/JobProgressBar';
 import { DiscordAccessSettings } from '../components/DiscordAccessSettings';
+import { ServerOwnershipSettings } from '../components/ServerOwnershipSettings';
 import {
   ResponsiveContainer,
   AreaChart,
@@ -132,7 +133,7 @@ interface LiveOsProcess {
 interface PanelAuditEvent {
   id: string;
   time: string;
-  category: 'RAM_ALLOC' | 'SIGKILL' | 'PROFILE' | 'OAUTH' | 'SYSTEM';
+  category: 'RAM_ALLOC' | 'SIGKILL' | 'PROFILE' | 'OAUTH' | 'SYSTEM' | 'MARKETPLACE' | 'SECURITY';
   message: string;
   actor: string;
 }
@@ -2453,6 +2454,13 @@ export const PanelControlView: React.FC<PanelControlViewProps> = ({
             </div>
 
             <DiscordAccessSettings
+              isSuperAdmin={
+                Boolean(currentUser.isSuperAdmin) || currentUser.role === 'Super Admin'
+              }
+              onShowToast={onShowToast}
+            />
+
+            <ServerOwnershipSettings
               isSuperAdmin={
                 Boolean(currentUser.isSuperAdmin) || currentUser.role === 'Super Admin'
               }

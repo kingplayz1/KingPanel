@@ -104,6 +104,28 @@ const client = () => {
   return c;
 };
 
+/**
+ * A Super Admin client, for assertions about a folder that existed before any
+ * account did. Server folders are now owned by their creator (see
+ * server/ownership.ts), and a folder with no ownership row is Super-Admin-only,
+ * so a freshly registered operator correctly receives 404 for Test_Server.
+ * The password is generated per install and read from the one-time file.
+ */
+async function superAdminClient() {
+  const row = fs
+    .readFileSync(path.join(dataDir, 'FIRST-RUN-CREDENTIALS.txt'), 'utf8')
+    .split(/\r?\n/)
+    .find((line) => line.startsWith('kingplayz\t'));
+  assert.ok(row, 'the bootstrap credentials file must contain a kingplayz row');
+  const c = client();
+  const res = await c.post('/api/auth/login', {
+    identifier: 'kingplayz',
+    password: row.split('\t')[1],
+  });
+  assert.equal(res.status, 200, `Super Admin sign-in failed: ${res.text.slice(0, 200)}`);
+  return c;
+}
+
 before(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'iskingpanel-test-'));
   dataDir = path.join(tmpDir, 'data');
@@ -431,8 +453,7 @@ describe('file manager stays inside the server folder', () => {
   let c;
 
   before(async () => {
-    c = client();
-    await c.post('/api/auth/login', { identifier: 'entitlement_user', password: 'secret123' });
+    c = await superAdminClient();
   });
 
   const traversals = [
@@ -496,8 +517,7 @@ describe('server lifecycle honesty', () => {
   let c;
 
   before(async () => {
-    c = client();
-    await c.post('/api/auth/login', { identifier: 'entitlement_user', password: 'secret123' });
+    c = await superAdminClient();
   });
 
   test('starting a server without an accepted EULA is refused', async () => {
@@ -630,8 +650,7 @@ describe('operation jobs', () => {
 // ---------------------------------------------------------------------------
 describe('simple panel regression', () => {
   test('the server registry lists the real folder with its real state', async () => {
-    const c = client();
-    await c.post('/api/auth/login', { identifier: 'entitlement_user', password: 'secret123' });
+    const c = await superAdminClient();
     const res = await c.get('/api/servers');
     assert.equal(res.status, 200);
     const server = res.body.servers.find((s) => s.id === 'Test_Server');

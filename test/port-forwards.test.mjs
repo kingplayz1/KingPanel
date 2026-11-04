@@ -18,7 +18,20 @@ import net from 'node:net';
 
 const REPO_ROOT = path.resolve(import.meta.dirname, '..');
 const STATE_FILE = '.local-port-forwards.json';
-const SUPER_ADMIN = { identifier: 'kingplayz', password: 'KingPlayz#2026' };
+/**
+ * The bootstrap Super Admin password is generated per install and written to the
+ * one-time credentials file next to the database, so it cannot be a constant in
+ * this file (and a constant is exactly what this suite must not depend on).
+ */
+function superAdminCredentials() {
+  const file = path.join(dataDir, 'FIRST-RUN-CREDENTIALS.txt');
+  const line = fs
+    .readFileSync(file, 'utf8')
+    .split(/\r?\n/)
+    .find((entry) => entry.startsWith('kingplayz\t'));
+  if (!line) throw new Error('no bootstrap credentials row for kingplayz');
+  return { identifier: 'kingplayz', password: line.split('\t')[1] };
+}
 
 let tmpDir;
 let dataDir;
@@ -118,7 +131,7 @@ function client() {
     post: (p, b) => request('POST', p, b),
     del: (p) => request('DELETE', p),
     async login() {
-      const res = await request('POST', '/api/auth/login', SUPER_ADMIN);
+      const res = await request('POST', '/api/auth/login', superAdminCredentials());
       assert.equal(res.status, 200, `super-admin login failed: ${res.text.slice(0, 200)}`);
     },
   };

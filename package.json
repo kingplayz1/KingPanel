@@ -5,17 +5,31 @@
   "description": "IS King Panel - Windows Desktop Application for Minecraft Server Management",
   "author": "kingplayz",
   "main": "electron-main.cjs",
+  "iskSigning": {
+    "provider": "esigner",
+    "expectedPublisher": "",
+    "timestampServer": "http://timestamp.digicert.com",
+    "hashAlgorithm": "sha256",
+    "uninstallerName": "Uninstall IS King Panel.exe"
+  },
   "scripts": {
     "dev": "tsx server.ts",
     "start": "tsx server.ts",
     "build": "vite build",
     "build:backend": "node scripts/build-backend.mjs",
+    "runtime:fetch": "node scripts/fetch-runtime.mjs",
+    "runtime:check": "node scripts/fetch-runtime.mjs --check",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
     "check:data": "node scripts/check-tracked-data.mjs",
+    "check:release": "node scripts/release-assets.mjs --runtime --privacy --signing",
+    "verify:signing": "node scripts/verify-signatures.mjs",
+    "check:docs": "node scripts/check-workflows-doc.mjs",
     "test": "node --import tsx --test test/*.test.mjs",
     "electron": "electron electron-main.cjs",
+    "fixtures:upgrade": "node scripts/make-upgrade-fixtures.mjs",
+    "verify:install-machine": "node scripts/verify-machine-install.mjs",
     "verify:upgrade": "node scripts/verify-installed-upgrade.mjs",
     "electron:build": "node scripts/build-release.mjs"
   },
@@ -29,20 +43,37 @@
       "dist/**/*",
       "server.cjs",
       "electron-main.cjs",
+      "updater-policy.cjs",
       "electron-preload.cjs",
+      "runtime-resolver.cjs",
+      "state-dirs.cjs",
+      "!runtime/**/*",
       "package.json",
-      "database/**/*",
       "node_modules/**/*",
       "src/**/*",
-      "!**.env",
-      "!**.env.*",
-      "!**.sqlite",
-      "!**.sqlite-*",
-      "!**.db",
+      "!database/**/*",
+      "!**/.env",
+      "!**/.env.*",
+      "!**/*.sqlite",
+      "!**/*.sqlite-*",
+      "!**/*.db",
+      "!**/.local-*",
+      "!**/.panel-*",
+      "!**/mongodb_collections/**",
+      "!**/*.bson.json",
+      "!**/FIRST-RUN-CREDENTIALS.txt",
+      "!**/state-migration.json",
+      "!**/server_runtime.json",
       "!**/secrets/**",
       "!**/logs/**",
       "!**/test/**",
       "!**/tests/**",
+      "!**/*.log",
+      "!**/*.log.*",
+      "!**/*.bak",
+      "!**/*.premigration-*",
+      "!**/*.pfx",
+      "!**/*.p12",
       "!**/*.map"
     ],
     "asar": true,
@@ -50,19 +81,30 @@
       "server.cjs",
       "dist/**/*"
     ],
+    "afterPack": "scripts/after-pack.cjs",
     "extraResources": [
       {
-        "from": "database",
-        "to": "database",
+        "from": "runtime",
+        "to": "runtime",
         "filter": [
-          "**/*"
+          "node.exe",
+          "LICENSE"
         ]
       }
     ],
     "win": {
       "target": "nsis",
       "asar": true,
-      "artifactName": "IS-King-Panel-Setup-${version}.${ext}"
+      "artifactName": "IS-King-Panel-Setup-${version}.${ext}",
+      "signExts": [
+        "!node.exe"
+      ],
+      "signtoolOptions": {
+        "signingHashAlgorithms": [
+          "sha256"
+        ],
+        "rfc3161TimeStampServer": "http://timestamp.digicert.com"
+      }
     },
     "nsis": {
       "include": "build/installer.nsh",

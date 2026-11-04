@@ -1,17 +1,20 @@
 name: Build and Release
 
-# A tag is the only trigger: the workflow publishes whatever version
-# package.json declares, so the tag must agree with it (checked below).
+# A tag is the only trigger. Versions are never rewritten here: the tag must
+# already match package.json, and the run stops before building anything if it
+# does not.
 on:
   push:
     tags:
       - 'v*'
 
+# Least privilege by default. Only the publish job is allowed to write, and only
+# to this repository's releases.
 permissions:
-  contents: write
+  contents: read
 
-# Two runs for the same tag would upload assets to one release at the same time;
-# queue them instead of cancelling, so a release is never left half-uploaded.
+# Two runs for the same tag would upload to one release at the same time; queue
+# them instead of cancelling, so a release is never left half-uploaded.
 concurrency:
   group: release-${{ github.ref_name }}
   cancel-in-progress: false
@@ -21,7 +24,11 @@ defaults:
     shell: bash
 
 jobs:
-  release:
+  # Everything that can invalidate a release happens here, on a read-only token,
+  # before anything is uploaded. The installer is passed to the publish job as an
+  # artifact, so the published bytes are the verified bytes.
+  build:
+    name: Build and verify (no publishing)
     runs-on: windows-latest
 
     steps:
@@ -31,25 +38,167 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          # The backend bundle targets node22 and Vite 8 needs >=20.19, so the
-          # Node 18 this workflow used to pin could not build the app at all.
           node-version: '22'
           cache: npm
 
+      # Cheap and first: a mistyped tag or a version bump that never landed stops
+      # the run before a 130 MB installer is built.
+      - name: Validate the tag against package.json
+        run: |
+          set -euo pipefail
+          node scripts/release-assets.mjs --tag "${GITHUB_REF_NAME}" --tag-only
+
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --no-audit --no-fund
 
-      # Builds server.cjs, the UI, and the NSIS installer, then verifies the
-      # packaged backend, app-update.yml, latest.yml and installer all agree.
-      # `--publish never` is baked in: uploading is this workflow's job.
+      # Fail before building anything if the certificate secrets are missing. The
+      # values are never printed: only whether each one is present.
+      # Provider-aware: the same preflight runs locally. It names the missing
+      # variables and the pinned publisher, and never prints a credential value.
+      - name: Require signing credentials
+        env:
+          ISK_SIGN_PROVIDER: ${{ vars.ISK_SIGN_PROVIDER }}
+          ISK_REQUIRE_SIGNING: '1'
+          ESIGNER_CLI: ${{ vars.ESIGNER_CLI }}
+          ESIGNER_SANDBOX: ${{ vars.ESIGNER_SANDBOX }}
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          ESIGNER_USERNAME: ${{ secrets.ESIGNER_USERNAME }}
+          ESIGNER_PASSWORD: ${{ secrets.ESIGNER_PASSWORD }}
+          ESIGNER_TOTP_SECRET: ${{ secrets.ESIGNER_TOTP_SECRET }}
+          ESIGNER_CREDENTIAL_ID: ${{ secrets.ESIGNER_CREDENTIAL_ID }}
+        run: node scripts/check-signing-env.mjs
+
+      - name: Tests
+        run: npm test
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Documentation inventory matches server.ts
+        run: npm run check:docs
+
+      - name: No user data is tracked
+        run: npm run check:data
+
+      # The installer carries its own Node runtime; fetch the pin from
+      # nodejs.org and prove the checksum, the version and node:sqlite before
+      # spending time on a build.
+      - name: Fetch and verify the pinned runtime
+        run: |
+          set -euo pipefail
+          npm run runtime:fetch
+          npm run runtime:check
+
+      # Builds server.cjs, the UI, and the NSIS installer with --publish never,
+      # then verifies (in this order) the tagged version, the packaged runtime,
+      # latest.yml/blockmap against the installer, app-update.yml and the
+      # packaged backend. The log is kept as an artifact for post-mortems.
       - name: Build installer and update metadata
-        run: npm run electron:build
+        env:
+          ISK_SIGN_PROVIDER: ${{ vars.ISK_SIGN_PROVIDER }}
+          ESIGNER_CLI: ${{ vars.ESIGNER_CLI }}
+          ESIGNER_SANDBOX: ${{ vars.ESIGNER_SANDBOX }}
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          ESIGNER_USERNAME: ${{ secrets.ESIGNER_USERNAME }}
+          ESIGNER_PASSWORD: ${{ secrets.ESIGNER_PASSWORD }}
+          ESIGNER_TOTP_SECRET: ${{ secrets.ESIGNER_TOTP_SECRET }}
+          ESIGNER_CREDENTIAL_ID: ${{ secrets.ESIGNER_CREDENTIAL_ID }}
+          # Signing is mandatory for a tag build, and the afterPack hook checks the
+          # upstream-signed runtime before NSIS compresses the installer.
+          ISK_REQUIRE_SIGNING: '1'
+        run: |
+          set -euo pipefail
+          npm run electron:build 2>&1 | tee release-build.log
 
-      # Fails if the tag and package.json version disagree, or if any of the
-      # three files is missing. Writes the exact names to the next step.
-      - name: Verify tag and release artifacts
+      # Same gate the publish job re-applies to the downloaded copies.
+      - name: Verify tag, artifacts, packaged runtime and signatures
+        env:
+          ISK_REQUIRE_SIGNING: '1'
+        run: |
+          set -euo pipefail
+          node scripts/release-assets.mjs --tag "${GITHUB_REF_NAME}" --runtime --privacy --signing
+          node scripts/verify-signatures.mjs --require
+
+      - name: Upload verified release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            dist_electron/IS-King-Panel-Setup-*.exe
+            dist_electron/IS-King-Panel-Setup-*.exe.blockmap
+            dist_electron/latest.yml
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-build-log
+          retention-days: 7
+          path: release-build.log
+
+  # Upload only. Re-verifies what arrived, refuses to touch an existing release,
+  # and re-reads the published assets afterwards.
+  publish:
+    name: Publish verified release
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # release-assets.mjs parses latest.yml with js-yaml, so the checker needs
+      # the dependency tree. Scripts are skipped: nothing here builds anything.
+      - name: Install verification dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Download verified artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+          path: dist_electron
+
+      # Re-check the downloaded bytes, not the ones the build job had: this is
+      # what the upload will actually send.
+      - name: Re-verify the downloaded artifact set
         id: assets
-        run: node scripts/release-assets.mjs --tag "${GITHUB_REF_NAME}"
+        run: |
+          set -euo pipefail
+          node scripts/release-assets.mjs --tag "${GITHUB_REF_NAME}"
+
+      # A published release is immutable from this workflow's point of view.
+      # Publishing into a partial one would leave clients a metadata/asset pair
+      # that never matched, so it is refused explicitly instead.
+      - name: Refuse to overwrite or complete an existing release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if ! gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" > /tmp/release.json 2>/dev/null; then
+            echo "No release exists for ${tag} yet."
+            exit 0
+          fi
+
+          draft=$(jq -r '.draft' /tmp/release.json)
+          count=$(jq -r '.assets | length' /tmp/release.json)
+          if [ "$draft" = "true" ]; then
+            echo "::warning::A draft release already exists for ${tag}; assets will be added to it and it will be published."
+            exit 0
+          fi
+          echo "::error::Release ${tag} is already published with ${count} asset(s). Versions are never rewritten: bump package.json and tag a new commit. To replace this release deliberately, delete it in the GitHub UI first."
+          exit 1
 
       - name: Publish release
         uses: softprops/action-gh-release@v3
@@ -58,10 +207,10 @@ jobs:
           name: Release ${{ github.ref_name }}
           draft: false
           prerelease: false
-          # Named explicitly rather than globbed, so a stale artifact left in
-          # dist_electron can never be published alongside this release.
+          # Named explicitly rather than globbed, so a stale artifact in the
+          # download directory can never be published with this release.
           fail_on_unmatched_files: true
-          overwrite_files: true
+          overwrite_files: false
           files: |
             dist_electron/${{ steps.assets.outputs.installer }}
             dist_electron/${{ steps.assets.outputs.blockmap }}
@@ -85,7 +234,7 @@ jobs:
 
           release="repos/${GITHUB_REPOSITORY}/releases/tags/${tag}"
 
-          flags=$(gh api "$release" --jq '"\(.draft) \(.prerelease)"')
+          flags=$(gh api "$release" --jq '".\(.draft) \(.prerelease)"')
           if [ "$flags" != "false false" ]; then
             echo "::error::Release ${tag} is draft/pre-release (${flags}); electron-updater ignores both."
             exit 1
@@ -129,3 +278,7 @@ jobs:
             # latest.yml seconds after a republish of the same tag.
             echo "::warning::The anonymously served ${latest} differs from this build — usually CDN lag after a republish. Re-check the feed URL in a few minutes."
           fi
+
+      # The full install-upgrade-install matrix needs a desktop session and two
+      # installers, so it runs on a real Windows 10/11 machine (npm run
+      # verify:upgrade) as a release gate, not on this runner.

@@ -14,13 +14,20 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { readFile, readdir, rm, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import yaml from 'js-yaml';
 import { EXTERNAL as BACKEND_EXTERNALS } from './build-backend.mjs';
 import { resolveReleaseAssets } from './release-naming.mjs';
+import { verifyArtifacts, verifyPackagedPrivacy, verifyPackagedRuntime } from './release-verify.mjs';
+import { signingConfig } from './signing.mjs';
+import {
+  MANIFEST_PATH,
+  parseManifest,
+  verifyRuntimeExecutable,
+} from './fetch-runtime.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const OUT_DIR = path.join(ROOT, 'dist_electron');
@@ -127,6 +134,26 @@ function verifyAppUpdateConfig(pkg) {
   if (!String(config.updaterCacheDirName || '').trim()) {
     problems.push('updaterCacheDirName is empty');
   }
+
+  // electron-updater's only publisher check reads this field, and it *skips*
+  // signature verification when the field is absent (NsisUpdater.verifySignature
+  // returns null). A signed release must therefore declare the pinned identity,
+  // and it must be the one we expect.
+  const signing = signingConfig(process.env, { expectedPublisher: pkg.iskSigning?.expectedPublisher });
+  if (signing.configured || signing.requireSigned) {
+    const pinned = signing.expectedPublisher;
+    const declared = Array.isArray(config.publisherName)
+      ? config.publisherName
+      : [config.publisherName].filter(Boolean);
+    if (!declared.length) {
+      problems.push(
+        'publisherName is missing from app-update.yml, so electron-updater would skip signature ' +
+          'verification of every downloaded installer',
+      );
+    } else if (pinned && !declared.some((name) => String(name).trim().toLowerCase() === pinned.toLowerCase())) {
+      problems.push(`publisherName "${declared.join(' | ')}" != pinned "${pinned}"`);
+    }
+  }
   if (problems.length) {
     throw new Error(`app-update.yml does not describe the configured feed:\n  - ${problems.join('\n  - ')}`);
   }
@@ -174,21 +201,54 @@ function verifyBackendExternals() {
 }
 
 /**
+ * The installer must carry the pinned runtime, outside the asar (a binary inside
+ * an archive cannot be executed). Checked after packaging rather than trusted
+ * from the config: an `extraResources` typo produces a build that installs and
+ * then cannot start its backend.
+ */
+async function verifyBundledRuntime() {
+  const manifest = parseManifest(JSON.parse(readFileSync(MANIFEST_PATH, 'utf8')));
+  const resourcesDir = path.join(OUT_DIR, 'win-unpacked', 'resources');
+  const problems = verifyPackagedRuntime({ resourcesDir, manifestPath: MANIFEST_PATH });
+  if (problems.length) {
+    throw new Error(`The packaged app is not releasable:\n  - ${problems.join('\n  - ')}`);
+  }
+
+  // Structural checks above; this one proves the shipped bytes actually run and
+  // can load node:sqlite, which a matching hash alone cannot establish.
+  const packaged = path.join(resourcesDir, 'runtime', 'node.exe');
+  const problem = verifyRuntimeExecutable(packaged, manifest);
+  if (problem) throw new Error(`The packaged runtime does not work: ${problem}`);
+
+  console.log(
+    `[release] runtime: resources/runtime/node.exe Node ${manifest.nodeVersion}, ` +
+      `sha256 ${manifest.sha256.slice(0, 16)}… verified with node:sqlite`,
+  );
+}
+
+/**
  * States what the produced installer is actually signed with, so a release
  * cannot silently drop from signed to unsigned (or the reverse) unnoticed.
  */
-function reportSigningPosture() {
-  const configured = ['CSC_LINK', 'WIN_CSC_LINK', 'CSC_NAME', 'WIN_CSC_NAME'].filter(
-    (key) => process.env[key],
-  );
-  if (configured.length === 0) {
+function reportSigningPosture(pkg) {
+  const config = signingConfig(process.env, { expectedPublisher: pkg.iskSigning?.expectedPublisher });
+  if (config.problems.length) {
+    throw new Error(`Signing configuration is invalid:\n  - ${config.problems.join('\n  - ')}`);
+  }
+  if (!config.configured) {
     console.warn(
-      '[release] signing: no certificate configured (CSC_LINK/WIN_CSC_LINK unset) — ' +
-        'the installer is unsigned and will warn on first run.',
+      '[release] signing: no signing provider configured — the installer is unsigned and ' +
+        'will warn on first run. That is fine locally and is refused in release mode.',
     );
     return;
   }
-  console.log(`[release] signing: certificate supplied via ${configured.join(', ')}`);
+  console.log(
+    `[release] signing: ${config.provider.label}, ${config.hashAlgorithm.toUpperCase()} only, ` +
+      `timestamp ${config.timestampServer}`,
+  );
+  console.log(
+    `[release] signing: expected publisher "${config.expectedPublisher || '(not pinned)'}"`,
+  );
 }
 
 async function main() {
@@ -201,6 +261,17 @@ async function main() {
     blockmap: blockmapName,
   } = resolveReleaseAssets(pkg);
 
+  // Refuse before packaging, not mid-way: electron-builder cannot derive a
+  // publisher from a cloud signer, so a cloud build without a pinned identity
+  // fails deep inside packaging with an unhelpful message.
+  const signing = signingConfig(process.env, { expectedPublisher: pkg.iskSigning?.expectedPublisher });
+  if (signing.method === 'esigner' && !signing.expectedPublisher) {
+    throw new Error(
+      'Cloud signing needs the certificate identity: set iskSigning.expectedPublisher in ' +
+        'package.json to the CN of the eSigner certificate before building.',
+    );
+  }
+
   const verifyOnly = process.argv.includes('--verify-only');
   if (verifyOnly) {
     console.log('[release] --verify-only: skipping build, verifying existing artifacts');
@@ -211,10 +282,22 @@ async function main() {
     step('UI build (vite)');
     run('vite build', [path.join('node_modules', 'vite', 'bin', 'vite.js'), 'build']);
 
+    // The packaged backend cannot use Electron's Node (20.18) and must not rely
+    // on the user's PATH, so the installer has to carry a runtime. This fetches
+    // the pinned build, refuses anything whose SHA-256 does not match, and
+    // proves the binary reports the pinned version and loads node:sqlite.
+    step('Backend runtime (pinned Node)');
+    run('runtime fetch', [path.join('scripts', 'fetch-runtime.mjs')]);
+
     step(`Packaging v${version} (NSIS, x64)`);
     await pruneStaleArtifacts();
+    // The config file carries what package.json cannot: SHA-256-only signing and,
+    // for a cloud provider, the custom sign hook. It is derived from
+    // package.json, so the NSIS options still have exactly one definition.
     run('electron-builder', [
       path.join('node_modules', 'electron-builder', 'out', 'cli', 'cli.js'),
+      '--config',
+      path.join(ROOT, 'electron-builder.config.cjs'),
       '--win',
       '--x64',
       // Metadata is generated, but uploading is a separate, authorised decision.
@@ -226,41 +309,40 @@ async function main() {
     });
   }
 
+  step('Verifying the installer carries the pinned runtime');
+  await verifyBundledRuntime();
+
+  // Fails the build, not just the tag workflow: a locally built installer that
+  // carries this machine's database must not even reach dist_electron as
+  // something a human could hand to someone else.
+  step('Verifying the installer carries no developer data');
+  const privacy = verifyPackagedPrivacy({ dir: OUT_DIR });
+  if (privacy.problems.length) {
+    throw new Error(`The packaged app contains data that must not be shipped:\n  - ${privacy.problems.join('\n  - ')}`);
+  }
+  console.log(
+    `[release] privacy: ${privacy.facts.payloadEntries} payload file(s), ` +
+      `${privacy.facts.dependencyEntries} dependency file(s), ` +
+      `${privacy.facts.sqliteInspected} database(s) inspected, ` +
+      `${privacy.facts.stateFilesInspected} state file(s) scanned`,
+  );
+
+  // Same checks the publish workflow applies to the downloaded copies, from one
+  // definition (scripts/release-verify.mjs): tag, artifact set, latest.yml and
+  // blockmap consistency, stray artifacts.
   step('Verifying release consistency');
-  const installerPath = path.join(OUT_DIR, installerName);
-  const { size } = await stat(installerPath).catch(() => {
-    throw new Error(`Expected installer ${installerName} was not produced.`);
-  });
-  await stat(path.join(OUT_DIR, blockmapName)).catch(() => {
-    throw new Error(`Expected blockmap ${blockmapName} was not produced.`);
-  });
+  const verified = await verifyArtifacts({ dir: OUT_DIR, pkg, tag: `v${version}` });
+  if (verified.problems.length) {
+    throw new Error(`Release metadata is inconsistent:\n  - ${verified.problems.join('\n  - ')}`);
+  }
+  const size = verified.sizes.installer;
 
-  const meta = yaml.load(await readFile(path.join(OUT_DIR, 'latest.yml'), 'utf8'));
-  const listed = meta?.files?.[0] ?? {};
-  const checksum = createHash('sha512').update(await readFile(installerPath)).digest('base64');
-
-  const problems = [];
-  if (meta?.version !== version) {
-    problems.push(`latest.yml version ${meta?.version} != package.json ${version}`);
-  }
-  if (meta?.path !== installerName) {
-    problems.push(`latest.yml path "${meta?.path}" != "${installerName}"`);
-  }
-  if (listed.url !== installerName) {
-    problems.push(`latest.yml files[0].url "${listed.url}" != "${installerName}"`);
-  }
-  if (Number(listed.size) !== size) {
-    problems.push(`latest.yml size ${listed.size} != ${size} bytes on disk`);
-  }
-  if (listed.sha512 !== checksum) {
-    problems.push('latest.yml sha512 does not match the installer on disk');
-  }
-  if (meta?.sha512 && meta.sha512 !== listed.sha512) {
-    problems.push('latest.yml top-level sha512 disagrees with files[0].sha512');
-  }
-  if (problems.length) {
-    throw new Error(`Release metadata is inconsistent:\n  - ${problems.join('\n  - ')}`);
-  }
+  // Authenticode, after the manifest check: the signature must be on the exact
+  // bytes latest.yml describes, or a signed build would still fail to update.
+  // Fails in release mode (ISK_REQUIRE_SIGNING=1) and prints the unsigned notice
+  // for a local build. The certificate itself is never read or logged here.
+  step('Verifying code signatures');
+  run('signature verification', [path.join('scripts', 'verify-signatures.mjs')]);
 
   const packagedBackend = await sha256(UNPACKED).catch(() => null);
   const builtBackend = await sha256(BACKEND);
@@ -273,7 +355,7 @@ async function main() {
 
   verifyAppUpdateConfig(pkg);
   verifyBackendExternals();
-  reportSigningPosture();
+  reportSigningPosture(pkg);
 
   console.log(`\n[release] v${version} ready in dist_electron/`);
   console.log(`[release]   ${installerName}  ${(size / 1024 / 1024).toFixed(1)} MB`);

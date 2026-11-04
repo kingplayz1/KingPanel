@@ -42,6 +42,10 @@ export const AuthGateModal: React.FC<AuthGateModalProps> = ({
   const [showResetBox, setShowResetBox] = useState(false);
   const [resetIdentifier, setResetIdentifier] = useState('');
   const [resetNewPassword, setResetNewPassword] = useState('');
+  // Account recovery is proved with the code issued when the account was
+  // created (shown in the one-time credentials file), never by naming an
+  // account and picking a new password.
+  const [resetRecoveryCode, setResetRecoveryCode] = useState('');
 
   // Sign Up State
   const [signupDisplayName, setSignupDisplayName] = useState('');
@@ -270,36 +274,22 @@ export const AuthGateModal: React.FC<AuthGateModalProps> = ({
     }
   };
 
-  const handleQuickOperatorLogin = async (op: AuthUser) => {
+  /**
+   * Selecting a suggested operator fills the sign-in form. It does not sign in.
+   *
+   * This used to POST a password compiled into the bundle and, when that call
+   * failed for any reason, call onAuthenticated() anyway with Super Admin
+   * privileges. That was a client-side gate: the panel opened without the server
+   * ever agreeing. The server is the only authority now.
+   */
+  const handleQuickOperatorLogin = (op: AuthUser) => {
     setAuthError(null);
-    const isSa = op.username.toLowerCase() === 'kingplayz' || op.id === 'SA-KINGPLAYZ-001';
-    try {
-      const res = await fetch('/api/auth/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          identifier: op.username,
-          password: isSa ? 'KingPlayz#2026' : 'kingpanel123',
-        }),
-      });
-      const data = await res.json();
-      if (res.ok && data.user) {
-        const isNewFromMongo = Boolean(data.showSetupGuide ?? data.isNewUser ?? false);
-        onAuthenticated(data.user, isNewFromMongo);
-        return;
-      }
-    } catch {
-      // Fallback
-    }
-    onAuthenticated(
-      {
-        ...op,
-        role: isSa ? 'Super Admin' : op.role,
-        isSuperAdmin: isSa,
-        discordVerified: isSa ? true : Boolean(op.discordVerified),
-        maxServerLimit: isSa ? 999 : op.discordVerified ? 10 : 2,
-      },
-      false,
+    setEmailOrUser(op.username);
+    onShowToast(
+      'Password required',
+      `Enter the password for @${op.username} to continue.`,
+      'error',
+      'key',
     );
   };
 
@@ -355,10 +345,10 @@ export const AuthGateModal: React.FC<AuthGateModalProps> = ({
 
   const handleResetPassword = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!resetIdentifier.trim() || resetNewPassword.length < 4) {
+    if (!resetIdentifier.trim() || !resetRecoveryCode.trim() || resetNewPassword.length < 8) {
       onShowToast(
         'Invalid Input',
-        'Enter your username/email and a new password (min 4 characters).',
+        'Enter your username/email, your recovery code, and a new password of at least 8 characters.',
         'warning',
         'key',
       );
@@ -370,6 +360,7 @@ export const AuthGateModal: React.FC<AuthGateModalProps> = ({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           identifier: resetIdentifier.trim(),
+          recoveryCode: resetRecoveryCode.trim(),
           newPassword: resetNewPassword,
         }),
       });
@@ -378,10 +369,20 @@ export const AuthGateModal: React.FC<AuthGateModalProps> = ({
         setEmailOrUser(resetIdentifier.trim());
         setPassword(resetNewPassword);
         setShowResetBox(false);
+        setResetRecoveryCode('');
         setAuthError(null);
         onShowToast('Password Updated', data.message, 'success', 'check_circle');
+        if (data.recoveryCode) {
+          // The old code is spent; the replacement is shown once.
+          onShowToast(
+            'New Recovery Code',
+            `Store this: ${data.recoveryCode}`,
+            'warning',
+            'key',
+          );
+        }
       } else {
-        onShowToast('Reset Failed', data.error || 'Account not found.', 'error', 'error');
+        onShowToast('Recovery Failed', data.error || 'That account and recovery code do not match.', 'error', 'error');
       }
     } catch {
       onShowToast('Reset Error', 'Could not reach local auth server.', 'error', 'error');
@@ -544,7 +545,11 @@ export const AuthGateModal: React.FC<AuthGateModalProps> = ({
                 onSubmit={handleResetPassword}
                 className="p-3.5 rounded-xl bg-surface-lowest border border-white/15 space-y-2.5"
               >
-                <div className="text-xs font-bold text-white">Reset Account Password</div>
+                <div className="text-xs font-bold text-white">Recover Account Password</div>
+                <p className="text-[11px] leading-snug text-outline">
+                  Enter the recovery code issued for this account (see
+                  FIRST-RUN-CREDENTIALS.txt in the application data folder).
+                </p>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                   <input
                     type="text"
@@ -554,11 +559,18 @@ export const AuthGateModal: React.FC<AuthGateModalProps> = ({
                     className="bg-surface border border-white/15 rounded-lg px-2.5 py-2 text-xs font-mono text-white"
                   />
                   <input
+                    type="text"
+                    value={resetRecoveryCode}
+                    onChange={(e) => setResetRecoveryCode(e.target.value)}
+                    placeholder="ISK-XXXXX-XXXXX-XXXXX"
+                    className="bg-surface border border-white/15 rounded-lg px-2.5 py-2 text-xs font-mono text-white"
+                  />
+                  <input
                     type="password"
                     value={resetNewPassword}
                     onChange={(e) => setResetNewPassword(e.target.value)}
-                    placeholder="New Password"
-                    className="bg-surface border border-white/15 rounded-lg px-2.5 py-2 text-xs font-mono text-white"
+                    placeholder="New Password (min 8)"
+                    className="bg-surface border border-white/15 rounded-lg px-2.5 py-2 text-xs font-mono text-white sm:col-span-2"
                   />
                 </div>
                 <button
