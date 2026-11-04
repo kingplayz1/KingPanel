@@ -105,7 +105,7 @@ Legend: `PASS` executed by a human on that VM and observed · `FAIL` executed an
 | Coverage | Mode | Proves |
 | --- | --- | --- |
 | `npm run verify:upgrade` (PASS, 2026-11-03) | per-user fixtures | update/download/uninstall logic and data preservation for a per-user install |
-| `test/install-modes.test.mjs` (34 tests) | MOCKED | elevation classification, install sequence, rollback, cache rules |
+| `test/install-modes.test.mjs` (39 tests) | MOCKED | elevation classification, install sequence, rollback, cache rules |
 | `npm run verify:install-machine` preflight | read-only | the plan, paths, HKLM key and elevation state are detected correctly |
 | install into `%ProgramFiles%`, HKLM registration, all-users shortcuts, UAC | — | **nothing yet** |
 
@@ -151,6 +151,7 @@ installers never perform.
    local feed:
    ```powershell
    npm run verify:install-machine -- --run --confirm=per-machine-install `
+     --platform <win10|win11> --expect-sha256 <hash of the update build> `
      --update-installer <path>\IS-King-Panel-Setup-<next>.exe 2>&1 |
      Tee-Object -FilePath evidence-<platform>-update.txt
    ```
@@ -186,6 +187,42 @@ Verdict:             READY | BLOCKED
 Recorded results belong in this file, under the matching platform section, with the
   evidence file names. Do not paste credentials into it.
 
+## Execution attempt (2026-11-04)
+
+What was executed before the verdict was recorded, and what stopped it. Every value below was
+read from this machine on that date; none of it is a simulated result.
+
+| Probe | How | Result |
+| --- | --- | --- |
+| Host identity | `Win32_ComputerSystem` | Windows 10 Pro 22H2, 10.0.19045, x64, physical Gigabyte B550 desktop, `DESKTOP-VPEOHS2`, account `KING` |
+| Disposable environment? | — | **no** — this is the developer's daily installation, which safety rule 7.2 forbids |
+| Hypervisor present | `Win32_ComputerSystem.HypervisorPresent` | `False` |
+| VM software | install directories and `PATH` | VirtualBox, VMware, QEMU, Docker, Multipass and Windows Sandbox all absent; `Get-VM` is not a recognised cmdlet |
+| Elevation | `IsInRole(Administrator)` | `False` |
+| Preflight | `npm run verify:install-machine` | exit **2**, `BLOCKED: this process is not elevated …` |
+| Installer size | `stat` | 131,347,121 bytes |
+| Installer SHA-256 | `certutil -hashfile … SHA256` plus an independent Node stream | `b1311ce9a439a0239b6364c1a78069da7376440f1eeff82515ae3156c7d70510` from both — matches *Artefact under test* |
+| Authenticode | `Get-AuthenticodeSignature` | `NotSigned`, as expected for this build |
+| Leftover state | `dir "C:\Program Files\IS King Panel"` and the HKLM query | directory exists and is empty; uninstall key absent |
+
+No install was attempted, and none could have been attempted here: the host is the daily machine
+and the harness refuses to elevate itself. Both platforms remain `NOT TESTED`, which is neither a
+pass nor a partial pass.
+
+The empty leftover directory was left in place — removing it needs an elevated shell, and that is
+the environment owner's decision rather than a cleanup the harness performs. It is worth watching
+during the real run: an empty install directory surviving a previous uninstall is consistent with
+NSIS leaving the folder behind, but that is unverified and must be checked on the VM rather than
+assumed.
+
+### Procedure defects found during the attempt
+
+| Defect | Effect | Correction |
+| --- | --- | --- |
+| Step 7 omitted `--platform` | every `--run` requires a platform, so the documented upgrade command would have been refused with exit 2 | the command now passes `--platform` and the update build's `--expect-sha256` |
+| "All nine rows" under Windows 11 | the matrix has had ten rows since *Cancelled UAC* was added | corrected to ten |
+| "(34 tests)" in the coverage table | stale after the evidence tests were added | corrected to 39 |
+
 ## Recorded results
 
 ### Windows 10 22H2
@@ -195,7 +232,7 @@ blocked*. All ten rows above are `NOT TESTED`.
 
 ### Windows 11
 
-Not executed. No Windows 11 VM was available; see *Why it is blocked*. All nine rows
+Not executed. No Windows 11 VM was available; see *Why it is blocked*. All ten rows
 above are `NOT TESTED`.
 
 **Release gate: CLOSED.** Per-machine release readiness is not claimed, and no
