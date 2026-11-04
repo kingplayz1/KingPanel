@@ -323,3 +323,128 @@ export async function runMachineInstall({ plan, installer, updateInstaller, deps
     versions: previousVersions,
   };
 }
+
+/**
+ * A filename that names the platform and cannot collide between two runs.
+ *
+ * Windows 10 and Windows 11 are two halves of one gate, and a shared filename is
+ * how one half quietly overwrites the other. The timestamp is local-clock ISO so
+ * two runs minutes apart stay distinguishable without a counter file.
+ */
+export function evidenceFileName({ platform, date = new Date(), hostname = '' } = {}) {
+  const stamp = (date instanceof Date ? date.toISOString() : String(date))
+    .replace(/\.\d+Z$/, '')
+    .replace(/:/g, '-')
+    .replace('T', '_');
+  const tag =
+    String(platform ?? 'unknown')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '') || 'unknown';
+  const host = String(hostname ?? '')
+    .replace(/[^A-Za-z0-9-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return `evidence-${tag}${host ? `-${host}` : ''}-${stamp}.txt`;
+}
+
+/**
+ * Whether the installer on disk is the one the report claims was tested.
+ *
+ * Installers are not bit-reproducible, so a stale hash is the normal outcome of
+ * a rebuild — and testing an unnamed binary is how a phase report ends up
+ * describing a build nobody has. With no expectation the check passes but says
+ * so, because the operator may legitimately be recording a fresh hash.
+ */
+export function installerHashVerdict({ actual, expected } = {}) {
+  const norm = (value) => String(value ?? '').trim().toLowerCase().replace(/^sha256[:\s-]*/, '');
+  if (!String(expected ?? '').trim()) {
+    return { ok: true, checked: false, detail: 'no --expect-sha256 was given; only the measured hash is recorded' };
+  }
+  if (!norm(actual)) {
+    return { ok: false, checked: true, detail: 'the installer hash could not be read' };
+  }
+  if (norm(actual) !== norm(expected)) {
+    return { ok: false, checked: true, detail: `measured ${norm(actual)}, expected ${norm(expected)}` };
+  }
+  return { ok: true, checked: true, detail: `matches ${norm(expected)}` };
+}
+
+/**
+ * Parse the Windows identity the harness records, from `ConvertTo-Json` output.
+ *
+ * Kept separate from the PowerShell call so the parsing — including the garbage
+ * case, where a run must not invent an OS version — is testable off Windows.
+ */
+export function parseWindowsIdentity(text) {
+  const empty = { productName: '', displayVersion: '', build: '', architecture: '', summary: 'unknown' };
+  let parsed;
+  try {
+    parsed = JSON.parse(String(text ?? '').trim());
+  } catch {
+    return empty;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return empty;
+  const productName = String(parsed.ProductName ?? '').trim();
+  const displayVersion = String(parsed.DisplayVersion ?? '').trim();
+  const build = [String(parsed.CurrentBuild ?? '').trim(), String(parsed.UBR ?? '').trim()]
+    .filter(Boolean)
+    .join('.');
+  const architecture = String(parsed.OSArchitecture ?? '').trim();
+  const summary =
+    [productName, displayVersion, build ? `build ${build}` : '', architecture].filter(Boolean).join(' · ') || 'unknown';
+  return { productName, displayVersion, build, architecture, summary };
+}
+
+/**
+ * The evidence file for one platform run.
+ *
+ * Three rules are encoded here, because they are the ways this record goes
+ * wrong: an unreadable or mismatched installer hash fails the run; a run with no
+ * checks is `BLOCKED`, never `PASS`; and the trailer says plainly which parts of
+ * the phase cannot come from this file at all.
+ */
+export function evidenceReport({
+  platform,
+  identity = {},
+  installer = {},
+  elevated,
+  result = {},
+  startedAt = new Date(),
+  finishedAt = new Date(),
+} = {}) {
+  const checks = Array.isArray(result.checks) ? result.checks : [];
+  const failed = checks.filter((entry) => !entry.ok);
+  const hash =
+    installer.hashVerdict ?? installerHashVerdict({ actual: installer.sha256, expected: installer.expectedSha256 });
+  const verdict = result.fatal || failed.length || hash.ok === false ? 'FAIL' : checks.length === 0 ? 'BLOCKED' : 'PASS';
+  const when = (value) => (value instanceof Date ? value.toISOString() : String(value));
+  const lines = [
+    'IS King Panel — per-machine installation evidence',
+    `Verdict: ${verdict}`,
+    `Platform (requested): ${platform ?? 'unknown'}`,
+    `Windows (observed): ${identity.summary ?? 'unknown'}`,
+    `Recorded: ${when(startedAt)} → ${when(finishedAt)}`,
+    '',
+    `Installer: ${installer.path ?? 'unknown'}`,
+    `Installer size: ${installer.size ?? 'unknown'} bytes`,
+    `Installer SHA-256: ${installer.sha256 ?? 'unreadable'}`,
+    `Expected SHA-256: ${String(installer.expectedSha256 ?? '').trim() || '(not given)'}`,
+    `SHA-256 check: ${hash.ok ? 'PASS' : 'FAIL'} — ${hash.detail}`,
+    `Elevation: ${elevated === true ? 'administrator' : elevated === false ? 'standard user' : 'unknown'}`,
+    '',
+    `Checks (${checks.length}, ${failed.length} failed):`,
+    ...checks.map(
+      (entry) => `  ${entry.ok ? 'PASS' : 'FAIL'}  ${entry.label}${entry.detail ? ` — ${entry.detail}` : ''}`,
+    ),
+  ];
+  if (result.fatal) lines.push('', `Stopped: ${result.fatal}`);
+  if (result.versions?.length) lines.push(`Versions seen: ${result.versions.join(' → ')}`);
+  lines.push(
+    '',
+    'Recorded by the harness. The UAC prompt and its cancellation, the shortcuts, the registry',
+    'entry and the two-Windows-account checks are the operator’s observations and belong in the',
+    'phase document. This file is not a substitute for them, and one platform’s file is never',
+    'evidence for the other.',
+  );
+  return lines.join('\n');
+}

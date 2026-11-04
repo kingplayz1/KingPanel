@@ -23,6 +23,26 @@ Per-machine release readiness is therefore **not claimed**.
 The development machine must not be used for this phase (safety rule 7.2), and the
 harness deliberately refuses to elevate itself, so the run cannot be produced from here.
 
+## Hand-off requirements
+
+What the two environments must be, so a run is not attempted on a host that cannot produce
+usable evidence.
+
+| Item | Requirement |
+| --- | --- |
+| Operating systems | Windows 10 22H2 (build 19045) and Windows 11, as two separate clean installations |
+| Snapshot | taken on each VM *before* the installer is copied in, so a dirty run can be reverted |
+| Accounts | one administrator (the elevated shell) and one separate **standard** user for the two-account test |
+| Disk | at least 10 GB free beyond the OS: installer (~131 MB), installed app, a test world and backups |
+| Network | internet access — the app's first run and server creation need it |
+| Absent before the run | `C:\Program Files\IS King Panel`, the `HKLM\...\Uninstall\com.kingplayz.iskingpanel` key, and any system Node (`where node` must fail) |
+| Never this machine | not the developer's daily installation; the harness refuses to elevate itself and safety rule 7.2 forbids it |
+
+Each `--run` writes `evidence/evidence-<platform>-<host>-<timestamp>.txt` itself: OS build,
+installer size and SHA-256, elevation, and every `PASS`/`FAIL` line. The file is git-ignored
+because it names real machines and accounts. `--run` refuses to start without
+`--platform win10|win11`, because one run must never be filed as evidence for both.
+
 ## Artefact under test
 
 | Field | Value |
@@ -105,9 +125,13 @@ installers never perform.
 4. **Full per-machine run**, from an elevated PowerShell in the repository:
    ```powershell
    npm run verify:install-machine -- --run --confirm=per-machine-install `
+     --platform <win10|win11> --expect-sha256 <hash from the table above> `
      --installer <path>\IS-King-Panel-Setup-1.0.2.exe 2>&1 |
-     Tee-Object -FilePath evidence-<platform>-run1.txt
+     Tee-Object -FilePath evidence-<platform>-console.txt
    ```
+   A mismatched `--expect-sha256` refuses before anything is installed. The harness also
+   writes its own `evidence/evidence-<platform>-…txt`; keep both, and quote the hash from the
+   harness file in the report rather than retyping it.
    This installs, launches, checks the bundled runtime and the per-user data location,
    uninstalls, verifies the data survived, and reinstalls. Record every `PASS`/`FAIL`
    line; exit 1 means a check failed, exit 2 means the environment was blocked.

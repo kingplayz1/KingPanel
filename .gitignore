@@ -85,3 +85,8 @@ session-store.json
 /output.txt
 /test.txt
 /log.txt
+
+# Per-machine installation evidence from the Windows 10/11 VMs. Kept locally and
+# pasted into the phase document: it names real machines and accounts, which do
+# not belong in a public repository.
+/evidence/

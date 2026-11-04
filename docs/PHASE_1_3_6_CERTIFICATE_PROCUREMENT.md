@@ -177,6 +177,22 @@ integration and verification requirements satisfied before purchasing.
 Thank you.
 ```
 
+### Decision scorecard
+
+One row per answer. Any `REJECT` blocks the purchase on its own, regardless of price, and the
+fallback in the last column is the next step rather than a re-negotiation.
+
+| Question | ACCEPT (buy) | REJECT or escalate | If rejected |
+| --- | --- | --- | --- |
+| India eligibility | Written confirmation that the applicant entity and its documents are accepted, naming the entity type | Only a marketing page, or “usually works” | DigiCert KeyLocker — evaluate as the alternative cloud OV signer |
+| Exact subject DN | The O/OU/CN they will issue, in writing, including whether a CN change forces re-issuance | “The CN is derived automatically” with no value | Ask for a trial certificate's subject, or reject |
+| RFC 3161 + SHA-256 | Explicit statement that eSigner timestamps are RFC 3161 with SHA-256 | Silence, or a legacy Authenticode timestamp | Inspect a trial timestamp token for OID `1.2.840.113549.1.9.16.1.4` before paying |
+| Quota and price | ≥ 240 signatures/year at ≈ $309 | A quota below the release rate, or a material price increase | eSigner Tier 2, or DigiCert |
+
+`iskSigning.expectedPublisher` stays empty until the exact subject CN is in hand. A guessed pin
+fails closed at the first release build — better than a wrong trust anchor, but still a wasted
+build, so it is not a shortcut worth taking.
+
 ## 9. Sandbox evidence (run 2026-11-03)
 
 CodeSignTool 1.3.2 for Windows, SSL.com sandbox endpoints, the vendor's published demo

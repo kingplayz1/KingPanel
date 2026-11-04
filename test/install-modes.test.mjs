@@ -22,8 +22,12 @@ import {
   assessLeftover,
   classifyInstallerResult,
   elevationProblem,
+  evidenceFileName,
+  evidenceReport,
   expandWindowsPath,
   installPlan,
+  installerHashVerdict,
+  parseWindowsIdentity,
   runMachineInstall,
   userDataVerdict,
 } from '../scripts/install-config.mjs';
@@ -530,5 +534,120 @@ describe('source digest', () => {
     assert.notEqual(configDigest({ a: 1 }), configDigest({ a: 2 }));
     assert.equal(configDigest({ a: 1 }), configDigest({ a: 1 }));
     assert.equal(typeof hashFile(manifest), 'string');
+  });
+});
+
+describe('installation evidence (mocked)', () => {
+  const identity = parseWindowsIdentity(
+    JSON.stringify({
+      ProductName: 'Microsoft Windows 10 Pro',
+      DisplayVersion: '22H2',
+      CurrentBuild: '19045',
+      UBR: 3803,
+      OSArchitecture: '64-bit',
+    }),
+  );
+  const checks = [
+    { label: 'installer completed', ok: true, detail: 'installed: exit code 0' },
+    { label: 'application launched', ok: true, detail: 'log' },
+  ];
+  const installer = {
+    path: 'dist_electron/IS-King-Panel-Setup-1.0.2.exe',
+    size: 131347121,
+    sha256: 'b1311ce9',
+    expectedSha256: 'B1311CE9',
+  };
+
+  test('the filename names the platform and cannot collide between runs', () => {
+    const first = evidenceFileName({ platform: 'win10', date: new Date('2026-11-04T10:15:30Z') });
+    const second = evidenceFileName({ platform: 'win11', date: new Date('2026-11-04T10:15:30Z') });
+    assert.equal(first, 'evidence-win10-2026-11-04_10-15-30.txt');
+    assert.notEqual(first, second, 'the two platforms must not share a file');
+    assert.match(evidenceFileName({ platform: 'Windows 10 22H2', date: new Date(0) }), /^evidence-windows-10-22h2-/);
+    assert.match(evidenceFileName({}), /^evidence-unknown-/);
+    assert.match(evidenceFileName({ platform: 'win10', hostname: 'VM LAB 1' }), /^evidence-win10-VM-LAB-1-/);
+  });
+
+  test('a hash mismatch refuses the binary; no expectation is a record, not a failure', () => {
+    assert.equal(installerHashVerdict({ actual: 'abc', expected: 'sha256:ABC' }).ok, true);
+    const mismatch = installerHashVerdict({ actual: 'abc', expected: 'abd' });
+    assert.equal(mismatch.ok, false);
+    assert.match(mismatch.detail, /measured abc, expected abd/);
+    const unclaimed = installerHashVerdict({ actual: 'abc' });
+    assert.equal(unclaimed.ok, true);
+    assert.equal(unclaimed.checked, false);
+    assert.match(unclaimed.detail, /no --expect-sha256/);
+    assert.equal(installerHashVerdict({ actual: '', expected: 'abc' }).ok, false);
+  });
+
+  test('the Windows identity is parsed, and garbage does not become an OS version', () => {
+    assert.equal(identity.productName, 'Microsoft Windows 10 Pro');
+    assert.equal(identity.displayVersion, '22H2');
+    assert.equal(identity.build, '19045.3803');
+    assert.match(identity.summary, /Microsoft Windows 10 Pro · 22H2 · build 19045\.3803/);
+    assert.equal(parseWindowsIdentity('').summary, 'unknown');
+    assert.equal(parseWindowsIdentity('not json').summary, 'unknown');
+    assert.equal(parseWindowsIdentity('[1,2]').summary, 'unknown');
+  });
+
+  test('a completed run records the platform, the hash and every check', () => {
+    const report = evidenceReport({
+      platform: 'win10',
+      identity,
+      installer,
+      elevated: true,
+      result: { checks, failures: [], fatal: null, versions: ['1.0.2.0'] },
+      startedAt: new Date('2026-11-04T10:00:00Z'),
+      finishedAt: new Date('2026-11-04T10:12:00Z'),
+    });
+    assert.match(report, /Verdict: PASS/);
+    assert.match(report, /Platform \(requested\): win10/);
+    assert.match(report, /Windows \(observed\): Microsoft Windows 10 Pro/);
+    assert.match(report, /Installer size: 131347121 bytes/);
+    assert.match(report, /Installer SHA-256: b1311ce9/);
+    assert.match(report, /SHA-256 check: PASS/);
+    assert.match(report, /Elevation: administrator/);
+    assert.match(report, /  PASS  installer completed — installed: exit code 0/);
+    assert.match(report, /Versions seen: 1\.0\.2\.0/);
+    assert.match(report, /not a substitute/);
+  });
+
+  test('a failed check, a mismatch or no checks at all is never PASS', () => {
+    const failed = evidenceReport({
+      platform: 'win11',
+      identity,
+      installer,
+      elevated: true,
+      result: { checks: [{ label: 'uninstall kept the user data', ok: false, detail: '2 before, 0 after' }], failures: [], fatal: null },
+    });
+    assert.match(failed, /Verdict: FAIL/);
+
+    const fatal = evidenceReport({
+      platform: 'win11',
+      identity,
+      installer,
+      elevated: true,
+      result: { checks, failures: [], fatal: 'the application did not start' },
+    });
+    assert.match(fatal, /Verdict: FAIL/);
+    assert.match(fatal, /Stopped: the application did not start/);
+
+    const mismatch = evidenceReport({
+      platform: 'win10',
+      identity,
+      elevated: true,
+      result: { checks, failures: [], fatal: null },
+      installer: { ...installer, sha256: 'different' },
+    });
+    assert.match(mismatch, /Verdict: FAIL/);
+    assert.match(mismatch, /SHA-256 check: FAIL/);
+
+    const nothing = evidenceReport({
+      platform: 'win10',
+      identity,
+      elevated: true,
+      result: { checks: [], failures: [], fatal: null },
+    });
+    assert.match(nothing, /Verdict: BLOCKED/, 'a run that checked nothing cannot be a pass');
   });
 });

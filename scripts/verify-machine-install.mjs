@@ -20,23 +20,33 @@
  *
  * Usage:
  *   node scripts/verify-machine-install.mjs                 # read-only preflight
- *   node scripts/verify-machine-install.mjs --run --confirm=per-machine-install
- *   node scripts/verify-machine-install.mjs --run --confirm=per-machine-install \
+ *   node scripts/verify-machine-install.mjs --run --confirm=per-machine-install --platform win10 \
+ *     --expect-sha256 <hash recorded in the phase document>
+ *   node scripts/verify-machine-install.mjs --run --confirm=per-machine-install --platform win10 \
  *     --update-installer .tmp/e2e/v1.0.2/IS-King-Panel-Setup-1.0.2.exe
+ *
+ * `--run` requires `--platform win10|win11` and writes `evidence/evidence-<platform>-<host>-<time>.txt`:
+ * the OS build, installer size and SHA-256, and every PASS/FAIL line, so no hash is transcribed by hand.
  *
  * Exit codes: 0 verified/ready, 1 checks failed, 2 environment blocked.
  */
 import { spawn, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   assessLeftover,
   classifyInstallerResult,
   elevationProblem,
+  evidenceFileName,
+  evidenceReport,
   expandWindowsPath,
   installPlan,
+  installerHashVerdict,
   isElevated,
+  parseWindowsIdentity,
   runMachineInstall,
 } from './install-config.mjs';
 import { resolveReleaseAssets } from './release-naming.mjs';
@@ -61,6 +71,12 @@ const installerPath = path.resolve(ROOT, arg('--installer', path.join('dist_elec
 const updateInstallerArg = arg('--update-installer');
 const installDir = path.resolve(arg('--install-dir', expandWindowsPath(basePlan.installDir)));
 const run = flag('--run');
+// One run is evidence for exactly one platform, so the platform is named here
+// rather than inferred from whatever the host happens to be.
+const PLATFORMS = ['win10', 'win11'];
+const platformArg = arg('--platform');
+const expectedSha256 = arg('--expect-sha256');
+const evidenceDir = path.resolve(ROOT, arg('--evidence-dir', 'evidence'));
 
 function queryRegistry() {
   if (process.platform !== 'win32') return [];
@@ -86,6 +102,32 @@ function listDir(dir) {
   } catch {
     return [];
   }
+}
+
+/** Streaming SHA-256 — the installer is ~130 MB and must not be read into memory. */
+function sha256File(file) {
+  const hash = createHash('sha256');
+  const fd = fs.openSync(file, 'r');
+  try {
+    const buffer = Buffer.allocUnsafe(4 * 1024 * 1024);
+    let read;
+    while ((read = fs.readSync(fd, buffer, 0, buffer.length, null)) > 0) hash.update(buffer.subarray(0, read));
+  } finally {
+    fs.closeSync(fd);
+  }
+  return hash.digest('hex');
+}
+
+/** The build the evidence claims to describe, read from the machine itself. */
+function windowsIdentity() {
+  if (process.platform !== 'win32') return parseWindowsIdentity('');
+  const script =
+    "$k = Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion'; " +
+    '[pscustomobject]@{ ProductName = $k.ProductName; DisplayVersion = $k.DisplayVersion; ' +
+    'CurrentBuild = $k.CurrentBuild; UBR = $k.UBR; ' +
+    'OSArchitecture = (Get-CimInstance Win32_OperatingSystem).OSArchitecture } | ConvertTo-Json -Compress';
+  const result = spawnSync('powershell', ['-NoProfile', '-Command', script], { encoding: 'utf8' });
+  return parseWindowsIdentity(result.stdout);
 }
 
 function preflight() {
@@ -249,6 +291,28 @@ async function main() {
     console.error(`[machine] BLOCKED: ${elevation}`);
     return 2;
   }
+  if (!PLATFORMS.includes(String(platformArg))) {
+    console.error(
+      '[machine] --run needs --platform win10 or win11.\n' +
+        '  Windows 10 and Windows 11 are separate rows of the same gate, and one run must never be\n' +
+        '  filed as evidence for both. Example:\n' +
+        '    npm run verify:install-machine -- --run --confirm=per-machine-install --platform win10 \\\n' +
+        '      --expect-sha256 <hash from the phase document>',
+    );
+    return 2;
+  }
+
+  // Check the binary before touching the machine: an installer that is not the
+  // one the report names makes every later PASS worthless.
+  const installerSize = fs.existsSync(installerPath) ? fs.statSync(installerPath).size : null;
+  const installerSha256 = fs.existsSync(installerPath) ? sha256File(installerPath) : null;
+  const hashVerdict = installerHashVerdict({ actual: installerSha256, expected: expectedSha256 });
+  console.log(`[machine] installer SHA-256: ${installerSha256 ?? 'unreadable'}`);
+  if (!hashVerdict.ok) {
+    console.error(`[machine] REFUSING to test this installer: ${hashVerdict.detail}`);
+    return 1;
+  }
+  console.log(`[machine] ${hashVerdict.detail}`);
 
   // The harness owns the whole work tree; a previous run's leftovers are ours.
   fs.rmSync(WORK, { recursive: true, force: true });
@@ -269,6 +333,8 @@ async function main() {
     appPort: APP_PORT,
   };
 
+  const startedAt = new Date();
+
   const result = await runMachineInstall({
     plan,
     installer: installerPath,
@@ -281,6 +347,33 @@ async function main() {
   }
   if (result.fatal) console.error(`[machine] STOPPED: ${result.fatal}`);
   console.log(`\n[machine] ${result.failures.length === 0 ? 'RESULT: PASS' : `RESULT: FAIL (${result.failures.length})`}`);
+
+  // Evidence is written before the exit code is returned, so a failed run still
+  // leaves the record of how it failed.
+  const evidencePath = path.join(
+    evidenceDir,
+    evidenceFileName({ platform: platformArg, date: startedAt, hostname: os.hostname() }),
+  );
+  fs.mkdirSync(evidenceDir, { recursive: true });
+  fs.writeFileSync(
+    evidencePath,
+    `${evidenceReport({
+      platform: platformArg,
+      identity: windowsIdentity(),
+      installer: {
+        path: path.relative(ROOT, installerPath),
+        size: installerSize,
+        sha256: installerSha256,
+        expectedSha256,
+        hashVerdict,
+      },
+      elevated: true,
+      result,
+      startedAt,
+      finishedAt: new Date(),
+    })}\n`,
+  );
+  console.log(`[machine] evidence: ${path.relative(ROOT, evidencePath)}`);
   if (result.failures.length) {
     console.log('[machine] the machine may be left with an installation; uninstall it with its own uninstaller.');
     return 1;
